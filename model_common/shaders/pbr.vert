@@ -1,9 +1,10 @@
 // Copyright 2026, Leia Inc.
 // SPDX-License-Identifier: BSL-1.0
 //
-// SKELETON metallic-roughness PBR vertex shader. Replace with the full
-// pbr.vert from SaschaWillems/Vulkan-glTF-PBR (skinning + morph targets +
-// node matrices) during the port. See ../../PORTING.md.
+// Metallic-roughness PBR vertex shader (v1: static geometry, no skinning).
+// viewProj is proj * Y-flipped-view (see ModelRenderer::updateUniforms), so
+// the model orientation matches the GS demo's pose convention exactly.
+// Texture (uv) + skinning + morph targets are follow-ups. See ../../PORTING.md.
 #version 450
 
 layout(location = 0) in vec3 inPos;
@@ -11,19 +12,26 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 
 layout(set = 0, binding = 0) uniform UBO {
-    mat4 proj;   // asymmetric per-eye Kooima projection (supplied by the demo)
-    mat4 view;
-    mat4 model;
+    mat4 viewProj;     // proj * Y-flipped view
+    vec4 cameraPos;    // world-space, .w unused
+    vec4 lightDir;     // world-space direction TO the light, .w unused
 } ubo;
+
+layout(push_constant) uniform Push {
+    mat4 model;
+    vec4 baseColorFactor;
+    vec4 mrParams;     // x=metallic, y=roughness
+    vec4 emissive;     // rgb
+} pc;
 
 layout(location = 0) out vec3 outWorldPos;
 layout(location = 1) out vec3 outNormal;
 layout(location = 2) out vec2 outUV;
 
 void main() {
-    vec4 world = ubo.model * vec4(inPos, 1.0);
+    vec4 world = pc.model * vec4(inPos, 1.0);
     outWorldPos = world.xyz;
-    outNormal = mat3(ubo.model) * inNormal;
+    outNormal = normalize(mat3(pc.model) * inNormal);
     outUV = inUV;
-    gl_Position = ubo.proj * ubo.view * world;
+    gl_Position = ubo.viewProj * world;
 }

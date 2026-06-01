@@ -1,13 +1,3 @@
-// ───────────────────────────────────────────────────────────────────────
-// PORTING BASELINE — copied verbatim from displayxr-demo-gaussiansplat.
-//
-// The window / OpenXR session / transparency / HUD / input plumbing here is
-// reusable AS-IS for the model viewer. The RENDERER call sites still target
-// the Gaussian-splat API (GsRenderer, loadScene, pickGaussian, findBestYaw,
-// .ply/.spz loading) and must be retargeted to model_common/ModelRenderer
-// (loadModel, pickSurface, .glb/.gltf). This file does NOT compile until that
-// retarget is done. See ../PORTING.md for the exact call-site checklist.
-// ───────────────────────────────────────────────────────────────────────
 // Copyright 2025, Leia Inc.
 // SPDX-License-Identifier: BSL-1.0
 /*!

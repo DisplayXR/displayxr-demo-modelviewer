@@ -1,20 +1,10 @@
-// ───────────────────────────────────────────────────────────────────────
-// PORTING BASELINE — copied verbatim from displayxr-demo-gaussiansplat.
-//
-// The window / OpenXR session / transparency / HUD / input plumbing here is
-// reusable AS-IS for the model viewer. The RENDERER call sites still target
-// the Gaussian-splat API (GsRenderer, loadScene, pickGaussian, findBestYaw,
-// .ply/.spz loading) and must be retargeted to model_common/ModelRenderer
-// (loadModel, pickSurface, .glb/.gltf). This file does NOT compile until that
-// retarget is done. See ../PORTING.md for the exact call-site checklist.
-// ───────────────────────────────────────────────────────────────────────
 // Copyright 2025, Leia Inc.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  SR 3DGS OpenXR Ext VK - 3D Gaussian Splatting with OpenXR (Vulkan)
+ * @brief  SR 3DGS OpenXR Ext VK - glTF 2.0 PBR model viewer with OpenXR (Vulkan)
  *
- * Renders 3D Gaussian Splatting scenes on tracked 3D displays via OpenXR.
+ * Renders glTF 2.0 models on tracked 3D displays via OpenXR.
  * Based on cube_handle_vk with the cube/grid renderer replaced by
  * a 3DGS.cpp compute pipeline.  Features a "Load Scene" button as a
  * window-space layer overlay.
@@ -34,8 +24,7 @@
 #include "logging.h"
 #include "input_handler.h"
 #include "xr_session.h"
-#include "gs_renderer.h"
-#include "gs_scene_loader.h"
+#include "model_renderer.h"
 #include "display3d_view.h"
 
 #include "hud_renderer.h"
@@ -53,10 +42,10 @@
 
 using namespace DirectX;
 
-static const char* APP_NAME = "gaussian_splatting_handle_vk_win";
+static const char* APP_NAME = "model_viewer_handle_vk_win";
 
-static const wchar_t* WINDOW_CLASS = L"SR3DGSOpenXRExtVKClass";
-static const wchar_t* WINDOW_TITLE = L"DisplayXR Gaussian Splat Viewer Demo";
+static const wchar_t* WINDOW_CLASS = L"DisplayXRModelViewerClass";
+static const wchar_t* WINDOW_TITLE = L"DisplayXR 3D Model Viewer";
 
 // HUD overlay fractions. Layer spans full window height so chrome buttons
 // can sit at the window top while the info panel anchors to the bottom-left
@@ -99,9 +88,9 @@ static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
 // 3DGS state
-static GsRenderer g_gsRenderer;
+static ModelRenderer g_modelRenderer;
 // Cross-thread scene-load queue: the file dialog runs on the main (message-pump)
-// thread, but the actual GsRenderer::loadScene() submits Vulkan work on the
+// thread, but the actual ModelRenderer::loadScene() submits Vulkan work on the
 // graphics queue and so MUST run on the same thread that drives per-frame
 // rendering — otherwise concurrent vkQueueSubmit/vkQueueWaitIdle from two
 // threads on a single VkQueue is undefined behaviour and crashes some drivers
@@ -146,7 +135,7 @@ static std::atomic<bool> g_fitValid{false};
 static void ApplyAutoFitForLoadedScene_locked() {
     float center[3], extent[3];
     // Voxel-density flood-fill — see the macOS demo for rationale.
-    bool ok = g_gsRenderer.getMainObjectBounds(64u, center, extent);
+    bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
     if (ok) {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
@@ -179,7 +168,7 @@ static void ApplyAutoFitForLoadedScene_locked() {
 
     // Per-format orientation correction is now done at load time (PLY loader
     // converts RDF+X-mirror → canonical RUB; SPZ loader uses RUB natively).
-    // Renderer's GsRenderer::updateUniforms negates the Y row of proj_mat to
+    // Renderer's ModelRenderer::updateUniforms negates the Y row of proj_mat to
     // match the +Y-up convention. No runtime view-stage flips needed.
 
     // Route the first post-load frame through the same reset path Space uses,
@@ -255,7 +244,7 @@ static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH
 // Atlas capture helpers live in test_apps/common/atlas_capture* — see
 // dxr_capture::CaptureAtlasRegionVk / TriggerCaptureFlash / MakeCapturePath.
 
-// Attempt to auto-load butterfly.spz from next to the exe.
+// Attempt to auto-load sample.glb from next to the exe.
 static void TryAutoLoadBundledScene() {
     char exePath[MAX_PATH] = {0};
     if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return;
@@ -264,17 +253,17 @@ static void TryAutoLoadBundledScene() {
     if (!lastSlash) lastSlash = strrchr(exePath, '/');
     if (!lastSlash) return;
     *(lastSlash + 1) = '\0';
-    std::string path = std::string(exePath) + "butterfly.spz";
+    std::string path = std::string(exePath) + "sample.glb";
     if (!PathFileExistsA(path.c_str())) {
         LOG_INFO("No bundled scene at %s (skipping auto-load)", path.c_str());
         return;
     }
-    if (!ValidateSceneFile(path)) return;
+    if (!model_validate_file(path)) return;
     LOG_INFO("Auto-loading bundled scene: %s", path.c_str());
     std::lock_guard<std::mutex> lock(g_sceneMutex);
-    if (g_gsRenderer.loadScene(path.c_str())) {
-        g_loadedFileName = GetPlyFilename(path);
-        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
+    if (g_modelRenderer.loadModel(path.c_str())) {
+        g_loadedFileName = model_basename(path);
+        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), model_filesize_str(path).c_str());
         ApplyAutoFitForLoadedScene_locked();
     } else {
         LOG_WARN("Auto-load failed for %s", path.c_str());
@@ -286,8 +275,8 @@ static void TryAutoLoadBundledScene() {
 // both the Win32 GetOpenFileNameA path and the #228 spatial picker result
 // drained in the main loop.
 static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
-    if (!ValidateSceneFile(path)) {
-        MessageBoxA(hwnd, "Invalid scene file. Supported formats: .ply, .spz", "Load Error", MB_OK | MB_ICONERROR);
+    if (!model_validate_file(path)) {
+        MessageBoxA(hwnd, "Invalid model file. Supported formats: .glb, .gltf", "Load Error", MB_OK | MB_ICONERROR);
         return false;
     }
     {
@@ -295,7 +284,7 @@ static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
         g_pendingLoadPath = path;
     }
     g_loadRequested.store(true, std::memory_order_release);
-    LOG_INFO("Queued 3DGS scene load: %s", path.c_str());
+    LOG_INFO("Queued model load: %s", path.c_str());
     return true;
 }
 
@@ -327,20 +316,20 @@ static void OpenLoadDialog(HWND hwnd) {
         !g_xr->filePickerInFlight) {
         XrFilePickerInfoEXT info = {XR_TYPE_FILE_PICKER_INFO_EXT};
         info.mode = XR_FILE_PICKER_MODE_OPEN_EXT;
-        strncpy(info.title, "Load Gaussian Splatting Scene",
+        strncpy(info.title, "Load 3D Model",
                 sizeof(info.title) - 1);
         info.filterCount = 3;
-        strncpy(info.filters[0].description, "3DGS Files",
+        strncpy(info.filters[0].description, "glTF Models",
                 sizeof(info.filters[0].description) - 1);
-        strncpy(info.filters[0].extensions, "*.ply;*.spz",
+        strncpy(info.filters[0].extensions, "*.glb;*.gltf",
                 sizeof(info.filters[0].extensions) - 1);
-        strncpy(info.filters[1].description, "PLY Files",
+        strncpy(info.filters[1].description, "Binary glTF",
                 sizeof(info.filters[1].description) - 1);
-        strncpy(info.filters[1].extensions, "*.ply",
+        strncpy(info.filters[1].extensions, "*.glb",
                 sizeof(info.filters[1].extensions) - 1);
-        strncpy(info.filters[2].description, "SPZ Files",
+        strncpy(info.filters[2].description, "glTF",
                 sizeof(info.filters[2].description) - 1);
-        strncpy(info.filters[2].extensions, "*.spz",
+        strncpy(info.filters[2].extensions, "*.gltf",
                 sizeof(info.filters[2].extensions) - 1);
 
         XrAsyncRequestIdEXT rid = 0;
@@ -361,10 +350,10 @@ static void OpenLoadDialog(HWND hwnd) {
     char filePath[MAX_PATH] = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = "3DGS Files (*.ply;*.spz)\0*.ply;*.spz\0PLY Files (*.ply)\0*.ply\0SPZ Files (*.spz)\0*.spz\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFilter = "glTF Models (*.glb;*.gltf)\0*.glb;*.gltf\0Binary glTF (*.glb)\0*.glb\0glTF (*.gltf)\0*.gltf\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = filePath;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrTitle = "Load Gaussian Splatting Scene";
+    ofn.lpstrTitle = "Load 3D Model";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
     if (GetOpenFileNameA(&ofn)) {
@@ -689,12 +678,12 @@ static void RenderThreadFunc(
                 g_pendingLoadPath.clear();
             }
             if (!path.empty()) {
-                LOG_INFO("Loading 3DGS scene: %s", path.c_str());
+                LOG_INFO("Loading model: %s", path.c_str());
                 std::lock_guard<std::mutex> lock(g_sceneMutex);
-                if (g_gsRenderer.loadScene(path.c_str())) {
-                    g_loadedFileName = GetPlyFilename(path);
+                if (g_modelRenderer.loadModel(path.c_str())) {
+                    g_loadedFileName = model_basename(path);
                     LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
-                        GetPlyFileSize(path).c_str());
+                        model_filesize_str(path).c_str());
                     ApplyAutoFitForLoadedScene_locked();
                 } else {
                     LOG_ERROR("Failed to load scene: %s", path.c_str());
@@ -910,7 +899,7 @@ static void RenderThreadFunc(
                             }
 
                             // Build per-view raw eye positions in render frame.
-                            // GsRenderer::updateUniforms Y-mirrors the world; displayPose
+                            // ModelRenderer::updateUniforms Y-mirrors the world; displayPose
                             // below is fed in render frame (cameraPosY negated). The
                             // rawEyes must live in the same render frame so the asymmetric
                             // Kooima projection's eye-vs-display geometry stays consistent
@@ -945,7 +934,7 @@ static void RenderThreadFunc(
                             XMFLOAT4 q;
                             XMStoreFloat4(&q, pOri);
                             displayPose.orientation = {q.x, q.y, q.z, q.w};
-                            // GsRenderer Y-mirrors the world inside updateUniforms (see comment
+                            // ModelRenderer Y-mirrors the world inside updateUniforms (see comment
                             // in gs_renderer.cpp). The off-axis Kooima projection assumes the
                             // mirror is reflected in the displayPose passed to display3d_compute_views,
                             // so negate Y here to keep the eye-vs-display geometry consistent.
@@ -1014,7 +1003,7 @@ static void RenderThreadFunc(
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
                             std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
-                            if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
+                            if (g_modelRenderer.pickSurface(rayOrigin, rayDir, hitPos)) {
                                 // Both endpoints stored in WORLD frame (the same frame as
                                 // inputSnapshot.cameraPosX/Y/Z and inputSnapshot.pitch/yaw)
                                 // so the slerp's writeback decodes back into world-frame
@@ -1129,7 +1118,7 @@ static void RenderThreadFunc(
                             bool hasGsScene;
                             {
                                 std::lock_guard<std::mutex> lock(g_sceneMutex);
-                                hasGsScene = g_gsRenderer.hasScene();
+                                hasGsScene = g_modelRenderer.hasModel();
                             }
 
                             if (hasGsScene) {
@@ -1141,7 +1130,7 @@ static void RenderThreadFunc(
                                     uint32_t row = (uint32_t)eye / cols;
                                     uint32_t vpX = col * renderW;
                                     uint32_t vpY = row * renderH;
-                                    g_gsRenderer.renderEye(
+                                    g_modelRenderer.renderEye(
                                         (*swapchainVkImages)[imageIndex], colorFormat,
                                         xr->swapchain.width, xr->swapchain.height,
                                         vpX, vpY, renderW, renderH,
@@ -1170,7 +1159,7 @@ static void RenderThreadFunc(
                                             sceneName = g_loadedFileName;
                                         }
                                         // Strip extension from scene filename
-                                        // (e.g. "butterfly.spz" → "butterfly").
+                                        // (e.g. "sample.glb" → "butterfly").
                                         auto dot = sceneName.find_last_of('.');
                                         std::string stem = (dot == std::string::npos)
                                             ? sceneName : sceneName.substr(0, dot);
@@ -1233,14 +1222,14 @@ static void RenderThreadFunc(
                                 sessionText += L"\nSession: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
                                 std::wstring modeText = xr->hasWin32WindowBindingExt ?
-                                    L"XR_EXT_win32_window_binding: ACTIVE (Vulkan + 3DGS)" :
+                                    L"XR_EXT_win32_window_binding: ACTIVE (Vulkan + glTF)" :
                                     L"XR_EXT_win32_window_binding: NOT AVAILABLE";
 
                                 // Scene info
-                                std::wstring sceneText = L"\n--- 3DGS Scene ---";
+                                std::wstring sceneText = L"\n--- Model ---";
                                 {
                                     std::lock_guard<std::mutex> lock(g_sceneMutex);
-                                    if (g_gsRenderer.hasScene()) {
+                                    if (g_modelRenderer.hasModel()) {
                                         std::wstring fname(g_loadedFileName.begin(), g_loadedFileName.end());
                                         sceneText += L"\nLoaded: " + fname;
                                     } else {
@@ -1504,7 +1493,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
     }
 
-    LOG_INFO("=== SR 3DGS OpenXR Ext Vulkan Application ===");
+    LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) ===");
 
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
@@ -1650,13 +1639,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         swapchainVkImages[i] = swapchainImages[i].image;
     }
 
-    // Initialize 3DGS renderer with the OpenXR Vulkan device
+    // Initialize model renderer with the OpenXR Vulkan device
     {
         uint32_t renderW = xr.swapchain.width;   // Full width — mono uses entire swapchain
         uint32_t renderH = xr.swapchain.height;
-        if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue,
+        if (!g_modelRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue,
                                queueFamilyIndex, renderW, renderH)) {
-            LOG_WARN("3DGS renderer init failed - scene rendering will not be available");
+            LOG_WARN("model renderer init failed - scene rendering will not be available");
         } else {
             TryAutoLoadBundledScene();
         }
@@ -1798,7 +1787,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
 
-    g_gsRenderer.cleanup();
+    g_modelRenderer.cleanup();
 
     if (hudCmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, hudCmdPool, nullptr);
     if (hudStagingBuffer != VK_NULL_HANDLE) {
