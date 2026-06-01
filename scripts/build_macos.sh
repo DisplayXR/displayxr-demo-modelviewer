@@ -80,7 +80,11 @@ fi
 
 if [ "$BUILD_INSTALLER" != "true" ]; then
     echo ""
-    echo "Run: $BIN"
+    # Use the dev launcher, not the bare binary: it converges the app and the
+    # installed runtime on one Vulkan loader (the bare binary links Homebrew's
+    # libvulkan while the runtime loads its own → xrGetVulkanGraphicsDeviceKHR
+    # fails). The distributed .app handles this itself; this is dev-only.
+    echo "Run: ./scripts/run_macos_dev.sh"
     exit 0
 fi
 
