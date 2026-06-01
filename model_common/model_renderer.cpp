@@ -113,6 +113,7 @@ bool ModelRenderer::init(VkInstance instance,
 
     if (!createRenderTargets()) return false;
     if (!createPipeline()) return false;
+    if (!createSamplerAndDefaults()) return false;
 
     initialized_ = true;
     std::printf("ModelRenderer: initialized (%ux%u)\n", width_, height_);
@@ -234,13 +235,27 @@ bool ModelRenderer::createPipeline() {
     dlci.pBindings = &b0;
     if (vkCreateDescriptorSetLayout(device_, &dlci, nullptr, &dsLayout_) != VK_SUCCESS) return false;
 
+    // Set 1: per-material textures — base color, MR, normal, occlusion, emissive.
+    VkDescriptorSetLayoutBinding mb[5] = {};
+    for (uint32_t i = 0; i < 5; ++i) {
+        mb[i].binding = i;
+        mb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        mb[i].descriptorCount = 1;
+        mb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo mlci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    mlci.bindingCount = 5;
+    mlci.pBindings = mb;
+    if (vkCreateDescriptorSetLayout(device_, &mlci, nullptr, &matSetLayout_) != VK_SUCCESS) return false;
+
     VkPushConstantRange pcr = {};
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.offset = 0;
     pcr.size = sizeof(PushBlock);
+    VkDescriptorSetLayout setLayouts[2] = {dsLayout_, matSetLayout_};
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts = &dsLayout_;
+    plci.setLayoutCount = 2;
+    plci.pSetLayouts = setLayouts;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(device_, &plci, nullptr, &pipelineLayout_) != VK_SUCCESS) return false;
@@ -358,11 +373,159 @@ bool ModelRenderer::createPipeline() {
     return true;
 }
 
-bool ModelRenderer::loadModel(const char* gltfPath) {
-    if (!initialized_ || !gltfPath) return false;
-    ModelData md;
-    if (!model_loader_load(gltfPath, md)) return false;
+ModelImage ModelRenderer::uploadTexture(const ModelTexture& tex) {
+    ModelImage img;
+    if (tex.width <= 0 || tex.height <= 0 || tex.rgba.empty()) return img;
+    img.width = tex.width;
+    img.height = tex.height;
+    const uint32_t w = (uint32_t)tex.width, h = (uint32_t)tex.height;
+    const uint32_t mips = (uint32_t)std::floor(std::log2((float)std::max(w, h))) + 1u;
 
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;  // sRGB decode done in the shader
+    ici.extent = {w, h, 1};
+    ici.mipLevels = mips;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // SRC for mip blits
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device_, &ici, nullptr, &img.image) != VK_SUCCESS) return ModelImage{};
+
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(device_, img.image, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = modelFindMemoryType(physDevice_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device_, &ai, nullptr, &img.memory) != VK_SUCCESS) { vkDestroyImage(device_, img.image, nullptr); return ModelImage{}; }
+    vkBindImageMemory(device_, img.image, img.memory, 0);
+
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = img.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = ici.format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
+    vkCreateImageView(device_, &vci, nullptr, &img.view);
+
+    // Staging upload of mip 0.
+    ModelBuffer staging = modelCreateBuffer(device_, physDevice_, tex.rgba.size(),
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void* mapped = nullptr;
+    vkMapMemory(device_, staging.memory, 0, tex.rgba.size(), 0, &mapped);
+    std::memcpy(mapped, tex.rgba.data(), tex.rgba.size());
+    vkUnmapMemory(device_, staging.memory);
+
+    VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = cmdPool_; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd; vkAllocateCommandBuffers(device_, &cbai, &cmd);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    auto barrier = [&](uint32_t mip, uint32_t count, VkImageLayout oldL, VkImageLayout newL,
+                       VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = oldL; b.newLayout = newL;
+        b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, count, 0, 1};
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    // mip 0 → TRANSFER_DST, copy.
+    barrier(0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy region = {};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyBufferToImage(cmd, staging.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Generate mips by successive blits.
+    int32_t mw = (int32_t)w, mh = (int32_t)h;
+    for (uint32_t i = 1; i < mips; ++i) {
+        // src mip (i-1): TRANSFER_DST → TRANSFER_SRC
+        barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // dst mip (i): UNDEFINED → TRANSFER_DST
+        barrier(i, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        int32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
+        VkImageBlit blit = {};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+        blit.srcOffsets[1] = {mw, mh, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        blit.dstOffsets[1] = {nw, nh, 1};
+        vkCmdBlitImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        // src mip (i-1) → SHADER_READ
+        barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        mw = nw; mh = nh;
+    }
+    // last mip → SHADER_READ
+    barrier(mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+    modelDestroyBuffer(device_, staging);
+    return img;
+}
+
+bool ModelRenderer::createSamplerAndDefaults() {
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod = VK_LOD_CLAMP_NONE;
+    sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    if (vkCreateSampler(device_, &sci, nullptr, &sampler_) != VK_SUCCESS) return false;
+
+    ModelTexture white; white.width = 1; white.height = 1; white.rgba = {255, 255, 255, 255};
+    whiteTex_ = uploadTexture(white);
+    ModelTexture flat;  flat.width = 1;  flat.height = 1;  flat.rgba = {128, 128, 255, 255};
+    flatNormalTex_ = uploadTexture(flat);
+    return whiteTex_.view != VK_NULL_HANDLE && flatNormalTex_.view != VK_NULL_HANDLE;
+}
+
+VkDescriptorSet ModelRenderer::makeMaterialSet(VkImageView baseColor, VkImageView mr,
+                                               VkImageView normal, VkImageView occ,
+                                               VkImageView emissive) {
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = matPool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &matSetLayout_;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(device_, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+
+    VkImageView views[5] = {baseColor, mr, normal, occ, emissive};
+    VkDescriptorImageInfo infos[5];
+    VkWriteDescriptorSet writes[5];
+    for (uint32_t i = 0; i < 5; ++i) {
+        infos[i] = {sampler_, views[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &infos[i];
+    }
+    vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
+    return set;
+}
+
+bool ModelRenderer::finalizeModel(ModelData& md) {
     cleanupModel();
 
     vertexBuffer_ = modelCreateBuffer(device_, physDevice_,
@@ -374,11 +537,16 @@ bool ModelRenderer::loadModel(const char* gltfPath) {
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (vertexBuffer_.buffer == VK_NULL_HANDLE || indexBuffer_.buffer == VK_NULL_HANDLE) return false;
-
     modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, vertexBuffer_,
                       md.vertices.data(), vertexBuffer_.size);
     modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, indexBuffer_,
                       md.indices.data(), indexBuffer_.size);
+
+    // Upload textures (parallel to md.textures; empty entries stay null).
+    modelTextures_.resize(md.textures.size());
+    for (size_t i = 0; i < md.textures.size(); ++i)
+        if (!md.textures[i].rgba.empty())
+            modelTextures_[i] = uploadTexture(md.textures[i]);
 
     materials_ = std::move(md.materials);
     primitives_ = std::move(md.primitives);
@@ -386,8 +554,43 @@ bool ModelRenderer::loadModel(const char* gltfPath) {
     std::memcpy(bboxMax_, md.bboxMax, sizeof(bboxMax_));
     hasBBox_ = md.hasBBox;
     numPrimitives_ = md.primitiveCount;
-    loadedModelPath_ = gltfPath;
+
+    // Per-material descriptor sets (set = 1) + a default for material == -1.
+    const uint32_t nSets = (uint32_t)materials_.size() + 1;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * 5};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = nSets;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(device_, &dpci, nullptr, &matPool_) != VK_SUCCESS) return false;
+
+    auto viewOr = [&](int idx, VkImageView def) -> VkImageView {
+        if (idx >= 0 && idx < (int)modelTextures_.size() && modelTextures_[idx].view != VK_NULL_HANDLE)
+            return modelTextures_[idx].view;
+        return def;
+    };
+    materialSets_.reserve(materials_.size());
+    for (const auto& m : materials_) {
+        materialSets_.push_back(makeMaterialSet(
+            viewOr(m.baseColorTex, whiteTex_.view),
+            viewOr(m.metallicRoughnessTex, whiteTex_.view),
+            viewOr(m.normalTex, flatNormalTex_.view),
+            viewOr(m.occlusionTex, whiteTex_.view),
+            viewOr(m.emissiveTex, whiteTex_.view)));
+    }
+    defaultMatSet_ = makeMaterialSet(whiteTex_.view, whiteTex_.view, flatNormalTex_.view,
+                                     whiteTex_.view, whiteTex_.view);
+
     modelLoaded_ = true;
+    return true;
+}
+
+bool ModelRenderer::loadModel(const char* gltfPath) {
+    if (!initialized_ || !gltfPath) return false;
+    ModelData md;
+    if (!model_loader_load(gltfPath, md)) return false;
+    if (!finalizeModel(md)) return false;
+    loadedModelPath_ = gltfPath;
     return true;
 }
 
@@ -395,29 +598,8 @@ bool ModelRenderer::loadDebugModel() {
     if (!initialized_) return false;
     ModelData md;
     buildCubeModel(md);
-
-    cleanupModel();
-    vertexBuffer_ = modelCreateBuffer(device_, physDevice_,
-        md.vertices.size() * sizeof(ModelVertex),
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    indexBuffer_ = modelCreateBuffer(device_, physDevice_,
-        md.indices.size() * sizeof(uint32_t),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vertexBuffer_.buffer == VK_NULL_HANDLE || indexBuffer_.buffer == VK_NULL_HANDLE) return false;
-    modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, vertexBuffer_,
-                      md.vertices.data(), vertexBuffer_.size);
-    modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, indexBuffer_,
-                      md.indices.data(), indexBuffer_.size);
-    materials_ = std::move(md.materials);
-    primitives_ = std::move(md.primitives);
-    std::memcpy(bboxMin_, md.bboxMin, sizeof(bboxMin_));
-    std::memcpy(bboxMax_, md.bboxMax, sizeof(bboxMax_));
-    hasBBox_ = true;
-    numPrimitives_ = 1;
+    if (!finalizeModel(md)) return false;
     loadedModelPath_ = "<debug-cube>";
-    modelLoaded_ = true;
     return true;
 }
 
@@ -561,6 +743,14 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         vkCmdPushConstants(cmd, pipelineLayout_,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(PushBlock), &pb);
+
+        // Set 1: this primitive's material textures (or the all-defaults set).
+        VkDescriptorSet matSet =
+            (p.material >= 0 && p.material < (int)materialSets_.size())
+                ? materialSets_[p.material] : defaultMatSet_;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
+                                1, 1, &matSet, 0, nullptr);
+
         vkCmdDrawIndexed(cmd, p.indexCount, 1, p.firstIndex, 0, 0);
     }
 
@@ -619,6 +809,13 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 void ModelRenderer::cleanupModel() {
     if (vertexBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, vertexBuffer_);
     if (indexBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, indexBuffer_);
+    for (auto& t : modelTextures_)
+        if (t.image != VK_NULL_HANDLE) modelDestroyImage(device_, t);
+    modelTextures_.clear();
+    // Freeing the pool frees all material sets allocated from it.
+    if (matPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, matPool_, nullptr); matPool_ = VK_NULL_HANDLE; }
+    materialSets_.clear();
+    defaultMatSet_ = VK_NULL_HANDLE;
     materials_.clear();
     primitives_.clear();
     hasBBox_ = false;
@@ -633,6 +830,10 @@ void ModelRenderer::cleanup() {
 
     cleanupModel();
 
+    if (sampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
+    if (whiteTex_.image != VK_NULL_HANDLE) modelDestroyImage(device_, whiteTex_);
+    if (flatNormalTex_.image != VK_NULL_HANDLE) modelDestroyImage(device_, flatNormalTex_);
+    if (matSetLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, matSetLayout_, nullptr); matSetLayout_ = VK_NULL_HANDLE; }
     if (uniformBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, uniformBuffer_);
     if (descriptorPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }

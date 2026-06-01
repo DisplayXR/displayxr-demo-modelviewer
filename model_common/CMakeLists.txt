@@ -96,6 +96,11 @@ target_include_directories(model_renderer PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}
 )
+# common/ provides stb_image.h declarations; the stb *implementation* is linked
+# from common/d3d11_renderer.cpp into the final executable (see model_loader.cpp).
+target_include_directories(model_renderer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+)
 
 target_link_libraries(model_renderer PUBLIC
     Vulkan::Vulkan

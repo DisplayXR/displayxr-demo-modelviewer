@@ -1,10 +1,13 @@
 // Copyright 2026, Leia Inc.
 // SPDX-License-Identifier: BSL-1.0
 //
-// Metallic-roughness PBR fragment shader (Cook-Torrance GGX) with a single
-// directional light + a constant ambient term. v1 uses material FACTORS only
-// (no textures, no IBL) — base-color/normal/MR/emissive maps + image-based
-// lighting are the follow-up. See ../../PORTING.md.
+// Metallic-roughness PBR fragment shader (Cook-Torrance GGX) with the full
+// glTF material texture set (base-color, metallic-roughness, normal, occlusion,
+// emissive), sRGB-correct sampling, tangent-free normal mapping (Schüler's
+// cotangent frame from screen-space derivatives), one directional light, and a
+// hemispherical-ambient stand-in for IBL (so metal reflects sky/ground instead
+// of going black). Real image-based lighting (env cubemap + prefiltered specular
+// + BRDF LUT) is the remaining follow-up. See ../../PORTING.md.
 #version 450
 
 layout(location = 0) in vec3 inWorldPos;
@@ -21,10 +24,17 @@ layout(set = 0, binding = 0) uniform UBO {
 
 layout(push_constant) uniform Push {
     mat4 model;
-    vec4 baseColorFactor;
-    vec4 mrParams;     // x=metallic, y=roughness
-    vec4 emissive;     // rgb
+    vec4 baseColorFactor;  // linear (glTF factor)
+    vec4 mrParams;         // x=metallic factor, y=roughness factor
+    vec4 emissive;         // rgb emissive factor (linear)
 } pc;
+
+// Set 1: per-material textures. Absent maps default to white / flat normal.
+layout(set = 1, binding = 0) uniform sampler2D baseColorTex;
+layout(set = 1, binding = 1) uniform sampler2D mrTex;
+layout(set = 1, binding = 2) uniform sampler2D normalTex;
+layout(set = 1, binding = 3) uniform sampler2D occlusionTex;
+layout(set = 1, binding = 4) uniform sampler2D emissiveTex;
 
 layout(location = 0) out vec4 outColor;
 
@@ -35,55 +45,79 @@ float D_GGX(float ndoth, float a) {
     float d = (ndoth * ndoth) * (a2 - 1.0) + 1.0;
     return a2 / max(PI * d * d, 1e-7);
 }
-
 float G_SchlickSmith(float ndotv, float ndotl, float a) {
     float k = (a * a) * 0.5;
     float gv = ndotv / (ndotv * (1.0 - k) + k);
     float gl = ndotl / (ndotl * (1.0 - k) + k);
     return gv * gl;
 }
-
 vec3 F_Schlick(float cosT, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
+}
+vec3 srgbToLinear(vec3 c) { return pow(c, vec3(2.2)); }
+
+// Tangent-free normal mapping (Christian Schüler). Builds a cotangent frame
+// from screen-space derivatives of position + uv, so no TANGENT attribute is
+// needed. N is the (viewer-facing) geometric normal.
+vec3 perturbNormal(vec3 N, vec2 uv) {
+    vec3 mapN = texture(normalTex, uv).xyz * 2.0 - 1.0;
+    vec3 dp1 = dFdx(inWorldPos), dp2 = dFdy(inWorldPos);
+    vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
+    vec3 dp2perp = cross(dp2, N), dp1perp = cross(N, dp1);
+    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float invmax = inversesqrt(max(dot(T, T), dot(B, B)));
+    return normalize(mat3(T * invmax, B * invmax, N) * mapN);
+}
+
+// Cheap hemispherical environment irradiance (sky above, ground below).
+vec3 hemiEnv(vec3 dir) {
+    return mix(vec3(0.20, 0.18, 0.16), vec3(0.45, 0.50, 0.62),
+               clamp(dir.y * 0.5 + 0.5, 0.0, 1.0));
 }
 
 void main() {
     // Foreground-only clip (transparent mode): drop geometry behind the
-    // display plane so the desktop shows through there. Mirrors the GS demo's
-    // transparent-mode far cull. 0 = disabled (opaque path unaffected).
+    // display plane. 0 = disabled (opaque path unaffected).
     if (ubo.lightDir.w > 0.0 && inViewZ > ubo.lightDir.w) discard;
 
-    vec3 albedo = pc.baseColorFactor.rgb;
-    float metallic = clamp(pc.mrParams.x, 0.0, 1.0);
-    float roughness = clamp(pc.mrParams.y, 0.04, 1.0);
-    float a = roughness * roughness;
+    vec4 baseSample = texture(baseColorTex, inUV);
+    vec3 albedo = srgbToLinear(baseSample.rgb) * pc.baseColorFactor.rgb;
 
-    vec3 N = normalize(inNormal);
+    vec3 mr = texture(mrTex, inUV).rgb;        // g=roughness, b=metallic (linear)
+    float metallic  = clamp(mr.b * pc.mrParams.x, 0.0, 1.0);
+    float roughness = clamp(mr.g * pc.mrParams.y, 0.04, 1.0);
+    float a = roughness * roughness;
+    float ao = texture(occlusionTex, inUV).r;
+    vec3 emissive = srgbToLinear(texture(emissiveTex, inUV).rgb) * pc.emissive.rgb;
+
     vec3 V = normalize(ubo.cameraPos.xyz - inWorldPos);
-    // Two-sided: face the normal toward the viewer.
-    if (dot(N, V) < 0.0) N = -N;
+    vec3 Ng = normalize(inNormal);
+    if (dot(Ng, V) < 0.0) Ng = -Ng;            // two-sided
+    vec3 N = perturbNormal(Ng, inUV);
+
     vec3 L = normalize(ubo.lightDir.xyz);
     vec3 H = normalize(V + L);
-
     float ndotl = max(dot(N, L), 0.0);
     float ndotv = max(dot(N, V), 1e-4);
     float ndoth = max(dot(N, H), 0.0);
 
     vec3 f0 = mix(vec3(0.04), albedo, metallic);
+
+    // Direct directional light.
     float D = D_GGX(ndoth, a);
     float G = G_SchlickSmith(ndotv, ndotl, a);
     vec3  F = F_Schlick(max(dot(H, V), 0.0), f0);
-
     vec3 spec = (D * G) * F / max(4.0 * ndotv * ndotl, 1e-4);
     vec3 kd = (1.0 - F) * (1.0 - metallic);
-    vec3 diffuse = kd * albedo / PI;
+    vec3 direct = (kd * albedo / PI + spec) * vec3(3.0) * ndotl;
 
-    vec3 lightColor = vec3(3.0);  // directional intensity
-    vec3 color = (diffuse + spec) * lightColor * ndotl;
+    // Ambient (hemispherical-env IBL stand-in).
+    vec3 Fr = f0 + (max(vec3(1.0 - roughness), f0) - f0) * pow(1.0 - ndotv, 5.0);
+    vec3 ambDiffuse = hemiEnv(N) * albedo * (1.0 - metallic);
+    vec3 ambSpecular = hemiEnv(reflect(-V, N)) * Fr;
+    vec3 ambient = (ambDiffuse + ambSpecular) * ao;
 
-    // Constant ambient so unlit faces aren't pure black (cheap IBL stand-in).
-    color += albedo * 0.18;
-    color += pc.emissive.rgb;
-
-    outColor = vec4(color, pc.baseColorFactor.a);
+    vec3 color = direct + ambient + emissive;
+    outColor = vec4(color, baseSample.a * pc.baseColorFactor.a);
 }

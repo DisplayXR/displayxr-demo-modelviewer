@@ -5,15 +5,14 @@
  * @brief  CPU-side glTF 2.0 loader (tinygltf) → flat GPU-upload-friendly form.
  *
  * Vendor-neutral analog of 3dgs_common/gs_scene_loader.h. Walks the default
- * scene's node hierarchy, bakes each node's world transform, and flattens
- * every mesh primitive into a single interleaved vertex buffer + index buffer
- * with per-primitive draw ranges, materials, and model matrices.
+ * scene's node hierarchy, bakes each node's world transform, flattens every
+ * mesh primitive into one interleaved vertex buffer + index buffer, and
+ * decodes material textures (base-color, metallic-roughness, normal,
+ * occlusion, emissive) to RGBA8.
  *
- * v1 scope: static geometry (position + normal + uv0), metallic-roughness
- * material FACTORS only. Texture image decode/upload is a follow-up — tinygltf
- * is built here with no stb coupling (TINYGLTF_NO_STB_IMAGE*) to avoid a
- * duplicate-symbol clash with common/ (d3d11_renderer.cpp already defines the
- * stb implementation). Skinning/animation/morph targets are also follow-ups.
+ * Scope: static geometry (position + normal + uv0). Skinning/animation/morph
+ * targets are follow-ups. tinygltf's bundled stb is compiled file-local
+ * (STB_IMAGE_STATIC) so it doesn't clash with common/'s stb implementation.
  * See ../PORTING.md.
  */
 
@@ -29,12 +28,25 @@ struct ModelVertex {
     float uv[2];
 };
 
+// Decoded RGBA8 texture image. Indices below reference ModelData::textures.
+struct ModelTexture {
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> rgba;   // width*height*4
+};
+
 struct ModelMaterial {
     float baseColorFactor[4] = {1, 1, 1, 1};
     float metallic = 1.0f;
     float roughness = 1.0f;
     float emissive[3] = {0, 0, 0};
-    int   baseColorTexture = -1;  // reserved for the texture follow-up
+    // Texture indices into ModelData::textures, or -1 when absent (the
+    // renderer then binds a glTF-correct default: white, or flat normal).
+    int baseColorTex = -1;
+    int metallicRoughnessTex = -1;
+    int normalTex = -1;
+    int occlusionTex = -1;
+    int emissiveTex = -1;
 };
 
 struct ModelPrimitive {
@@ -47,6 +59,7 @@ struct ModelPrimitive {
 struct ModelData {
     std::vector<ModelVertex>    vertices;
     std::vector<uint32_t>       indices;
+    std::vector<ModelTexture>   textures;
     std::vector<ModelMaterial>  materials;
     std::vector<ModelPrimitive> primitives;
 
@@ -62,9 +75,6 @@ struct ModelData {
 bool model_loader_load(const char* gltfPath, ModelData& out);
 
 // ── Path helpers (replace the GS scene-loader's .ply/.spz equivalents) ────
-// True if the file exists and has a supported (.glb / .gltf) extension.
 bool model_validate_file(const std::string& path);
-// Filename without directory.
 std::string model_basename(const std::string& path);
-// Human-readable file size, e.g. "12.3 MB" (or "unknown" on error).
 std::string model_filesize_str(const std::string& path);

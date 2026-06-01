@@ -10,10 +10,10 @@
  */
 
 #define TINYGLTF_IMPLEMENTATION
-#define TINYGLTF_NO_STB_IMAGE
-#define TINYGLTF_NO_STB_IMAGE_WRITE
-#define TINYGLTF_NO_EXTERNAL_IMAGE
-#include <tiny_gltf.h>
+#define TINYGLTF_NO_STB_IMAGE        // supply a custom image loader (below) that calls
+#define TINYGLTF_NO_STB_IMAGE_WRITE  // the stb already linked from common/ — avoids a
+#include <tiny_gltf.h>               // duplicate stb implementation (and stb-config bugs)
+#include "stb_image.h"               // declarations only; impl is in common/d3d11_renderer.cpp
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -28,6 +28,28 @@
 #include <filesystem>
 
 namespace {
+
+// Custom tinygltf image loader → decode embedded/external images to RGBA8 via
+// the stb implementation already linked from common/d3d11_renderer.cpp.
+bool LoadImageStb(tinygltf::Image* image, const int /*imageIdx*/, std::string* err,
+                  std::string* /*warn*/, int /*reqW*/, int /*reqH*/,
+                  const unsigned char* bytes, int size, void* /*user*/) {
+    int w = 0, h = 0, comp = 0;
+    unsigned char* data = stbi_load_from_memory(bytes, size, &w, &h, &comp, 4);  // force RGBA
+    if (!data) {
+        if (err) *err = std::string("stbi_load_from_memory failed: ") +
+                        (stbi_failure_reason() ? stbi_failure_reason() : "unknown");
+        return false;
+    }
+    image->width = w;
+    image->height = h;
+    image->component = 4;
+    image->bits = 8;
+    image->pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    image->image.assign(data, data + (size_t)w * h * 4);
+    stbi_image_free(data);
+    return true;
+}
 
 // Compose a node's local transform: explicit matrix if present, else T*R*S.
 glm::mat4 nodeLocalMatrix(const tinygltf::Node& node) {
@@ -171,6 +193,7 @@ bool model_loader_load(const char* gltfPath, ModelData& out) {
 
     tinygltf::Model model;
     tinygltf::TinyGLTF loader;
+    loader.SetImageLoader(&LoadImageStb, nullptr);
     std::string err, warn;
 
     const std::string path = gltfPath;
@@ -190,7 +213,44 @@ bool model_loader_load(const char* gltfPath, ModelData& out) {
         return false;
     }
 
-    // Materials (factors only in v1).
+    // Decode images → RGBA8 (parallel to model.images). Empty entries (decode
+    // failed / unsupported bit depth) make the renderer fall back to a default.
+    out.textures.resize(model.images.size());
+    for (size_t i = 0; i < model.images.size(); ++i) {
+        const tinygltf::Image& img = model.images[i];
+        if (img.image.empty() || img.width <= 0 || img.height <= 0 ||
+            img.bits != 8 || img.pixel_type != TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
+            std::fprintf(stderr, "[model_loader] image %zu skipped (w=%d h=%d bits=%d comp=%d)\n",
+                         i, img.width, img.height, img.bits, img.component);
+            continue;
+        }
+        ModelTexture t;
+        t.width = img.width;
+        t.height = img.height;
+        t.rgba.resize((size_t)img.width * img.height * 4);
+        const int comp = img.component;
+        const unsigned char* s = img.image.data();
+        for (size_t p = 0; p < (size_t)img.width * img.height; ++p) {
+            uint8_t r = s[p * comp + 0];
+            uint8_t g = (comp >= 3) ? s[p * comp + 1] : r;       // 1/2-comp → grayscale
+            uint8_t b = (comp >= 3) ? s[p * comp + 2] : r;
+            uint8_t a = (comp == 4) ? s[p * comp + 3]
+                       : (comp == 2) ? s[p * comp + 1] : 255;
+            t.rgba[p * 4 + 0] = r; t.rgba[p * 4 + 1] = g;
+            t.rgba[p * 4 + 2] = b; t.rgba[p * 4 + 3] = a;
+        }
+        out.textures[i] = std::move(t);
+    }
+
+    // glTF texture index → source image index (== ModelData::textures index).
+    auto resolveTex = [&](int gltfTexIndex) -> int {
+        if (gltfTexIndex < 0 || gltfTexIndex >= (int)model.textures.size()) return -1;
+        int src = model.textures[gltfTexIndex].source;
+        if (src < 0 || src >= (int)out.textures.size()) return -1;
+        return out.textures[src].rgba.empty() ? -1 : src;  // -1 → renderer default
+    };
+
+    // Materials (factors + texture refs).
     out.materials.reserve(model.materials.size());
     for (const auto& mat : model.materials) {
         ModelMaterial mm{};
@@ -201,7 +261,11 @@ bool model_loader_load(const char* gltfPath, ModelData& out) {
         mm.roughness = (float)pbr.roughnessFactor;
         if (mat.emissiveFactor.size() == 3)
             for (int i = 0; i < 3; ++i) mm.emissive[i] = (float)mat.emissiveFactor[i];
-        mm.baseColorTexture = pbr.baseColorTexture.index;  // recorded, unused in v1
+        mm.baseColorTex          = resolveTex(pbr.baseColorTexture.index);
+        mm.metallicRoughnessTex  = resolveTex(pbr.metallicRoughnessTexture.index);
+        mm.normalTex             = resolveTex(mat.normalTexture.index);
+        mm.occlusionTex          = resolveTex(mat.occlusionTexture.index);
+        mm.emissiveTex           = resolveTex(mat.emissiveTexture.index);
         out.materials.push_back(mm);
     }
 
