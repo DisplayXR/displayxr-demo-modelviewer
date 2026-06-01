@@ -1,14 +1,20 @@
 # Bundled demo model
 
-Drop a small, redistributable glTF 2.0 model here named `sample.glb`. The
-build scripts copy `sample.glb` next to the executable and the app auto-loads
-it at startup (mirroring how the Gaussian-splat demo bundles `butterfly.spz`).
+`sample.glb` is the model the app auto-loads at startup. The build scripts copy
+it next to the executable and the installer stages it (the same pattern the
+Gaussian-splat demo uses for `butterfly.spz`).
 
-Good public-domain / CC0 starter models:
-- Khronos **DamagedHelmet** (`glTF-Sample-Assets`, CC-BY) — classic PBR test.
-- Khronos **BoxTextured** / **Avocado** — tiny, fast to load.
+## Current asset — attribution
 
-  https://github.com/KhronosGroup/glTF-Sample-Assets
+`sample.glb` is **"Battle Damaged Sci-fi Helmet — PBR"** (a.k.a. *DamagedHelmet*)
+from the [Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/DamagedHelmet)
+collection.
 
-Pick a license compatible with this repo's BSL-1.0 distribution, or keep the
-asset out of git and document the download in the release notes.
+- Author: **theblueturtle_** (helmet), glTF conversion by ctxwing.
+- License: **CC BY 4.0** — <https://creativecommons.org/licenses/by/4.0/>
+- Attribution **must** be retained when redistributing this asset (installer
+  about/credits + release notes).
+
+To swap the default model, replace `sample.glb` and update this attribution.
+CC0 alternatives (no attribution needed) live in the same Khronos repo, e.g.
+`Box`, `BoxTextured`, `Avocado`.

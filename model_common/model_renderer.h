@@ -84,6 +84,12 @@ private:
 
     bool createRenderTargets();
     bool createPipeline();
+    bool createSamplerAndDefaults();
+    ModelImage uploadTexture(const struct ModelTexture& tex);
+    VkDescriptorSet makeMaterialSet(VkImageView baseColor, VkImageView mr,
+                                    VkImageView normal, VkImageView occ,
+                                    VkImageView emissive);
+    bool finalizeModel(struct ModelData& md);   // upload geometry+textures, build material sets
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar);
     void cleanupModel();
 
@@ -117,9 +123,19 @@ private:
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
     ModelBuffer uniformBuffer_;   // host-visible UniformBlock
 
+    // ── Material textures (set = 1: 5 combined image samplers) ───────────
+    VkSampler sampler_ = VK_NULL_HANDLE;
+    ModelImage whiteTex_;        // 1x1 white  — default base-color/MR/AO/emissive
+    ModelImage flatNormalTex_;   // 1x1 (128,128,255) — default tangent-space normal
+    VkDescriptorSetLayout matSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool matPool_ = VK_NULL_HANDLE;          // recreated per model
+    std::vector<VkDescriptorSet> materialSets_;          // one per material
+    VkDescriptorSet defaultMatSet_ = VK_NULL_HANDLE;     // for material == -1
+
     // ── Loaded model GPU data ────────────────────────────────────────────
     ModelBuffer vertexBuffer_;
     ModelBuffer indexBuffer_;
+    std::vector<ModelImage>     modelTextures_;
     std::vector<ModelMaterial>  materials_;
     std::vector<ModelPrimitive> primitives_;
     float bboxMin_[3] = {0, 0, 0};
