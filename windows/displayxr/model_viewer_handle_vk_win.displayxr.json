@@ -5,7 +5,7 @@
   "category": "demo",
   "display_mode": "auto",
   "description": "Interactive PBR viewer for 3D models (.glb / .gltf). Drag-and-drop a model or press L to load. Bundled with a demo model.",
-  "icon": "icon.png",
-  "icon_3d": "icon_sbs.png",
+  "icon": "model_viewer_icon.png",
+  "icon_3d": "model_viewer_icon_sbs.png",
   "icon_3d_layout": "sbs-lr"
 }
