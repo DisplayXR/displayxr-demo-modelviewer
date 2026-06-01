@@ -114,10 +114,10 @@ static std::mutex g_sceneMutex;
 // Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
 static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
-// Comfort margin is baked into getMainObjectBounds (which picks a different
-// multiplier for single-object vs scene-with-central-object). Keep this at
-// 1.0 to mean "no extra margin on top of what the bounds method returned".
-static constexpr float kAutoFitVerticalComfort = 1.0f;
+// Initial virtual-display height as a multiple of the model's height: the
+// display-centric rig frames the (centered) model with 1.2× its height, i.e.
+// ~10% headroom top and bottom.
+static constexpr float kAutoFitVerticalComfort = 1.2f;
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -134,7 +134,7 @@ static std::atomic<bool> g_fitValid{false};
 // Caller must hold g_sceneMutex (we read pickData_ from the renderer).
 static void ApplyAutoFitForLoadedScene_locked() {
     float center[3], extent[3];
-    // Voxel-density flood-fill — see the macOS demo for rationale.
+    // Full model AABB: center for the rig position, extent[1] for the height fit.
     bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
     if (ok) {
         g_fitCenter[0] = center[0];
