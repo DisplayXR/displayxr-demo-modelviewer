@@ -1,22 +1,12 @@
-// ───────────────────────────────────────────────────────────────────────
-// PORTING BASELINE — copied verbatim from displayxr-demo-gaussiansplat.
-//
-// The window / OpenXR session / transparency / HUD / input plumbing here is
-// reusable AS-IS for the model viewer. The RENDERER call sites still target
-// the Gaussian-splat API (GsRenderer, loadScene, pickGaussian, findBestYaw,
-// .ply/.spz loading) and must be retargeted to model_common/ModelRenderer
-// (loadModel, pickSurface, .glb/.gltf). This file does NOT compile until that
-// retarget is done. See ../PORTING.md for the exact call-site checklist.
-// ───────────────────────────────────────────────────────────────────────
 // Copyright 2025, Leia Inc.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  macOS Vulkan OpenXR 3D Gaussian Splatting with external window binding
+ * @brief  macOS Vulkan OpenXR glTF 2.0 PBR model viewer with external window binding
  *
- * Renders 3DGS scenes on tracked 3D displays via OpenXR.
+ * Renders glTF 2.0 models on tracked 3D displays via OpenXR.
  * Based on cube_handle_vk_macos with the cube/grid renderer replaced by
- * a 3DGS.cpp compute pipeline.  Features a "Load Scene" button overlay.
+ * the model_common/ModelRenderer PBR pipeline.  Features a "Load…" button overlay.
  *
  * Features:
  * - App creates and owns the NSWindow (XR_EXT_cocoa_window_binding)
@@ -24,7 +14,7 @@
  * - XR_EXT_display_info: Kooima projection, display metrics
  * - V key cycles rendering modes via xrRequestDisplayRenderingModeEXT
  * - 0-3 keys select rendering mode directly
- * - L key or button click: NSOpenPanel to load .ply/.spz scenes
+ * - L key or button click: NSOpenPanel to load .glb/.gltf models
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
@@ -61,8 +51,7 @@
 #include "view_params.h"
 #include "display3d_view.h"
 #include "camera3d_view.h"
-#include "gs_renderer.h"
-#include "gs_scene_loader.h"
+#include "model_renderer.h"
 #include "atlas_capture.h"
 
 // ============================================================================
@@ -144,10 +133,10 @@ struct InputState {
 // percentile-based extent — see ApplyAutoFitForLoadedScene().
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
-// Comfort margin is baked into getMainObjectBounds (which picks a different
-// multiplier for single-object vs scene-with-central-object). Keep this at
-// 1.0 to mean "no extra margin on top of what the bounds method returned".
-static constexpr float kAutoFitVerticalComfort = 1.0f;
+// Initial virtual-display height as a multiple of the model's height: the
+// display-centric rig frames the (centered) model with 1.2× its height, i.e.
+// ~10% headroom top and bottom.
+static constexpr float kAutoFitVerticalComfort = 1.2f;
 
 // Cached auto-fit result for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -173,8 +162,8 @@ static bool g_fullscreen = false;
 static NSRect g_savedWindowFrame = {};
 static NSUInteger g_savedWindowStyle = 0;
 
-// 3DGS state
-static GsRenderer g_gsRenderer;
+// Model-viewer state
+static ModelRenderer g_modelRenderer;
 static std::string g_loadedFileName;
 
 static double g_avgFrameTime = 0.0;
@@ -477,15 +466,15 @@ static void OpenLoadDialog() {
         [panel setCanChooseFiles:YES];
         [panel setCanChooseDirectories:NO];
         [panel setAllowsMultipleSelection:NO];
-        [panel setTitle:@"Load Gaussian Splatting Scene"];
-        [panel setMessage:@"Select a .ply or .spz file containing 3D Gaussian splats"];
+        [panel setTitle:@"Load 3D Model"];
+        [panel setMessage:@"Select a .glb or .gltf glTF 2.0 model"];
 
         if (@available(macOS 11.0, *)) {
-            UTType *plyType = [UTType typeWithFilenameExtension:@"ply"];
-            UTType *spzType = [UTType typeWithFilenameExtension:@"spz"];
+            UTType *glbType  = [UTType typeWithFilenameExtension:@"glb"];
+            UTType *gltfType = [UTType typeWithFilenameExtension:@"gltf"];
             NSMutableArray<UTType *> *types = [NSMutableArray array];
-            if (plyType) [types addObject:plyType];
-            if (spzType) [types addObject:spzType];
+            if (glbType)  [types addObject:glbType];
+            if (gltfType) [types addObject:gltfType];
             if (types.count > 0) {
                 [panel setAllowedContentTypes:types];
             }
@@ -496,17 +485,17 @@ static void OpenLoadDialog() {
             if (url) {
                 const char *path = [[url path] UTF8String];
                 std::string pathStr(path);
-                if (ValidateSceneFile(pathStr)) {
-                    LOG_INFO("Loading 3DGS scene: %s", path);
-                    if (g_gsRenderer.loadScene(path)) {
-                        g_loadedFileName = GetPlyFilename(pathStr);
-                        LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
-                            GetPlyFileSize(pathStr).c_str());
+                if (model_validate_file(pathStr)) {
+                    LOG_INFO("Loading model: %s", path);
+                    if (g_modelRenderer.loadModel(path)) {
+                        g_loadedFileName = model_basename(pathStr);
+                        LOG_INFO("Model loaded: %s (%s)", g_loadedFileName.c_str(),
+                            model_filesize_str(pathStr).c_str());
                         ApplyAutoFitForLoadedScene();
                     } else {
-                        LOG_ERROR("Failed to load scene: %s", path);
+                        LOG_ERROR("Failed to load model: %s", path);
                         NSAlert *alert = [[NSAlert alloc] init];
-                        [alert setMessageText:@"Failed to load scene file"];
+                        [alert setMessageText:@"Failed to load model file"];
                         [alert setInformativeText:@"The file may be corrupt or unsupported."];
                         [alert runModal];
                     }
@@ -557,7 +546,7 @@ static void OpenLoadDialog() {
     MarkUserInput(g_input);
     g_input.yaw -= (float)[event deltaX] * 0.005f;
     // pitch += because the renderer Y-mirrors the world internally
-    // (gs_renderer.cpp); without this, mouse-drag-up would tilt the
+    // (model_renderer.cpp); without this, mouse-drag-up would tilt the
     // camera DOWN. cube_handle apps go the other way (-= deltaY)
     // because they Y-flip at rasterization (negative VkViewport.height),
     // not at view stage.
@@ -665,7 +654,7 @@ static void OpenLoadDialog() {
     }
 }
 
-// Drag-and-drop: accept .ply and .spz files
+// Drag-and-drop: accept .glb and .gltf files
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
     NSPasteboard *pb = [sender draggingPasteboard];
     if ([[pb types] containsObject:NSPasteboardTypeFileURL]) {
@@ -681,7 +670,7 @@ static void OpenLoadDialog() {
         if (![url isFileURL]) continue;
         NSString *path = [url path];
         NSString *ext = [[path pathExtension] lowercaseString];
-        if ([ext isEqualToString:@"ply"] || [ext isEqualToString:@"spz"]) {
+        if ([ext isEqualToString:@"glb"] || [ext isEqualToString:@"gltf"]) {
             g_input.pendingLoadPath = std::string([path UTF8String]);
             return YES;
         }
@@ -713,7 +702,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
                        NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     g_window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    [g_window setTitle:@"DisplayXR Gaussian Splat Viewer Demo"];
+    [g_window setTitle:@"DisplayXR 3D Model Viewer"];
     [g_window setDelegate:delegate];
     [g_window center];
 
@@ -722,7 +711,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_metalView];
 
-    // Accept drag-and-drop of .ply / .spz files
+    // Accept drag-and-drop of .glb / .gltf files
     [g_metalView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 
     // Add HUD overlay — frosted backdrop + text view inside
@@ -973,7 +962,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strncpy(ci.applicationInfo.applicationName, "SR3DGSOpenXRExtMacOS", sizeof(ci.applicationInfo.applicationName));
+    strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
     ci.applicationInfo.applicationVersion = 1;
     strncpy(ci.applicationInfo.engineName, "None", sizeof(ci.applicationInfo.engineName));
     ci.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
@@ -1049,7 +1038,7 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
 
     VkApplicationInfo ai = {};
     ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    ai.pApplicationName = "SR3DGSOpenXRExtMacOS";
+    ai.pApplicationName = "DisplayXRModelViewerMacOS";
     ai.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ci = {};
     ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -1393,16 +1382,16 @@ static bool FileExists(const std::string& p) {
 }
 
 // Compute robust scene bounds (5th–95th percentile per axis) and set the
-// display rig pose + vHeight to frame the scene. Display orientation is
-// kept identity (forward = world −Z): splats have no canonical front, and
-// any heuristic (PCA, etc.) can pick the wrong side; the user can rotate
+// display rig pose + vHeight to frame the model. Display orientation is
+// kept identity (forward = world −Z): a model's canonical front is its
+// authored +Z, which glTF places facing the viewer; the user can rotate
 // with mouse drag from a predictable starting pose.
 static void ApplyAutoFitForLoadedScene() {
     float center[3], extent[3];
-    // Voxel-density flood-fill from the peak voxel: locates the main object
-    // by spatial connectivity (figure is a contiguous 3D blob, walls/floor
-    // are separated by air gaps that the flood-fill can't cross). 64³ grid.
-    if (g_gsRenderer.getMainObjectBounds(64u, center, extent)) {
+    // Robust AABB (5th–95th percentile per axis): center for the rig position,
+    // extent[1] for the height fit. Percentile trim rejects stray outlier
+    // vertices that would otherwise inflate the frame.
+    if (g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent)) {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
@@ -1410,10 +1399,8 @@ static void ApplyAutoFitForLoadedScene() {
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
         g_fitVHeight = vh;
 
-        // EXPERIMENT: yaw scan disabled to test if RUB load convention now
-        // gives a natural yaw=0 facing (matching SuperSplat's default).
-        // float viewerOffset[3] = {0.0f, 0.1f, 0.6f};
-        // g_fitYaw = g_gsRenderer.findBestYaw(g_fitCenter, viewerOffset, 8);
+        // glTF models are authored front-facing (+Z toward the viewer), so a
+        // yaw scan isn't needed — start at yaw=0 and let the user rotate.
         g_fitYaw = 0.0f;
 
         g_fitValid = true;
@@ -1436,25 +1423,24 @@ static void ApplyAutoFitForLoadedScene() {
     // threshold starts rotating immediately on first display.
     MarkUserInput(g_input);
 
-    // Per-format orientation correction is now done at load time (PLY loader
-    // converts RDF+X-mirror → canonical RUB; SPZ loader uses RUB natively).
-    // GsRenderer::updateUniforms negates the Y row of proj_mat to match the
+    // glTF uses a +Y-up, right-handed coordinate system natively.
+    // ModelRenderer::updateUniforms negates the Y row of proj_mat to match the
     // +Y-up convention. No runtime view-stage flips needed.
 }
 
 static void TryAutoLoadBundledScene() {
     std::string dir = ExeDir();
     if (dir.empty()) return;
-    std::string path = dir + "/butterfly.spz";
+    std::string path = dir + "/sample.glb";
     if (!FileExists(path)) {
-        LOG_INFO("No bundled scene at %s (skipping auto-load)", path.c_str());
+        LOG_INFO("No bundled model at %s (skipping auto-load)", path.c_str());
         return;
     }
-    if (!ValidateSceneFile(path)) return;
-    LOG_INFO("Auto-loading bundled scene: %s", path.c_str());
-    if (g_gsRenderer.loadScene(path.c_str())) {
-        g_loadedFileName = GetPlyFilename(path);
-        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
+    if (!model_validate_file(path)) return;
+    LOG_INFO("Auto-loading bundled model: %s", path.c_str());
+    if (g_modelRenderer.loadModel(path.c_str())) {
+        g_loadedFileName = model_basename(path);
+        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), model_filesize_str(path).c_str());
         ApplyAutoFitForLoadedScene();
     } else {
         LOG_WARN("Auto-load failed for %s", path.c_str());
@@ -1472,7 +1458,7 @@ int main() {
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    LOG_INFO("=== SR 3DGS OpenXR + External macOS Window ===");
+    LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) + External macOS Window ===");
 
     // Initialize rendering mode from env var (legacy fallback)
     {
@@ -1552,11 +1538,11 @@ int main() {
       xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
           (XrSwapchainImageBaseHeader*)swapchainImages.data()); }
 
-    // Initialize 3DGS renderer
+    // Initialize model renderer
     { uint32_t rw = xr.swapchain.width;   // Full width — mono uses entire swapchain
       uint32_t rh = xr.swapchain.height;
-      if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex, rw, rh))
-          LOG_WARN("3DGS renderer init failed");
+      if (!g_modelRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex, rw, rh))
+          LOG_WARN("model renderer init failed");
     }
 
     // Command pool for placeholder rendering
@@ -1569,18 +1555,24 @@ int main() {
     g_input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
     g_input.nominalViewerZ = xr.nominalViewerZ;
     g_input.renderingModeCount = xr.renderingModeCount;
+    // Align the runtime's active rendering mode with the app's default
+    // (currentRenderingMode = 1, the first 3D mode) at startup. The sim display
+    // boots in 2D (mode 0); without this the display stays 2D until the user
+    // toggles. The main-loop dispatch holds this request until the session is
+    // running, so it isn't issued to a not-yet-begun session and lost.
+    g_input.renderingModeChangeRequested = true;
     g_input.lastInputTimeSec = NowSec();
 
     // Reflect initial state in top-bar buttons.
     UpdateTopBarButtonTitles(xr);
 
-    // Try loading the bundled butterfly.spz scene (copied next to the exe by CMake).
+    // Try loading the bundled sample.glb model (copied next to the exe by CMake).
     TryAutoLoadBundledScene();
 
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
     LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
-    LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.ply/.spz also accept drag-and-drop)");
+    LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.glb/.gltf also accept drag-and-drop)");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -1603,10 +1595,10 @@ int main() {
         if (!g_input.pendingLoadPath.empty()) {
             std::string p = g_input.pendingLoadPath;
             g_input.pendingLoadPath.clear();
-            if (ValidateSceneFile(p)) {
-                LOG_INFO("Loading dropped scene: %s", p.c_str());
-                if (g_gsRenderer.loadScene(p.c_str())) {
-                    g_loadedFileName = GetPlyFilename(p);
+            if (model_validate_file(p)) {
+                LOG_INFO("Loading dropped model: %s", p.c_str());
+                if (g_modelRenderer.loadModel(p.c_str())) {
+                    g_loadedFileName = model_basename(p);
                     ApplyAutoFitForLoadedScene();
                 }
             }
@@ -1622,8 +1614,11 @@ int main() {
 
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
 
-        // Handle rendering mode change (V=cycle, 0-3=direct, or Mode button)
-        if (g_input.renderingModeChangeRequested) {
+        // Handle rendering mode change (V=cycle, 0-3=direct, Mode button, or the
+        // startup default-mode request). Held until the session is running so the
+        // request reaches a begun session rather than being dropped (this handler
+        // runs before PollEvents, which is what begins the session).
+        if (g_input.renderingModeChangeRequested && xr.sessionRunning) {
             g_input.renderingModeChangeRequested = false;
             if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
                 xr.pfnRequestDisplayRenderingModeEXT(xr.session, g_input.currentRenderingMode);
@@ -1715,8 +1710,8 @@ int main() {
 
                         XrPosef cameraPose;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
-                        // GsRenderer Y-mirrors the world inside updateUniforms (see comment
-                        // in gs_renderer.cpp). The off-axis Kooima projection assumes the
+                        // ModelRenderer Y-mirrors the world inside updateUniforms (see comment
+                        // in model_renderer.cpp). The off-axis Kooima projection assumes the
                         // mirror is reflected in the displayPose passed to display3d_compute_view,
                         // so negate Y here to keep the eye-vs-display geometry consistent.
                         cameraPose.position = {g_input.cameraPosX, -g_input.cameraPosY, g_input.cameraPosZ};
@@ -1769,7 +1764,7 @@ int main() {
                                 eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
                             }
                             for (auto& e : rawEyePos) { e.x -= eyeOffsetX; e.y -= eyeOffsetY; }
-                            // GsRenderer Y-mirrors the world; cameraPose Y is negated
+                            // ModelRenderer Y-mirrors the world; cameraPose Y is negated
                             // below at the display3d_compute_views boundary. Eyes must
                             // live in the same render frame so the asymmetric Kooima
                             // projection's eye-vs-display geometry stays consistent —
@@ -1790,7 +1785,7 @@ int main() {
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
-                        // physical mouse location on the display surface, pick nearest splat,
+                        // physical mouse location on the display surface, pick nearest surface,
                         // then smoothly move & re-orient the virtual display to face back
                         // along the ray.
                         if (g_input.teleportRequested && hasKooima) {
@@ -1835,10 +1830,10 @@ int main() {
                                 ? (XrVector3f){centerEyeDisp.x / es, centerEyeDisp.y / es, centerEyeDisp.z / es}
                                 : centerEyeDisp;
                             // Use a real-world-frame displayPose for picking — the unproject
-                            // ray needs to be in the same frame as the splats (un-Y-flipped
+                            // ray needs to be in the same frame as the model (un-Y-flipped
                             // world). cameraPose has its Y negated for the renderer's view-
                             // stage Y mirror; using it here would put rayOrigin in a mirror
-                            // frame and pickGaussian would intersect against splats in the
+                            // frame and pickSurface would intersect against the mesh in the
                             // wrong frame.
                             XrPosef cameraPoseWorld = cameraPose;
                             cameraPoseWorld.position.y = g_input.cameraPosY;
@@ -1854,7 +1849,7 @@ int main() {
                             float rayOrigin[3] = {rayOriginV.x, rayOriginV.y, rayOriginV.z};
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
-                            if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
+                            if (g_modelRenderer.pickSurface(rayOrigin, rayDir, hitPos)) {
                                 // Both endpoints stored in WORLD frame (the same frame as
                                 // g_input.cameraPosX/Y/Z) so the slerp interpolates
                                 // consistently. cameraPose has its Y negated for the
@@ -1871,7 +1866,7 @@ int main() {
                                 g_input.transitionTo = target;
                                 g_input.transitionT = 0.0f;
                                 g_input.transitioning = true;
-                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)",
+                                LOG_INFO("Focus on surface (%.3f, %.3f, %.3f)",
                                     hitPos[0], hitPos[1], hitPos[2]);
                             }
                         } else if (g_input.teleportRequested) {
@@ -1914,13 +1909,13 @@ int main() {
                                 projectionViews[eye].fov = hasKooima ? eyeViews[eye].fov : views[srcView].fov;
                             }
 
-                            // Render 3DGS or placeholder
+                            // Render model or placeholder
                             VkImage targetImage = swapchainImages[imageIndex].image;
                             VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
-                            if (g_gsRenderer.hasScene()) {
+                            if (g_modelRenderer.hasModel()) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
-                                    g_gsRenderer.renderEye(
+                                    g_modelRenderer.renderEye(
                                         targetImage, swapFormat,
                                         xr.swapchain.width, xr.swapchain.height,
                                         tileOffsets[eye].first, tileOffsets[eye].second,
@@ -1939,14 +1934,14 @@ int main() {
                             // rendered view. Anchored at the swapchain's top-left.
                             if (g_input.captureAtlasRequested) {
                                 g_input.captureAtlasRequested = false;
-                                if (g_gsRenderer.hasScene()) {
+                                if (g_modelRenderer.hasModel()) {
                                     uint32_t cols = tileColumns > 0 ? tileColumns : 1u;
                                     uint32_t rows = tileRows > 0 ? tileRows : 1u;
                                     uint32_t atlasW = cols * renderW;
                                     uint32_t atlasH = rows * renderH;
                                     if (atlasW <= xr.swapchain.width && atlasH <= xr.swapchain.height) {
-                                        // Strip extension from scene filename
-                                        // (e.g. "butterfly.spz" → "butterfly").
+                                        // Strip extension from model filename
+                                        // (e.g. "sample.glb" → "sample").
                                         auto dot = g_loadedFileName.find_last_of('.');
                                         std::string stem = (dot == std::string::npos)
                                             ? g_loadedFileName
@@ -2007,9 +2002,9 @@ int main() {
             @autoreleasepool {
                 if (g_input.hudVisible && g_hudView != nil) {
                     double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
-                    NSString *sceneInfo = g_gsRenderer.hasScene()
-                        ? [NSString stringWithFormat:@"Scene: %s", g_loadedFileName.c_str()]
-                        : @"No scene loaded (press L)";
+                    NSString *sceneInfo = g_modelRenderer.hasModel()
+                        ? [NSString stringWithFormat:@"Model: %s", g_loadedFileName.c_str()]
+                        : @"No model loaded (press L)";
 
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
                     const char *orbitLabel = g_input.animateEnabled
@@ -2033,7 +2028,7 @@ int main() {
                         "%@"
                         "Vdisplay: (%.2f, %.2f, %.2f)\n"
                         "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
-                        "DblClick=Focus splat  -/= Depth  Space=Reset\n"
+                        "DblClick=Focus  -/= Depth  Space=Reset\n"
                         "M=Auto-Orbit  V=Mode  L=Load  Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",
@@ -2077,7 +2072,7 @@ int main() {
     }
 
     LOG_INFO("=== Shutting down ===");
-    g_gsRenderer.cleanup();
+    g_modelRenderer.cleanup();
     if (cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, cmdPool, nullptr);
     CleanupOpenXR(xr);
     // MoltenVK may throw std::system_error ("mutex lock failed") during device/instance

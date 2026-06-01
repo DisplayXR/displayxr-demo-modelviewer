@@ -83,6 +83,13 @@ the app auto-loads it. See `*/assets/README.md`.
 - `windows/main.cpp` + `xr_session.cpp` retargeted to `ModelRenderer`
   (`loadModel`/`pickSurface`/`getRobustSceneBounds`, `.glb/.gltf` dialogs).
 
+**macOS v1 — implemented** (branch `port/macos-renderer`):
+- `macos/main.mm` retargeted to `ModelRenderer` mirroring the Windows port —
+  NSOpenPanel + drag-drop accept `.glb/.gltf`, `sample.glb` auto-loads,
+  double-click focus calls `pickSurface`. No transparent-background mode
+  (Windows-only); foreground clip omitted. Builds the
+  `model_viewer_handle_vk_macos` target via `scripts/build_macos.sh`.
+
 **Open follow-ups:**
 - **Textures + IBL** — biggest visual win. Decode base-color/normal/MR/AO/
   emissive maps and add irradiance + prefiltered-env + BRDF-LUT. Needs an stb
@@ -93,11 +100,15 @@ the app auto-loads it. See `*/assets/README.md`.
   animation sampling, joint UBO.
 - **`pickSurface`** — ray/triangle intersection (currently returns false, so
   double-click focus is a no-op).
-- **macOS** — `macos/main.mm` is still the GS baseline (banner intact) and
-  links `model_renderer` but calls the GS API → won't build on Apple. Retarget
-  it the same way `windows/main.cpp` was. The Windows build is unaffected
-  (`macos/CMakeLists.txt` early-returns off-Apple).
-- **Bundled `sample.glb`** — add a CC0/CC-BY model under `*/assets/`.
+- ~~**macOS**~~ — **done** (branch `port/macos-renderer`): `macos/main.mm`
+  retargeted from the GS API to `ModelRenderer` the same way `windows/main.cpp`
+  was — `loadModel`/`pickSurface`/`hasModel`/`getRobustSceneBounds`,
+  `.glb/.gltf` NSOpenPanel + drag-drop, `sample.glb` auto-load. Builds via
+  `scripts/build_macos.sh` → `build/macos/model_viewer_handle_vk_macos`. macOS
+  has no transparent-background mode (Windows-only), so the per-eye foreground
+  clip was intentionally omitted (`renderEye`'s `clipFar` defaults to 0).
+- ~~**Bundled `sample.glb`**~~ — **done**: present under `windows/assets/` and
+  `macos/assets/` (3.7 MB), copied next to the exe by both build scripts.
 
 ## Definition of done
 
