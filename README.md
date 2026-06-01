@@ -57,9 +57,15 @@ first configure (no submodules).
 ```bash
 brew install cmake ninja vulkan-sdk openxr-loader
 ./scripts/build_macos.sh
-# Run
-./build/macos/model_viewer_handle_vk_macos
+# Run against an installed DisplayXR runtime (handles the Vulkan-loader setup):
+./scripts/run_macos_dev.sh
 ```
+> Launch the dev build with `scripts/run_macos_dev.sh`, not the bare binary.
+> The dev binary links Homebrew's Vulkan loader while the installed runtime
+> loads its own; the script converges both on one loader (and points Vulkan at
+> the runtime's bundled MoltenVK) so the `xrGetVulkanGraphicsDeviceKHR`
+> handshake succeeds. The distributed `.app` (`build_macos.sh --installer`)
+> bundles a self-consistent Vulkan stack and needs none of this.
 
 ### Windows
 ```bat
