@@ -49,6 +49,10 @@ add_executable(model_viewer_handle_vk_macos
     # Vulkan host-readback path for the 'I' key atlas capture (mirrors the
     # Windows target — lives in common/ but isn't part of sr_common_base).
     ${CMAKE_SOURCE_DIR}/common/atlas_capture_vk.cpp
+    # stb_image (read) implementation. model_loader.cpp takes stb declarations
+    # only; on Windows the impl comes from common/d3d11_renderer.cpp, which is
+    # Windows-only — macOS supplies it through this dedicated TU instead.
+    ${CMAKE_SOURCE_DIR}/common/stb_image_impl_macos.cpp
 )
 
 target_include_directories(model_viewer_handle_vk_macos PRIVATE
