@@ -36,6 +36,11 @@ layout(set = 1, binding = 2) uniform sampler2D normalTex;
 layout(set = 1, binding = 3) uniform sampler2D occlusionTex;
 layout(set = 1, binding = 4) uniform sampler2D emissiveTex;
 
+// Set 2: image-based lighting (generated from the analytic sky).
+layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
+layout(set = 2, binding = 1) uniform samplerCube prefilteredMap;  // specular (roughness mips)
+layout(set = 2, binding = 2) uniform sampler2D   brdfLUT;         // split-sum scale/bias
+
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.14159265359;
@@ -55,6 +60,10 @@ vec3 F_Schlick(float cosT, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
 vec3 srgbToLinear(vec3 c) { return pow(c, vec3(2.2)); }
+// Fresnel with a roughness-aware ceiling (for ambient specular).
+vec3 F_SchlickRoughness(float cosT, vec3 f0, float rough) {
+    return f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
+}
 
 // Tangent-free normal mapping (Christian Schüler). Builds a cotangent frame
 // from screen-space derivatives of position + uv, so no TANGENT attribute is
@@ -68,12 +77,6 @@ vec3 perturbNormal(vec3 N, vec2 uv) {
     vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
     float invmax = inversesqrt(max(dot(T, T), dot(B, B)));
     return normalize(mat3(T * invmax, B * invmax, N) * mapN);
-}
-
-// Cheap hemispherical environment irradiance (sky above, ground below).
-vec3 hemiEnv(vec3 dir) {
-    return mix(vec3(0.20, 0.18, 0.16), vec3(0.45, 0.50, 0.62),
-               clamp(dir.y * 0.5 + 0.5, 0.0, 1.0));
 }
 
 void main() {
@@ -112,11 +115,15 @@ void main() {
     vec3 kd = (1.0 - F) * (1.0 - metallic);
     vec3 direct = (kd * albedo / PI + spec) * vec3(3.0) * ndotl;
 
-    // Ambient (hemispherical-env IBL stand-in).
-    vec3 Fr = f0 + (max(vec3(1.0 - roughness), f0) - f0) * pow(1.0 - ndotv, 5.0);
-    vec3 ambDiffuse = hemiEnv(N) * albedo * (1.0 - metallic);
-    vec3 ambSpecular = hemiEnv(reflect(-V, N)) * Fr;
-    vec3 ambient = (ambDiffuse + ambSpecular) * ao;
+    // Ambient = image-based lighting (split-sum): irradiance cube for diffuse,
+    // prefiltered cube + BRDF LUT for specular.
+    vec3 Fr = F_SchlickRoughness(ndotv, f0, roughness);
+    vec3 diffuseIBL = texture(irradianceMap, N).rgb * albedo * (1.0 - metallic);
+    float maxLod = float(textureQueryLevels(prefilteredMap) - 1);
+    vec3 prefiltered = textureLod(prefilteredMap, reflect(-V, N), roughness * maxLod).rgb;
+    vec2 ab = texture(brdfLUT, vec2(ndotv, roughness)).rg;
+    vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
+    vec3 ambient = (diffuseIBL + specularIBL) * ao;
 
     vec3 color = direct + ambient + emissive;
     outColor = vec4(color, baseSample.a * pc.baseColorFactor.a);
