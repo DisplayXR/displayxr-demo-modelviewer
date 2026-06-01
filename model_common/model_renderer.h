@@ -4,20 +4,17 @@
  * @file
  * @brief  glTF 2.0 PBR model renderer for the DisplayXR model-viewer demo.
  *
- * Vendor-neutral analog of 3dgs_common/gs_renderer.h. Loads a .glb/.gltf
- * model via tinygltf and rasterises it with a metallic-roughness PBR pass to
- * a viewport region of an OpenXR-provided Vulkan swapchain image, once per
- * eye/view, using the asymmetric per-eye Kooima projection the platform code
- * supplies.
+ * Vendor-neutral analog of 3dgs_common/gs_renderer.h. Loads a .glb/.gltf model
+ * via model_loader (tinygltf) and rasterises it with a metallic-roughness PBR
+ * pass into an internal colour image, then blits that into the per-eye
+ * swapchain viewport region — reusing the exact viewport-copy + transparency
+ * scaffolding the GS renderer uses, so it drops into the platform code with a
+ * mechanical rename.
  *
- * The intended implementation is a port of the MIT-licensed
- * SaschaWillems/Vulkan-glTF-PBR `vkglTF::Model` loader + PBR/IBL shaders.
- * This header is the SKELETON: the method surface mirrors what
- * windows/main.cpp + macos/main.mm already call on GsRenderer, so the
- * platform glue retargets with a near-mechanical rename. See ../PORTING.md.
- *
- * Method bodies in model_renderer.cpp are stubs (return false / clear to the
- * background colour) until the renderer is ported.
+ * v1 scope: static geometry, material FACTORS (base color, metallic,
+ * roughness, emissive), one directional light + flat ambient. Textures, IBL,
+ * skinning and animation are follow-ups; the shader/CMake hooks are in place.
+ * See ../PORTING.md.
  */
 
 #pragma once
@@ -25,9 +22,11 @@
 #include <vulkan/vulkan.h>
 #include <string>
 #include <cstdint>
+#include <vector>
+#include "model_vulkan_utils.h"
+#include "model_loader.h"
 
 struct ModelRenderer {
-    // Initialize with the OpenXR runtime's Vulkan resources.
     bool init(VkInstance instance,
               VkPhysicalDevice physicalDevice,
               VkDevice device,
@@ -36,52 +35,21 @@ struct ModelRenderer {
               uint32_t renderWidth,
               uint32_t renderHeight);
 
-    // Load a glTF 2.0 model (.glb or .gltf). Parses the scene graph, uploads
-    // vertex/index buffers + material textures, builds the PBR pipeline.
     bool loadModel(const char* gltfPath);
-
-    // Load a built-in debug model (e.g. a unit cube) so the demo renders
-    // something before any file is opened.
     bool loadDebugModel();
-
-    // Returns true if a model is currently loaded.
     bool hasModel() const;
-
-    // Returns the loaded model file path.
     const std::string& modelPath() const;
-
-    // Total primitive (draw-call) count across the loaded scene graph.
     uint32_t primitiveCount() const;
 
-    // World-space axis-aligned bounding box of the loaded model.
-    // Returns false if no model is loaded; otherwise writes min/max xyz.
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
-
-    // Robust center + per-axis extent for auto-framing. For a mesh model the
-    // raw AABB is already robust, so this can forward to getSceneBBox; kept as
-    // a distinct entry point because the platform framing code calls it.
-    // Returns false if no model is loaded.
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
-
-    // Raycast pick against the loaded mesh: nearest surface hit along a ray.
-    // Returns true if a hit was found, with the hit point written to hitPos.
     bool pickSurface(const float rayOrigin[3], const float rayDir[3],
                      float hitPos[3], float maxDistance = 100.0f) const;
-
-    // Find the display yaw (radians, around world +Y) for initial framing.
-    // For a model this can simply return 0 (front-facing) unless a smarter
-    // heuristic is wanted. Signature kept to match the platform call site.
     float findBestYaw(const float displayCenter[3],
                       const float viewerOffsetLocal[3],
                       uint32_t numCandidates = 8) const;
 
-    // Render one view to a region of a Vulkan swapchain image.
-    // Manages its own command buffers internally (allocate, record, submit, wait).
-    // viewMatrix and projMatrix are column-major float[16].
-    // transparentBg=true clears uncovered pixels to RGBA(0,0,0,0) so the
-    // runtime chroma-key pass yields desktop see-through.
-    // clipFarViewSpace>0 culls geometry beyond that view-space depth. 0=off.
     void renderEye(VkImage swapchainImage,
                    VkFormat swapchainFormat,
                    uint32_t imageWidth,
@@ -95,12 +63,29 @@ struct ModelRenderer {
                    bool transparentBg = false,
                    float clipFarViewSpace = 0.0f);
 
-    // Clean up all resources.
     void cleanup();
-
     ~ModelRenderer();
 
 private:
+    // Push-constant block (must match shaders/pbr.{vert,frag}). 112 bytes.
+    struct PushBlock {
+        float model[16];
+        float baseColorFactor[4];
+        float mrParams[4];   // x=metallic, y=roughness
+        float emissive[4];   // rgb
+    };
+    // Set-0 uniform buffer (must match shaders/pbr.{vert,frag}).
+    struct UniformBlock {
+        float viewProj[16];
+        float cameraPos[4];
+        float lightDir[4];
+    };
+
+    bool createRenderTargets();
+    bool createPipeline();
+    void updateUniforms(const float viewMatrix[16], const float projMatrix[16]);
+    void cleanupModel();
+
     // ── Core Vulkan handles (not owned, from OpenXR runtime) ─────────────
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physDevice_ = VK_NULL_HANDLE;
@@ -115,9 +100,28 @@ private:
     std::string loadedModelPath_;
     uint32_t numPrimitives_ = 0;
 
-    // TODO(port): vkglTF::Model instance, PBR pipeline + layout, descriptor
-    // pool/sets, per-material texture handles, IBL cubemaps (irradiance,
-    // prefiltered env) + BRDF LUT, depth attachment, the offscreen colour
-    // target, and the uniform buffers for camera + light + material params.
-    // Lift these from SaschaWillems/Vulkan-glTF-PBR (see ../PORTING.md).
+    // ── Render targets (internal; blitted to the swapchain viewport) ─────
+    VkFormat colorFormat_ = VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat depthFormat_ = VK_FORMAT_D32_SFLOAT;
+    ModelImage colorImage_;
+    ModelImage depthImage_;
+    VkRenderPass renderPass_ = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+
+    // ── Pipeline ──────────────────────────────────────────────────────────
+    VkDescriptorSetLayout dsLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
+    ModelBuffer uniformBuffer_;   // host-visible UniformBlock
+
+    // ── Loaded model GPU data ────────────────────────────────────────────
+    ModelBuffer vertexBuffer_;
+    ModelBuffer indexBuffer_;
+    std::vector<ModelMaterial>  materials_;
+    std::vector<ModelPrimitive> primitives_;
+    float bboxMin_[3] = {0, 0, 0};
+    float bboxMax_[3] = {0, 0, 0};
+    bool  hasBBox_ = false;
 };

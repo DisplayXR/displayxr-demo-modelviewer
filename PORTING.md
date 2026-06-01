@@ -72,6 +72,33 @@ the app auto-loads it. See `*/assets/README.md`.
   describe the shell tile. Replace the placeholder `icon.png` / `icon_sbs.png`
   (currently the splat demo's icons) with model-viewer artwork.
 
+## Status
+
+**Windows v1 — implemented** (branch `port/gltf-pbr-renderer`):
+- `model_common/` renderer is real, not a stub: tinygltf load (factors only,
+  no stb coupling), interleaved vertex/index upload, metallic-roughness GGX
+  pass with one directional light + flat ambient, internal image → per-eye
+  viewport blit, transparent-bg path. View math mirrors `gs_renderer`'s
+  Y-flip so the demo's pose code is unchanged.
+- `windows/main.cpp` + `xr_session.cpp` retargeted to `ModelRenderer`
+  (`loadModel`/`pickSurface`/`getRobustSceneBounds`, `.glb/.gltf` dialogs).
+
+**Open follow-ups:**
+- **Textures + IBL** — biggest visual win. Decode base-color/normal/MR/AO/
+  emissive maps and add irradiance + prefiltered-env + BRDF-LUT. Needs an stb
+  decode path that doesn't clash with `common/` (e.g. tinygltf's own image
+  callback, or KTX2/basisu), since `d3d11_renderer.cpp` already owns the stb
+  implementation. Add the IBL generation shaders to `SHADER_SOURCES`.
+- **Skinning + animation** — extend `ModelVertex` (joints/weights), per-node
+  animation sampling, joint UBO.
+- **`pickSurface`** — ray/triangle intersection (currently returns false, so
+  double-click focus is a no-op).
+- **macOS** — `macos/main.mm` is still the GS baseline (banner intact) and
+  links `model_renderer` but calls the GS API → won't build on Apple. Retarget
+  it the same way `windows/main.cpp` was. The Windows build is unaffected
+  (`macos/CMakeLists.txt` early-returns off-Apple).
+- **Bundled `sample.glb`** — add a CC0/CC-BY model under `*/assets/`.
+
 ## Definition of done
 
 `scripts/build_windows.bat` produces `model_viewer_handle_vk_win.exe` that

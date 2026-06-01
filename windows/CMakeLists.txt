@@ -7,11 +7,10 @@
 # added ../common and ../model_common as subdirectories, exposing the
 # `sr_common_base`, `sr_common`, and `model_renderer` targets.
 #
-# NOTE: windows/main.cpp + xr_session.cpp are the PORTING BASELINE copied from
-# displayxr-demo-gaussiansplat. The window/OpenXR/HUD/input glue is reusable
-# as-is; the renderer call sites still target the GS API and must be retargeted
-# to ModelRenderer. See ../PORTING.md. The target will not link until that
-# port is done.
+# windows/main.cpp + xr_session.cpp originated from displayxr-demo-gaussiansplat;
+# the window/OpenXR/HUD/input glue is reused as-is and the renderer call sites
+# are retargeted to model_common/ModelRenderer (glTF PBR). See ../PORTING.md
+# for what's done (Windows v1) and what's still open (textures/IBL, macOS).
 
 cmake_minimum_required(VERSION 3.21)
 
