@@ -33,6 +33,8 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/quaternion.hpp>      // glm::quat, slerp, mat4_cast
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace {
 
@@ -794,6 +796,16 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
 
     materials_ = std::move(md.materials);
     primitives_ = std::move(md.primitives);
+
+    // Animation graph (Phase 1). Auto-play the first clip; no clips → static
+    // fast-path (activeAnim_ stays -1 and updateAnimation is a no-op).
+    nodes_ = std::move(md.nodes);
+    animations_ = std::move(md.animations);
+    rootNodes_ = std::move(md.rootNodes);
+    nodeWorld_.assign(nodes_.size() * 16, 0.0f);
+    activeAnim_ = animations_.empty() ? -1 : 0;
+    animTime_ = 0.0f;
+
     std::memcpy(bboxMin_, md.bboxMin, sizeof(bboxMin_));
     std::memcpy(bboxMax_, md.bboxMax, sizeof(bboxMax_));
     hasBBox_ = md.hasBBox;
@@ -922,6 +934,150 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(UniformBlock), 0, &mapped);
     std::memcpy(mapped, &ub, sizeof(UniformBlock));
     vkUnmapMemory(device_, uniformBuffer_.memory);
+}
+
+namespace {
+
+// Sample a translation/scale sampler (comps = 3) at time t → out[comps].
+// Handles STEP / LINEAR / CUBICSPLINE; clamps outside the keyframe range.
+void sampleVec(const AnimSampler& s, int comps, float t, float* out) {
+    const std::vector<float>& in = s.input;
+    const size_t n = in.size();
+    const int stride = (s.interp == AnimInterp::CubicSpline) ? 3 * comps : comps;
+    const int valOff = (s.interp == AnimInterp::CubicSpline) ? comps : 0;
+    auto val = [&](size_t k) -> const float* { return &s.output[k * stride + valOff]; };
+
+    if (n == 0) { for (int c = 0; c < comps; ++c) out[c] = 0.0f; return; }
+    if (t <= in.front() || n == 1) { const float* v = val(0);   for (int c=0;c<comps;++c) out[c]=v[c]; return; }
+    if (t >= in.back())            { const float* v = val(n-1); for (int c=0;c<comps;++c) out[c]=v[c]; return; }
+
+    size_t k = 0;
+    while (k + 1 < n && in[k + 1] <= t) ++k;   // in[k] <= t < in[k+1]
+    const float dt = in[k + 1] - in[k];
+    const float u = dt > 0.0f ? (t - in[k]) / dt : 0.0f;
+
+    if (s.interp == AnimInterp::Step) { const float* v = val(k); for (int c=0;c<comps;++c) out[c]=v[c]; return; }
+    if (s.interp == AnimInterp::CubicSpline) {
+        const float* p0 = val(k);
+        const float* p1 = val(k + 1);
+        const float* m0 = &s.output[k * stride + 2 * comps];       // out-tangent of key k
+        const float* m1 = &s.output[(k + 1) * stride + 0];         // in-tangent of key k+1
+        const float u2 = u * u, u3 = u2 * u;
+        const float h00 = 2*u3 - 3*u2 + 1, h10 = u3 - 2*u2 + u;
+        const float h01 = -2*u3 + 3*u2,    h11 = u3 - u2;
+        for (int c = 0; c < comps; ++c)
+            out[c] = h00*p0[c] + h10*dt*m0[c] + h01*p1[c] + h11*dt*m1[c];
+        return;
+    }
+    const float* v0 = val(k); const float* v1 = val(k + 1);   // LINEAR
+    for (int c = 0; c < comps; ++c) out[c] = v0[c] + (v1[c] - v0[c]) * u;
+}
+
+// glTF quat (x,y,z,w) at output offset → glm::quat (w,x,y,z).
+glm::quat quatFrom(const std::vector<float>& o, size_t base) {
+    return glm::quat(o[base + 3], o[base + 0], o[base + 1], o[base + 2]);
+}
+
+// Sample a rotation sampler at time t → normalized quaternion. LINEAR uses
+// slerp; CUBICSPLINE does the Hermite on quat components then renormalizes.
+glm::quat sampleQuat(const AnimSampler& s, float t) {
+    const std::vector<float>& in = s.input;
+    const size_t n = in.size();
+    const int stride = (s.interp == AnimInterp::CubicSpline) ? 12 : 4;
+    const int valOff = (s.interp == AnimInterp::CubicSpline) ? 4 : 0;
+
+    if (n == 0) return glm::quat(1, 0, 0, 0);
+    if (t <= in.front() || n == 1) return glm::normalize(quatFrom(s.output, 0 * stride + valOff));
+    if (t >= in.back())            return glm::normalize(quatFrom(s.output, (n-1) * stride + valOff));
+
+    size_t k = 0;
+    while (k + 1 < n && in[k + 1] <= t) ++k;
+    const float dt = in[k + 1] - in[k];
+    const float u = dt > 0.0f ? (t - in[k]) / dt : 0.0f;
+
+    if (s.interp == AnimInterp::Step)
+        return glm::normalize(quatFrom(s.output, k * stride + valOff));
+    if (s.interp == AnimInterp::CubicSpline) {
+        const glm::quat p0 = quatFrom(s.output, k * stride + valOff);
+        const glm::quat p1 = quatFrom(s.output, (k + 1) * stride + valOff);
+        const glm::quat m0 = quatFrom(s.output, k * stride + 8);        // out-tangent k
+        const glm::quat m1 = quatFrom(s.output, (k + 1) * stride + 0);  // in-tangent k+1
+        const float u2 = u * u, u3 = u2 * u;
+        const float h00 = 2*u3 - 3*u2 + 1, h10 = u3 - 2*u2 + u;
+        const float h01 = -2*u3 + 3*u2,    h11 = u3 - u2;
+        glm::quat q = p0*h00 + m0*(h10*dt) + p1*h01 + m1*(h11*dt);
+        return glm::normalize(q);
+    }
+    return glm::normalize(glm::slerp(glm::normalize(quatFrom(s.output, k * stride)),
+                                     glm::normalize(quatFrom(s.output, (k + 1) * stride)), u));
+}
+
+// Compose a node's local matrix from its (possibly animated) TRS, or its
+// explicit matrix.
+glm::mat4 nodeLocal(const ModelNode& n) {
+    if (n.hasMatrix) return glm::make_mat4(n.matrix);
+    glm::mat4 T = glm::translate(glm::mat4(1.0f),
+                                 glm::vec3(n.translation[0], n.translation[1], n.translation[2]));
+    glm::mat4 R = glm::mat4_cast(glm::quat(n.rotation[3], n.rotation[0], n.rotation[1], n.rotation[2]));
+    glm::mat4 S = glm::scale(glm::mat4(1.0f),
+                             glm::vec3(n.scale[0], n.scale[1], n.scale[2]));
+    return T * R * S;
+}
+
+}  // namespace
+
+void ModelRenderer::updateAnimation(float dtSeconds) {
+    // Static fast-path: no clip → primitives keep their once-baked modelMatrix.
+    if (activeAnim_ < 0 || activeAnim_ >= (int)animations_.size()) return;
+    const Animation& anim = animations_[activeAnim_];
+
+    // Advance + loop the playhead within the clip duration.
+    animTime_ += dtSeconds;
+    if (anim.duration > 0.0f) {
+        animTime_ = std::fmod(animTime_, anim.duration);
+        if (animTime_ < 0.0f) animTime_ += anim.duration;
+    }
+
+    // 1) Sample each channel → write the ABSOLUTE TRS value into its target
+    //    node. Channel-driven components are fully recomputed every frame, so
+    //    mutating nodes_ in place is safe; untargeted components keep their base.
+    for (const AnimChannel& ch : anim.channels) {
+        const AnimSampler& s = anim.samplers[ch.sampler];
+        ModelNode& node = nodes_[ch.targetNode];
+        switch (ch.path) {
+            case AnimPath::Translation: sampleVec(s, 3, animTime_, node.translation); break;
+            case AnimPath::Scale:       sampleVec(s, 3, animTime_, node.scale);       break;
+            case AnimPath::Rotation: {
+                glm::quat q = sampleQuat(s, animTime_);
+                node.rotation[0] = q.x; node.rotation[1] = q.y;
+                node.rotation[2] = q.z; node.rotation[3] = q.w;
+                break;
+            }
+            case AnimPath::Weights: break;   // morph targets → Phase 3
+        }
+    }
+
+    // 2) Re-walk the hierarchy (parent before child via DFS) → world matrices.
+    for (int root : rootNodes_) {
+        // Iterative DFS; each node's parent world is already written when popped.
+        std::vector<int> stack(1, root);
+        while (!stack.empty()) {
+            int idx = stack.back(); stack.pop_back();
+            if (idx < 0 || idx >= (int)nodes_.size()) continue;
+            const ModelNode& n = nodes_[idx];
+            glm::mat4 parentW = (n.parent >= 0 && n.parent < (int)nodes_.size())
+                ? glm::make_mat4(&nodeWorld_[n.parent * 16]) : glm::mat4(1.0f);
+            glm::mat4 world = parentW * nodeLocal(n);
+            std::memcpy(&nodeWorld_[idx * 16], glm::value_ptr(world), 16 * sizeof(float));
+            for (int c : n.children) stack.push_back(c);
+        }
+    }
+
+    // 3) Refresh each primitive's model matrix from its owning node.
+    for (ModelPrimitive& p : primitives_) {
+        if (p.node >= 0 && p.node < (int)nodes_.size())
+            std::memcpy(p.modelMatrix, &nodeWorld_[p.node * 16], 16 * sizeof(float));
+    }
 }
 
 void ModelRenderer::renderEye(VkImage swapchainImage,
@@ -1083,6 +1239,12 @@ void ModelRenderer::cleanupModel() {
     defaultMatSet_ = VK_NULL_HANDLE;
     materials_.clear();
     primitives_.clear();
+    nodes_.clear();
+    animations_.clear();
+    rootNodes_.clear();
+    nodeWorld_.clear();
+    activeAnim_ = -1;
+    animTime_ = 0.0f;
     hasBBox_ = false;
     numPrimitives_ = 0;
     modelLoaded_ = false;
