@@ -148,8 +148,11 @@ Section "Model Viewer Demo" SecDemo
 
     ; Manifest + icons live together; icon paths inside the manifest are
     ; resolved relative to the manifest file (per spec §2.3).
-    File "${SOURCE_DIR}\windows\displayxr\icon.png"
-    File "${SOURCE_DIR}\windows\displayxr\icon_sbs.png"
+    ; Per-app icon names — the apps dir is shared by all registered demos, so
+    ; generic icon.png/icon_sbs.png would collide (e.g. with the gaussiansplat
+    ; demo). Keep these prefixed and unique.
+    File "${SOURCE_DIR}\windows\displayxr\model_viewer_icon.png"
+    File "${SOURCE_DIR}\windows\displayxr\model_viewer_icon_sbs.png"
 
     ; Generate the manifest with an absolute exe_path pointing at the
     ; install dir we just populated. We can't reuse the in-tree sidecar
@@ -163,8 +166,8 @@ Section "Model Viewer Demo" SecDemo
     FileWrite $0 '  "category": "demo",$\r$\n'
     FileWrite $0 '  "display_mode": "auto",$\r$\n'
     FileWrite $0 '  "description": "Interactive PBR viewer for 3D models (.glb / .gltf). Drag-and-drop a model or press L to load. Bundled with a demo model.",$\r$\n'
-    FileWrite $0 '  "icon": "icon.png",$\r$\n'
-    FileWrite $0 '  "icon_3d": "icon_sbs.png",$\r$\n'
+    FileWrite $0 '  "icon": "model_viewer_icon.png",$\r$\n'
+    FileWrite $0 '  "icon_3d": "model_viewer_icon_sbs.png",$\r$\n'
     FileWrite $0 '  "icon_3d_layout": "sbs-lr",$\r$\n'
     ; Use forward slashes in exe_path so the JSON parses with any strict
     ; library — the manifest spec accepts either separator and normalizes.
@@ -240,8 +243,8 @@ Section "Uninstall"
     ; /REBOOTOK schedules deletion on next reboot if the file is still locked
     ; at uninstall time (belt-and-suspenders on top of the taskkill above).
     Delete /REBOOTOK "$APPDATA\DisplayXR\apps\model_viewer.displayxr.json"
-    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\icon.png"
-    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\icon_sbs.png"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\model_viewer_icon.png"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\model_viewer_icon_sbs.png"
     RMDir "$APPDATA\DisplayXR\apps"
 
     ; Remove install dir contents.
