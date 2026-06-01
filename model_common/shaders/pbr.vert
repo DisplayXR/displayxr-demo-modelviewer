@@ -13,8 +13,9 @@ layout(location = 2) in vec2 inUV;
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;     // proj * Y-flipped view
+    mat4 view;         // Z-forward-adjusted view (for the foreground clip)
     vec4 cameraPos;    // world-space, .w unused
-    vec4 lightDir;     // world-space direction TO the light, .w unused
+    vec4 lightDir;     // .xyz = world dir TO light, .w = clipFar (view-space; 0=off)
 } ubo;
 
 layout(push_constant) uniform Push {
@@ -27,11 +28,13 @@ layout(push_constant) uniform Push {
 layout(location = 0) out vec3 outWorldPos;
 layout(location = 1) out vec3 outNormal;
 layout(location = 2) out vec2 outUV;
+layout(location = 3) out float outViewZ;   // view-space forward distance
 
 void main() {
     vec4 world = pc.model * vec4(inPos, 1.0);
     outWorldPos = world.xyz;
     outNormal = normalize(mat3(pc.model) * inNormal);
     outUV = inUV;
+    outViewZ = (ubo.view * world).z;
     gl_Position = ubo.viewProj * world;
 }

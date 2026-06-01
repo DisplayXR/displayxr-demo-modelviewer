@@ -77,13 +77,14 @@ private:
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag}).
     struct UniformBlock {
         float viewProj[16];
+        float view[16];     // Z-forward-adjusted view, for the foreground clip
         float cameraPos[4];
-        float lightDir[4];
+        float lightDir[4];  // .xyz = light direction, .w = clipFar (view-space; 0=off)
     };
 
     bool createRenderTargets();
     bool createPipeline();
-    void updateUniforms(const float viewMatrix[16], const float projMatrix[16]);
+    void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar);
     void cleanupModel();
 
     // ── Core Vulkan handles (not owned, from OpenXR runtime) ─────────────

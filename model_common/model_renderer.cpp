@@ -452,7 +452,8 @@ float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const
     return 0.0f;  // glTF models are authored front-facing.
 }
 
-void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16]) {
+void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
+                                   float clipFar) {
     // Mirror gs_renderer: flip world Y at the view stage (right-multiply by
     // diag(1,-1,1,1) → negate view column 1) so the model is upright and
     // consistent with the demo's Y-mirrored display-pose contract.
@@ -466,6 +467,15 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     UniformBlock ub{};
     mat4Mul(projMatrix, vmFlipped, ub.viewProj);
 
+    // View matrix with the Z row negated → positive Z = forward (matches
+    // gs_renderer / the eye_display.z forward distance), used by the shader's
+    // foreground clip. Column-major Z-row indices: 2, 6, 10, 14.
+    std::memcpy(ub.view, vmFlipped, sizeof(ub.view));
+    ub.view[2]  = -ub.view[2];
+    ub.view[6]  = -ub.view[6];
+    ub.view[10] = -ub.view[10];
+    ub.view[14] = -ub.view[14];
+
     // Camera world position = -R^T * t from the flipped view matrix.
     float tx = vmFlipped[12], ty = vmFlipped[13], tz = vmFlipped[14];
     ub.cameraPos[0] = -(vmFlipped[0] * tx + vmFlipped[1] * ty + vmFlipped[2] * tz);
@@ -476,7 +486,8 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     // Fixed key light (world space), normalized.
     float lx = 0.4f, ly = 0.8f, lz = 0.5f;
     float ln = std::sqrt(lx * lx + ly * ly + lz * lz);
-    ub.lightDir[0] = lx / ln; ub.lightDir[1] = ly / ln; ub.lightDir[2] = lz / ln; ub.lightDir[3] = 0.0f;
+    ub.lightDir[0] = lx / ln; ub.lightDir[1] = ly / ln; ub.lightDir[2] = lz / ln;
+    ub.lightDir[3] = (clipFar > 0.0f) ? clipFar : 0.0f;  // foreground clip (view-space)
 
     void* mapped = nullptr;
     vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(UniformBlock), 0, &mapped);
@@ -495,10 +506,10 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                               const float viewMatrix[16],
                               const float projMatrix[16],
                               bool transparentBg,
-                              float /*clipFarViewSpace*/) {
+                              float clipFarViewSpace) {
     if (!initialized_ || !modelLoaded_) return;
 
-    updateUniforms(viewMatrix, projMatrix);
+    updateUniforms(viewMatrix, projMatrix, clipFarViewSpace);
 
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = cmdPool_;

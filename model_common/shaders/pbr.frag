@@ -10,11 +10,13 @@
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
+layout(location = 3) in float inViewZ;
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
+    mat4 view;
     vec4 cameraPos;
-    vec4 lightDir;
+    vec4 lightDir;     // .xyz = light dir, .w = clipFar (view-space; 0=off)
 } ubo;
 
 layout(push_constant) uniform Push {
@@ -46,6 +48,11 @@ vec3 F_Schlick(float cosT, vec3 f0) {
 }
 
 void main() {
+    // Foreground-only clip (transparent mode): drop geometry behind the
+    // display plane so the desktop shows through there. Mirrors the GS demo's
+    // transparent-mode far cull. 0 = disabled (opaque path unaffected).
+    if (ubo.lightDir.w > 0.0 && inViewZ > ubo.lightDir.w) discard;
+
     vec3 albedo = pc.baseColorFactor.rgb;
     float metallic = clamp(pc.mrParams.x, 0.0, 1.0);
     float roughness = clamp(pc.mrParams.y, 0.04, 1.0);
