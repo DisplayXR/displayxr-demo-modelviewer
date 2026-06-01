@@ -7,10 +7,10 @@
 # added ../common and ../model_common as subdirectories, exposing the
 # `sr_common_base` and `model_renderer` targets.
 #
-# NOTE: macos/main.mm is the PORTING BASELINE copied from
-# displayxr-demo-gaussiansplat. The Cocoa/MoltenVK/OpenXR/HUD/input glue is
-# reusable as-is; the renderer call sites still target the GS API and must be
-# retargeted to ModelRenderer. See ../PORTING.md.
+# macos/main.mm is the macOS entry point: Cocoa window + MoltenVK + OpenXR
+# session + HUD/input, with the renderer call sites wired to ModelRenderer
+# (loadModel / hasModel / getRobustSceneBounds, .glb/.gltf NSOpenPanel +
+# drag-drop). No transparent-background mode on macOS (Windows-only).
 
 cmake_minimum_required(VERSION 3.21)
 

@@ -5,26 +5,20 @@ DisplayXR runtime via OpenXR with Vulkan. Loads `.glb` / `.gltf` models and
 renders them with asymmetric per-eye Kooima projection for the full multiview
 3D experience.
 
-> **🚧 Scaffold status:** this repo is a scaffold seeded from
-> [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat).
-> The reusable DisplayXR plumbing (`common/`, `openxr_includes/`, window +
-> OpenXR session + HUD + input + transparency) is in place, and `model_common/`
-> holds the glTF/PBR renderer **skeleton**. The renderer itself and the
-> platform renderer call sites are **not yet ported** — see
-> [`PORTING.md`](PORTING.md) for the remaining work.
+Loads metallic-roughness PBR materials with textures and image-based lighting,
+a blurred procedural skybox, and a transparent see-through mode (Windows). The
+bundled sample is the Khronos DamagedHelmet, auto-loaded at startup.
 
-> **Requires the DisplayXR runtime v1.3.0 or newer** (Windows) / **the latest
+> **Requires the DisplayXR runtime v1.9.1 or newer** (Windows) / **the latest
 > macOS runtime `.pkg`**. Download the matching installer from the
 > [`displayxr-runtime` releases page](https://github.com/DisplayXR/displayxr-runtime/releases):
 > `DisplayXRSetup-*.exe` on Windows or `DisplayXR-Installer-*.pkg` on macOS.
-> v1.3.0 ships the Vulkan transparent-window bridge that this demo's HWND +
-> session rely on; older runtimes will produce a broken/black window. The
-> shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases))
+> v1.9.1 ships the Vulkan transparent-window bridge + in-place resize this demo
+> relies on; older runtimes produce a broken/black window or flicker on resize.
+> The shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases))
 > is optional — only needed for the spatial workspace shell.
 
 ## Controls
-
-Inherited from the demo baseline (subject to refinement during the renderer port):
 
 | Input | Action |
 |---|---|
@@ -69,24 +63,26 @@ brew install cmake ninja vulkan-sdk openxr-loader
 
 ### Windows
 ```bat
-REM Set OpenXR_ROOT to your OpenXR SDK install if find_package can't see it.
-scripts\build_windows.bat
+REM Sets vcvars64 + OpenXR_ROOT + Vulkan SDK, then configures + builds.
+scripts\build-with-deps.bat
 REM Run
-build\windows\Release\model_viewer_handle_vk_win.exe
+build\windows\model_viewer_handle_vk_win.exe
 ```
+> Use `build-with-deps.bat`, not the bare `build_windows.bat` — the latter
+> assumes you are already inside a VS developer environment.
 
 ## Repo layout
 
 ```
 .
-├── macos/                  Platform entry + window handling (porting baseline)
-├── windows/                Platform entry + window handling (porting baseline)
-├── model_common/           glTF 2.0 PBR renderer (skeleton: loader + renderer + shaders)
-├── common/                 Shared helpers: Kooima math, input, HUD (reused as-is)
+├── macos/                  Platform entry + window handling (Cocoa / MoltenVK)
+├── windows/                Platform entry + window handling (Win32 / Vulkan)
+├── model_common/           glTF 2.0 PBR renderer: loader + renderer + shaders
+├── common/                 Shared helpers: Kooima math, input, HUD
 ├── openxr_includes/         Vendored OpenXR headers (incl. DisplayXR extensions)
 ├── installer/              Windows NSIS + macOS .pkg installers
 ├── scripts/                Build scripts for each platform
-└── PORTING.md              What's left to turn the skeleton into a working viewer
+└── PORTING.md              Roadmap (port done; animation/skinning next)
 ```
 
 `common/` and `openxr_includes/` are shared with the other DisplayXR demos and
@@ -96,7 +92,7 @@ were seeded from the runtime source tree.
 
 This is a separate demo, not a mode bolted onto the splat viewer: it shows a
 different DisplayXR capability (mesh + PBR rendering) and grows the demo
-gallery. The renderer is being ported from the MIT-licensed
+gallery. The renderer draws on techniques from the MIT-licensed
 [SaschaWillems/Vulkan-glTF-PBR](https://github.com/SaschaWillems/Vulkan-glTF-PBR).
 
 ## License

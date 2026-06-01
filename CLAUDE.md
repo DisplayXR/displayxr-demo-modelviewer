@@ -4,132 +4,126 @@ Guidance for Claude Code (claude.ai/code) working on this repo.
 
 ## Project Overview
 
-DisplayXR Demo — 3D Model Viewer. Real-time glTF 2.0 PBR model viewer for
-glasses-free 3D displays, built on the DisplayXR OpenXR runtime via Vulkan.
-Loads `.glb` / `.gltf` files, renders with asymmetric per-eye Kooima projection.
+DisplayXR Demo — **3D Model Viewer**. Real-time glTF 2.0 PBR model viewer for
+glasses-free 3D displays, on the DisplayXR OpenXR runtime via Vulkan (Windows)
+and MoltenVK (macOS). Loads `.glb` / `.gltf`, renders with asymmetric per-eye
+Kooima projection. Standalone repo, independent release cadence; `common/` +
+`openxr_includes/` were seeded from the runtime and are maintained here.
 
-This is a **standalone repo**. It evolves independently — there is no
-source-mirror from the runtime. Edit code here directly; cut your own release
-tags here. The `common/` and `openxr_includes/` directories were seeded from
-the runtime tree (and shared with the other DisplayXR demos) but are
-maintained in this repo.
-
-## ⚠️ Scaffold status — read PORTING.md first
-
-This repo was scaffolded from `displayxr-demo-gaussiansplat`. State:
-- **Done & reusable as-is:** `common/`, `openxr_includes/`, the window /
-  OpenXR session / transparency / HUD / input glue in `windows/` + `macos/`,
-  build wiring, installer, shell sidecar.
-- **Skeleton (stubs):** `model_common/` — `model_renderer.*` (PBR renderer),
-  `model_loader.*` (tinygltf wrapper), `shaders/pbr.{vert,frag}`.
-- **Not yet retargeted:** the renderer call sites inside `windows/main.cpp`,
-  `windows/xr_session.cpp`, `macos/main.mm` still call the Gaussian-splat API.
-  Each carries a PORTING BASELINE banner. **These files don't compile until the
-  port is done.**
-
-`PORTING.md` has the full checklist + the file map from
-[SaschaWillems/Vulkan-glTF-PBR](https://github.com/SaschaWillems/Vulkan-glTF-PBR)
-(MIT — the renderer source).
+**Status: shipped & working on Windows + macOS.** The renderer is fully
+implemented (this is NOT a skeleton — ignore any old "porting baseline"
+phrasing). Released: v0.1.0 (initial), v0.2.0 (macOS + ZDP clip). Bundled
+`sample.glb` = Khronos DamagedHelmet (CC BY 4.0), auto-loaded at startup.
 
 ## Runtime dependency
 
-Requires the **DisplayXR runtime v1.3.0 or newer** (Vulkan transparent-window
-bridge, PR #215 — the HWND is created with `WS_EX_NOREDIRECTIONBITMAP` and the
-session with `transparentBackgroundEnabled = XR_TRUE`). Install via
-`DisplayXRSetup-*.exe` from the
-[`displayxr-runtime` releases page](https://github.com/DisplayXR/displayxr-runtime/releases).
-Apps load the runtime via the registry-resolved manifest (no `XR_RUNTIME_JSON`
-needed). The shell is optional.
+Requires **DisplayXR runtime ≥ v1.9.1** (v1.9.1 has the per-app VK-native
+compositor in-place DComp resize fix this demo relies on for clean window
+resizing). Install `DisplayXRSetup-*.exe` from the
+[runtime releases](https://github.com/DisplayXR/displayxr-runtime/releases).
+Apps load the runtime via the registry-resolved manifest (no `XR_RUNTIME_JSON`).
 
-## Repo layout
+## Architecture
 
 ```
-.
-├── macos/                 Platform entry + window handling (Cocoa/Metal/MoltenVK) — porting baseline
-├── windows/               Platform entry + window handling (Win32) — porting baseline
-│   ├── main.cpp           HWND creation, WindowProc message pump
-│   ├── xr_session.cpp     OpenXR session create, GraphicsBindingVulkan, win32_window_binding
-│   └── displayxr/         Shell tile sidecar (.displayxr.json + icons)
-├── model_common/          glTF 2.0 PBR renderer: model_renderer, model_loader, model_vulkan_utils, shaders/
-├── common/                Shared helpers: Kooima math, input, HUD (reused verbatim)
-├── openxr_includes/       Vendored OpenXR + DisplayXR extension headers
-├── installer/             Windows NSIS + macOS .pkg installers
-├── scripts/               Build scripts per platform
-└── PORTING.md             Skeleton → working-viewer checklist
+windows/main.cpp, macos/main.mm  — platform entry: window, OpenXR session,
+                                    input/HUD, per-frame view/projection, atlas
+                                    capture ('I'), file load (L / drag-drop)
+model_common/                     — the renderer (vendor-neutral, analog of
+                                    3dgs_common in the gaussiansplat demo):
+  model_loader.{h,cpp}            — tinygltf parse → interleaved verts + indices
+                                    + materials + decoded RGBA textures + node-
+                                    baked world transforms + AABB; path helpers
+  model_renderer.{h,cpp}          — metallic-roughness GGX raster pass into an
+                                    internal colour image, blitted into the
+                                    per-eye swapchain viewport; IBL generation
+  model_vulkan_utils.{h,cpp}      — VkBuffer/VkImage helpers
+  shaders/                        — pbr.{vert,frag}; skybox.frag; IBL gen:
+                                    fullscreen.vert, brdf_lut/irradiance/
+                                    prefilter.frag, sky.glsl + ibl_common.glsl
+common/                           — Kooima view math (display3d_view.*),
+                                    camera3d_view (unused), input, HUD, stb
+openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 ```
 
-## Build commands
+### Renderer conventions (important)
+- **Internal target sized to the swapchain** (not per-eye); recreated only on
+  swapchain-size change. `renderEye` sets viewport/scissor to the per-eye tile
+  and blits `[0,0..vp]` into the swapchain at `(vpX,vpY)`. Mirrors gs_renderer.
+- **ZDP-relative clip planes.** `display3d_compute_view/_views` take
+  `(clip_front, clip_back)` (NOT absolute near/far) and compute per-eye
+  `near = ez·(1−clip_front)`, `far = ez·(1+clip_back)` from each eye's
+  perpendicular distance to the convergence plane (`eye_scaled.z`). Defaults
+  `0.5 / 2.0`; **transparent mode passes `clip_back = 0`** (far at the ZDP →
+  foreground only). Scales with zoom; keeps depth precision tight. macOS has no
+  transparent mode → `clip_back = 2.0` there.
+- **IBL** is generated once at init from a procedural analytic sky (`sky.glsl`):
+  BRDF LUT + irradiance cube + roughness-mipped prefiltered cube; split-sum in
+  `pbr.frag`. The **skybox** samples the prefiltered cube at a high mip
+  (blurred) — sharp far features cause lightfield cross-talk.
+- **sRGB** base-color/emissive are decoded in the shader (textures uploaded
+  UNORM). **Normal mapping is tangent-free** (screen-space derivative frame).
+- **stb / tinygltf:** `model_loader.cpp` uses `TINYGLTF_NO_STB_IMAGE` + a custom
+  image-loader callback calling `stbi_load_from_memory`. The stb *implementation*
+  comes from `common/d3d11_renderer.cpp` on Windows and
+  `common/stb_image_impl_macos.cpp` on macOS. Do NOT define
+  `STB_IMAGE_IMPLEMENTATION` in `model_loader.cpp` (duplicate-symbol clash).
 
-### Windows (preferred dev path)
-```bat
-scripts\build_windows.bat
-```
-Outputs `build\windows\Release\model_viewer_handle_vk_win.exe` plus bundled DLLs.
-`model_common` fetches tinygltf + glm via FetchContent on first configure.
+### Loader limits (today) → these are the next phases
+- **No skinning / animation / morph targets** — meshes render in bind pose.
+- **No Draco** mesh compression, **no KTX2/Basis** textures (stb = PNG/JPEG only).
+See **PORTING.md** for the phased roadmap (animation is the next big one).
 
-### macOS
-```bash
-brew install cmake ninja vulkan-sdk openxr-loader
-./scripts/build_macos.sh
-```
-Outputs `build/macos/model_viewer_handle_vk_macos`.
+## Build
 
-## OpenXR + Vulkan integration notes
+### Windows (local dev)
+Use **`scripts\build-with-deps.bat`** — it sets vcvars64 + `OpenXR_ROOT` +
+Vulkan SDK then runs cmake. The bare `scripts\build_windows.bat` assumes you're
+already in a VS dev environment and will fail otherwise. Output:
+`build\windows\model_viewer_handle_vk_win.exe` (+ bundled openxr_loader.dll +
+sample.glb copied next to it). `model_common` FetchContents tinygltf + glm.
 
-- Uses `XR_KHR_vulkan_enable` (creates own VkInstance/Device).
-- Uses `XR_EXT_win32_window_binding` for app-owned HWND.
-- Uses `XR_EXT_display_info` (v12+) for display dims + rendering modes.
-- Submits a single `XrCompositionLayerProjection` per frame.
+### macOS (local dev)
+`./scripts/build_macos.sh` (builds the OpenXR loader from source, pulls
+Vulkan/MoltenVK via brew). Run via **`./scripts/run_macos_dev.sh`**, not the
+bare binary (the dev launcher aligns the app + runtime on one Vulkan loader).
+`./scripts/build_macos.sh --installer` builds the `.pkg`.
 
-The runtime's VK native compositor handles atlas → display processor →
-present. The demo sets the `XR_EXT_win32_window_binding` transparency flags;
-the runtime does the chroma-key / weave / DComp work.
+### CI (`.github/workflows/`)
+`build-windows.yml` + `build-macos.yml` run on **`pull_request` + push to main**
+(build-validation — they compile the app + installer/.pkg, nothing publishes)
+and on **`v*` tags** (release: build + attach both installers to the GH Release +
+dispatch `versions-bump` to displayxr-runtime). So every PR is build-checked on
+both platforms — keep it that way.
 
-## Transparency support (runtime ≥ v1.3.0)
-
-App-side contract (already implemented in the platform baseline):
-1. HWND created with `WS_EX_NOREDIRECTIONBITMAP` + null background brush.
-2. `transparentBackgroundEnabled = XR_TRUE`, `chromaKeyColor = 0` at session create.
-3. Renderer clears uncovered pixels to `RGBA(0,0,0,0)` (the `transparentBg`
-   path in `ModelRenderer::renderEye`).
-4. Projection layer sets `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`.
-
-Anti-aliased edges become hard-mask alpha on Leia hardware (SR-weaver
-limitation — alpha is 0 or 1).
-
-## Coding conventions
-
-- C++17 / C++20, Vulkan 1.0+, Objective-C++ on macOS.
-- Naming: `lower_snake_case` for files/functions, `PascalCase` for C++ types.
-- **Multiview-first language**: use `tile`, `view`, `atlas`. NEVER `stereo`,
-  `left+right eye`, or `SBS` in new code, comments, docs, or chat.
-
-## Build quirks
-
-The CMakeLists has historically broken on dev paths with spaces (e.g.
-`C:\Users\Sparks i7 3080\...`). Use relative manifest paths; quote paths in
-custom commands. If `scripts\build_windows.bat` fails with a path-quoting
-error, that's the symptom.
-
-## Testing the dev build inside the DisplayXR Shell launcher
-
-`scripts\dev_register.bat` drops a `%LOCALAPPDATA%\DisplayXR\apps\` manifest
-pointing at this repo's dev build, which wins over the installed
-`%ProgramData%` entry so the shell tile launches your dev binary.
-`scripts\dev_register.bat --unregister` removes it. The build script does not
-auto-register (kept hermetic).
+## Shell tile
+`windows/displayxr/` + `macos/displayxr/` carry the `.displayxr.json` sidecar +
+**per-app-named** icons `model_viewer_icon.png` (2D) + `model_viewer_icon_sbs.png`
+(3D, sbs-lr). The names MUST be unique: the shell's `%ProgramData%\DisplayXR\apps\`
+dir is shared by all demos and icon paths resolve relative to it — generic
+`icon.png` collides (it clobbered the gaussiansplat demo once). The icons are a
+square-cropped render of the bundled model. `scripts\dev_register.bat` points
+the shell launcher at your dev build.
 
 ## Releasing
+Tag `vX.Y.Z` → CI builds both installers, attaches them to the GH Release, and
+dispatches `versions-bump` (`modelviewer_demo` field) to displayxr-runtime,
+which mirrors `versions.json` to `displayxr-installer`. The Windows meta-installer
+bundle ships this demo (`/installer-release` on the bundle, when ready).
+Independent cadence from the runtime.
 
-Each demo cuts its own `vX.Y.Z` tag on its own cadence (independent of the
-runtime). Build the installer, then `gh release create` with the asset
-attached. No automated runtime-side trigger.
+## Coding conventions
+- C++17/20, Vulkan 1.0+, Objective-C++ on macOS.
+- `lower_snake_case` files/functions, `PascalCase` C++ types.
+- **Multiview-first language**: `tile` / `view` / `atlas`. NEVER `stereo`,
+  `left+right eye`, or `SBS` in code/comments/docs/chat (the SBS *logo layout*
+  string `sbs-lr` is the one allowed exception — it's the manifest schema value).
+- CMake breaks on spaces in dev paths; quote paths, use relative manifest paths.
 
 ## Sibling repos
-
 | Repo | Purpose |
 |---|---|
-| [`displayxr-runtime`](https://github.com/DisplayXR/displayxr-runtime) | The runtime. Releases ship `DisplayXRSetup-*.exe`. |
-| [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | Sibling demo this repo was scaffolded from. |
+| [`displayxr-runtime`](https://github.com/DisplayXR/displayxr-runtime) | The runtime (+ versions.json hub, release skills). |
+| [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | Sibling splat-viewer demo; shares the `common/` view math. |
+| [`displayxr-installer`](https://github.com/DisplayXR/displayxr-installer) | Windows meta-installer bundle (chains this demo). |
 | [`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases) | Shell installer (optional add-on). |
-| `displayxr-demo-<name>` | Other standalone demos with independent evolution. |
