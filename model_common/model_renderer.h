@@ -85,6 +85,7 @@ private:
     bool createRenderTargets();
     bool createPipeline();
     bool createSamplerAndDefaults();
+    bool createIbl();   // generate BRDF LUT + irradiance + prefiltered cubes from the analytic sky
     ModelImage uploadTexture(const struct ModelTexture& tex);
     VkDescriptorSet makeMaterialSet(VkImageView baseColor, VkImageView mr,
                                     VkImageView normal, VkImageView occ,
@@ -131,6 +132,27 @@ private:
     VkDescriptorPool matPool_ = VK_NULL_HANDLE;          // recreated per model
     std::vector<VkDescriptorSet> materialSets_;          // one per material
     VkDescriptorSet defaultMatSet_ = VK_NULL_HANDLE;     // for material == -1
+
+    // ── IBL (set = 2: irradiance cube, prefiltered cube, BRDF LUT) ───────
+    struct CubeMap {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;   // cube view (all mips/layers)
+        uint32_t size = 0;
+        uint32_t mips = 1;
+    };
+    // Render the analytic sky into each cube face/mip with the given fragment
+    // SPIR-V; perMipRoughness pushes {face, roughness} (prefilter) vs {face} (irradiance).
+    bool genCubeMap(CubeMap& cube, uint32_t size, uint32_t mips,
+                    const uint32_t* fragSpv, size_t fragSpvBytes, bool perMipRoughness);
+    ModelImage brdfLut_;                 // 2D R16G16_SFLOAT
+    CubeMap irradianceCube_;
+    CubeMap prefilterCube_;
+    VkSampler iblCubeSampler_ = VK_NULL_HANDLE;
+    VkSampler iblLutSampler_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout iblSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool iblPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet iblSet_ = VK_NULL_HANDLE;
 
     // ── Loaded model GPU data ────────────────────────────────────────────
     ModelBuffer vertexBuffer_;

@@ -59,6 +59,15 @@ set(SHADER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(SHADER_SOURCES
     shaders/pbr.vert
     shaders/pbr.frag
+    shaders/fullscreen.vert
+    shaders/brdf_lut.frag
+    shaders/irradiance.frag
+    shaders/prefilter.frag
+)
+# GLSL #include dependencies (force recompile when these change).
+set(SHADER_INCLUDES
+    ${SHADER_INCLUDE_DIR}/sky.glsl
+    ${SHADER_INCLUDE_DIR}/ibl_common.glsl
 )
 
 set(SHADER_HEADERS "")
@@ -76,7 +85,7 @@ foreach(GLSL_REL ${SHADER_SOURCES})
             ${GLSL_SRC}
             --vn ${VARNAME}
             -o ${HEADER}
-        DEPENDS ${GLSL_SRC}
+        DEPENDS ${GLSL_SRC} ${SHADER_INCLUDES}
         COMMENT "Compiling SPIR-V: ${GLSL_NAME}"
     )
     list(APPEND SHADER_HEADERS ${HEADER})
