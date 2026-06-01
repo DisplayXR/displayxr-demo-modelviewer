@@ -20,6 +20,7 @@ layout(set = 0, binding = 0) uniform UBO {
     mat4 view;
     vec4 cameraPos;
     vec4 lightDir;     // .xyz = light dir, .w = clipFar (view-space; 0=off)
+    mat4 invViewProj;  // (skybox only)
 } ubo;
 
 layout(push_constant) uniform Push {

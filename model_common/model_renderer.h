@@ -77,12 +77,14 @@ private:
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag}).
     struct UniformBlock {
         float viewProj[16];
-        float view[16];     // Z-forward-adjusted view, for the foreground clip
+        float view[16];        // Z-forward-adjusted view, for the foreground clip
         float cameraPos[4];
-        float lightDir[4];  // .xyz = light direction, .w = clipFar (view-space; 0=off)
+        float lightDir[4];     // .xyz = light direction, .w = clipFar (view-space; 0=off)
+        float invViewProj[16]; // inverse(viewProj), for the skybox ray reconstruction
     };
 
     bool createRenderTargets();
+    bool ensureTargets(uint32_t w, uint32_t h);   // (re)create color+depth+framebuffer at this size
     bool createPipeline();
     bool createSamplerAndDefaults();
     bool createIbl();   // generate BRDF LUT + irradiance + prefiltered cubes from the analytic sky
@@ -120,6 +122,7 @@ private:
     VkDescriptorSetLayout dsLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline skyboxPipeline_ = VK_NULL_HANDLE;   // analytic-sky background (opaque mode)
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
     ModelBuffer uniformBuffer_;   // host-visible UniformBlock
