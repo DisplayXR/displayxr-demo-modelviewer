@@ -103,6 +103,25 @@ void readVec(const tinygltf::Model& m, int accessorIdx, int comps,
     }
 }
 
+// Read an accessor as a flat float array (count * numComponents). Returns the
+// number of components per element (1 = SCALAR, 3 = VEC3, 4 = VEC4 …) so the
+// caller can stride it. Used for animation sampler input/output buffers.
+int readAccessorFloats(const tinygltf::Model& m, int accessorIdx,
+                       std::vector<float>& out) {
+    out.clear();
+    if (accessorIdx < 0 || accessorIdx >= (int)m.accessors.size()) return 0;
+    const tinygltf::Accessor& acc = m.accessors[accessorIdx];
+    const int comps = tinygltf::GetNumComponentsInType(acc.type);
+    size_t stride = 0;
+    const unsigned char* base = accessorPtr(m, acc, stride);
+    out.resize(acc.count * comps);
+    for (size_t i = 0; i < acc.count; ++i) {
+        const float* f = reinterpret_cast<const float*>(base + i * stride);
+        for (int c = 0; c < comps; ++c) out[i * comps + c] = f[c];
+    }
+    return comps;
+}
+
 uint32_t readIndex(const tinygltf::Model& m, const tinygltf::Accessor& acc,
                    const unsigned char* base, size_t stride, size_t i) {
     const unsigned char* p = base + i * stride;
@@ -162,6 +181,7 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
             ModelPrimitive mp{};
             mp.firstIndex = (uint32_t)out.indices.size();
             mp.material = prim.material;
+            mp.node = nodeIdx;   // owning node → animated world matrix per frame
             std::memcpy(mp.modelMatrix, glm::value_ptr(world), 16 * sizeof(float));
 
             if (prim.indices >= 0) {
@@ -284,10 +304,76 @@ bool model_loader_load(const char* gltfPath, ModelData& out) {
         return false;
     }
 
+    // ── Retain the node graph (1:1 with model.nodes) for per-frame animation ──
+    // mp.node indices set in processNode reference these entries directly.
+    out.nodes.resize(model.nodes.size());
+    for (size_t i = 0; i < model.nodes.size(); ++i) {
+        const tinygltf::Node& src = model.nodes[i];
+        ModelNode& dst = out.nodes[i];
+        dst.mesh = src.mesh;
+        dst.children.assign(src.children.begin(), src.children.end());
+        for (int c : src.children)
+            if (c >= 0 && c < (int)out.nodes.size()) out.nodes[c].parent = (int)i;
+        if (src.matrix.size() == 16) {
+            dst.hasMatrix = true;
+            for (int k = 0; k < 16; ++k) dst.matrix[k] = (float)src.matrix[k];
+        }
+        if (src.translation.size() == 3)
+            for (int k = 0; k < 3; ++k) dst.translation[k] = (float)src.translation[k];
+        if (src.rotation.size() == 4)
+            for (int k = 0; k < 4; ++k) dst.rotation[k] = (float)src.rotation[k];  // xyzw
+        if (src.scale.size() == 3)
+            for (int k = 0; k < 3; ++k) dst.scale[k] = (float)src.scale[k];
+    }
+    // Scene roots (same selection the world-bake walk used above).
+    if (sceneIdx >= 0 && sceneIdx < (int)model.scenes.size()) {
+        out.rootNodes.assign(model.scenes[sceneIdx].nodes.begin(),
+                             model.scenes[sceneIdx].nodes.end());
+    } else {
+        for (int n = 0; n < (int)out.nodes.size(); ++n)
+            if (out.nodes[n].parent < 0) out.rootNodes.push_back(n);
+    }
+
+    // ── Parse animations[] (channels + samplers) ─────────────────────────────
+    auto mapPath = [](const std::string& p, AnimPath& out) -> bool {
+        if (p == "translation") { out = AnimPath::Translation; return true; }
+        if (p == "rotation")    { out = AnimPath::Rotation;    return true; }
+        if (p == "scale")       { out = AnimPath::Scale;       return true; }
+        if (p == "weights")     { out = AnimPath::Weights;     return true; }
+        return false;
+    };
+    for (const auto& src : model.animations) {
+        Animation anim;
+        anim.name = src.name;
+        anim.samplers.reserve(src.samplers.size());
+        for (const auto& s : src.samplers) {
+            AnimSampler smp;
+            readAccessorFloats(model, s.input, smp.input);
+            readAccessorFloats(model, s.output, smp.output);
+            smp.interp = s.interpolation == "STEP"        ? AnimInterp::Step
+                       : s.interpolation == "CUBICSPLINE" ? AnimInterp::CubicSpline
+                                                          : AnimInterp::Linear;
+            if (!smp.input.empty())
+                anim.duration = std::max(anim.duration, smp.input.back());
+            anim.samplers.push_back(std::move(smp));
+        }
+        for (const auto& c : src.channels) {
+            AnimChannel ch;
+            ch.targetNode = c.target_node;
+            ch.sampler = c.sampler;
+            if (ch.targetNode < 0 || ch.targetNode >= (int)out.nodes.size()) continue;
+            if (ch.sampler < 0 || ch.sampler >= (int)anim.samplers.size()) continue;
+            if (!mapPath(c.target_path, ch.path)) continue;
+            anim.channels.push_back(ch);
+        }
+        if (!anim.channels.empty()) out.animations.push_back(std::move(anim));
+    }
+
     std::fprintf(stderr,
-        "[model_loader] '%s': %u prims, %zu verts, %zu indices, %zu materials\n",
+        "[model_loader] '%s': %u prims, %zu verts, %zu indices, %zu materials, "
+        "%zu nodes, %zu animations\n",
         gltfPath, out.primitiveCount, out.vertices.size(), out.indices.size(),
-        out.materials.size());
+        out.materials.size(), out.nodes.size(), out.animations.size());
     return true;
 }
 

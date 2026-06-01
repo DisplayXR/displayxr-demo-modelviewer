@@ -244,22 +244,34 @@ static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH
 // Atlas capture helpers live in test_apps/common/atlas_capture* — see
 // dxr_capture::CaptureAtlasRegionVk / TriggerCaptureFlash / MakeCapturePath.
 
-// Attempt to auto-load sample.glb from next to the exe.
-static void TryAutoLoadBundledScene() {
-    char exePath[MAX_PATH] = {0};
-    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return;
-    // Strip basename
-    char *lastSlash = strrchr(exePath, '\\');
-    if (!lastSlash) lastSlash = strrchr(exePath, '/');
-    if (!lastSlash) return;
-    *(lastSlash + 1) = '\0';
-    std::string path = std::string(exePath) + "sample.glb";
-    if (!PathFileExistsA(path.c_str())) {
-        LOG_INFO("No bundled scene at %s (skipping auto-load)", path.c_str());
-        return;
+// Load a scene at startup. With an explicit path (first CLI arg) load that;
+// otherwise fall back to the bundled sample.glb next to the exe.
+static void TryAutoLoadBundledScene(const std::string& overridePath = std::string()) {
+    std::string path;
+    if (!overridePath.empty()) {
+        if (!model_validate_file(overridePath)) {
+            LOG_WARN("CLI model '%s' invalid/missing — falling back to bundled sample",
+                     overridePath.c_str());
+        } else {
+            path = overridePath;
+        }
     }
-    if (!model_validate_file(path)) return;
-    LOG_INFO("Auto-loading bundled scene: %s", path.c_str());
+    if (path.empty()) {
+        char exePath[MAX_PATH] = {0};
+        if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return;
+        // Strip basename
+        char *lastSlash = strrchr(exePath, '\\');
+        if (!lastSlash) lastSlash = strrchr(exePath, '/');
+        if (!lastSlash) return;
+        *(lastSlash + 1) = '\0';
+        path = std::string(exePath) + "sample.glb";
+        if (!PathFileExistsA(path.c_str())) {
+            LOG_INFO("No bundled scene at %s (skipping auto-load)", path.c_str());
+            return;
+        }
+        if (!model_validate_file(path)) return;
+    }
+    LOG_INFO("Auto-loading scene: %s", path.c_str());
     std::lock_guard<std::mutex> lock(g_sceneMutex);
     if (g_modelRenderer.loadModel(path.c_str())) {
         g_loadedFileName = model_basename(path);
@@ -720,6 +732,8 @@ static void RenderThreadFunc(
 
         UpdatePerformanceStats(perfStats);
         UpdateCameraMovement(inputSnapshot, perfStats.deltaTime, xr->displayHeightM);
+        // Advance node/TRS animation once per frame (no-op for static models).
+        g_modelRenderer.updateAnimation(perfStats.deltaTime);
 
         // On Space-reset: shared UpdateCameraMovement returns to (0,0,0) + default
         // vHeight. For the splat demo, restore the per-scene auto-fit pose instead.
@@ -1497,7 +1511,16 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* exInfo) {
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
-    (void)lpCmdLine;
+
+    // Optional CLI: a single .glb/.gltf path to load at startup instead of the
+    // bundled sample. Trim surrounding whitespace + quotes from the raw cmdline.
+    std::string cliModelPath;
+    if (lpCmdLine && *lpCmdLine) {
+        std::string s(lpCmdLine);
+        size_t a = s.find_first_not_of(" \t\"");
+        size_t b = s.find_last_not_of(" \t\"");
+        if (a != std::string::npos) cliModelPath = s.substr(a, b - a + 1);
+    }
 
     SetUnhandledExceptionFilter(CrashHandler);
 
@@ -1659,7 +1682,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                queueFamilyIndex, renderW, renderH)) {
             LOG_WARN("model renderer init failed - scene rendering will not be available");
         } else {
-            TryAutoLoadBundledScene();
+            TryAutoLoadBundledScene(cliModelPath);
         }
     }
 

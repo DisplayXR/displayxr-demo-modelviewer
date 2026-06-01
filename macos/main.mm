@@ -1613,6 +1613,8 @@ int main() {
         }
 
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
+        // Advance node/TRS animation once per frame (no-op for static models).
+        g_modelRenderer.updateAnimation(deltaTime);
 
         // Handle rendering mode change (V=cycle, 0-3=direct, Mode button, or the
         // startup default-mode request). Held until the session is running so the

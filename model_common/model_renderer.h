@@ -41,6 +41,11 @@ struct ModelRenderer {
     const std::string& modelPath() const;
     uint32_t primitiveCount() const;
 
+    // Advance the active animation clip by dtSeconds and refresh per-primitive
+    // model matrices. No-op (static fast-path) when the model has no animation.
+    // Call once per frame, before renderEye.
+    void updateAnimation(float dtSeconds);
+
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
@@ -163,6 +168,15 @@ private:
     std::vector<ModelImage>     modelTextures_;
     std::vector<ModelMaterial>  materials_;
     std::vector<ModelPrimitive> primitives_;
+
+    // ── Animation (Phase 1: node TRS). Empty graph → static fast-path ────────
+    std::vector<ModelNode>  nodes_;
+    std::vector<Animation>  animations_;
+    std::vector<int>        rootNodes_;
+    std::vector<float>      nodeWorld_;   // scratch: 16 floats/node, per-frame walk
+    int   activeAnim_ = -1;              // -1 = none/static (fast-path guard)
+    float animTime_   = 0.0f;            // playhead within the active clip (seconds)
+
     float bboxMin_[3] = {0, 0, 0};
     float bboxMax_[3] = {0, 0, 0};
     bool  hasBBox_ = false;
