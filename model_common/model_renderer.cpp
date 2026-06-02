@@ -326,13 +326,25 @@ bool ModelRenderer::createPipeline() {
     ilci.pBindings = ib;
     if (vkCreateDescriptorSetLayout(device_, &ilci, nullptr, &iblSetLayout_) != VK_SUCCESS) return false;
 
+    // Set 3: joint-matrix SSBO for skinning (vertex stage). Always present (a
+    // 1-matrix dummy for static models) so the binding is valid every draw.
+    VkDescriptorSetLayoutBinding jb = {};
+    jb.binding = 0;
+    jb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    jb.descriptorCount = 1;
+    jb.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    VkDescriptorSetLayoutCreateInfo jlci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    jlci.bindingCount = 1;
+    jlci.pBindings = &jb;
+    if (vkCreateDescriptorSetLayout(device_, &jlci, nullptr, &jointSetLayout_) != VK_SUCCESS) return false;
+
     VkPushConstantRange pcr = {};
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.offset = 0;
     pcr.size = sizeof(PushBlock);
-    VkDescriptorSetLayout setLayouts[3] = {dsLayout_, matSetLayout_, iblSetLayout_};
+    VkDescriptorSetLayout setLayouts[4] = {dsLayout_, matSetLayout_, iblSetLayout_, jointSetLayout_};
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 3;
+    plci.setLayoutCount = 4;
     plci.pSetLayouts = setLayouts;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
@@ -353,15 +365,17 @@ bool ModelRenderer::createPipeline() {
     stages[1].pName = "main";
 
     VkVertexInputBindingDescription vib = {0, sizeof(ModelVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription via[3] = {
-        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, (uint32_t)offsetof(ModelVertex, pos)},
-        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, (uint32_t)offsetof(ModelVertex, normal)},
-        {2, 0, VK_FORMAT_R32G32_SFLOAT,    (uint32_t)offsetof(ModelVertex, uv)},
+    VkVertexInputAttributeDescription via[5] = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT,    (uint32_t)offsetof(ModelVertex, pos)},
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT,    (uint32_t)offsetof(ModelVertex, normal)},
+        {2, 0, VK_FORMAT_R32G32_SFLOAT,       (uint32_t)offsetof(ModelVertex, uv)},
+        {3, 0, VK_FORMAT_R16G16B16A16_UINT,   (uint32_t)offsetof(ModelVertex, joints0)},
+        {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(ModelVertex, weights0)},
     };
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1;
     vi.pVertexBindingDescriptions = &vib;
-    vi.vertexAttributeDescriptionCount = 3;
+    vi.vertexAttributeDescriptionCount = 5;
     vi.pVertexAttributeDescriptions = via;
 
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -806,6 +820,47 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     activeAnim_ = animations_.empty() ? -1 : 0;
     animTime_ = 0.0f;
 
+    // ── Skinning: joint-matrix SSBO (set = 3) ────────────────────────────────
+    // Sized to all skins' joints concatenated; ≥1 matrix so static models still
+    // bind a valid set 3. Host-visible: updateAnimation memcpy's it each frame.
+    // Initialized to identity — the static fast-path then leaves it untouched.
+    skins_ = std::move(md.skins);
+    jointCount_ = md.totalJoints > 0 ? md.totalJoints : 1;
+    jointBuffer_ = modelCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)jointCount_ * 16 * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (jointBuffer_.buffer == VK_NULL_HANDLE) return false;
+    {
+        void* mapped = nullptr;
+        vkMapMemory(device_, jointBuffer_.memory, 0, jointBuffer_.size, 0, &mapped);
+        const glm::mat4 ident(1.0f);
+        for (uint32_t i = 0; i < jointCount_; ++i)
+            std::memcpy((char*)mapped + i * 16 * sizeof(float), glm::value_ptr(ident), 16 * sizeof(float));
+        vkUnmapMemory(device_, jointBuffer_.memory);
+    }
+    {
+        VkDescriptorPoolSize jps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+        VkDescriptorPoolCreateInfo jdpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        jdpci.maxSets = 1;
+        jdpci.poolSizeCount = 1;
+        jdpci.pPoolSizes = &jps;
+        if (vkCreateDescriptorPool(device_, &jdpci, nullptr, &jointPool_) != VK_SUCCESS) return false;
+        VkDescriptorSetAllocateInfo jdsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        jdsai.descriptorPool = jointPool_;
+        jdsai.descriptorSetCount = 1;
+        jdsai.pSetLayouts = &jointSetLayout_;
+        if (vkAllocateDescriptorSets(device_, &jdsai, &jointSet_) != VK_SUCCESS) return false;
+        VkDescriptorBufferInfo jdbi = {jointBuffer_.buffer, 0, jointBuffer_.size};
+        VkWriteDescriptorSet jw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        jw.dstSet = jointSet_;
+        jw.dstBinding = 0;
+        jw.descriptorCount = 1;
+        jw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        jw.pBufferInfo = &jdbi;
+        vkUpdateDescriptorSets(device_, 1, &jw, 0, nullptr);
+    }
+
     std::memcpy(bboxMin_, md.bboxMin, sizeof(bboxMin_));
     std::memcpy(bboxMax_, md.bboxMax, sizeof(bboxMax_));
     hasBBox_ = md.hasBBox;
@@ -1078,6 +1133,30 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
         if (p.node >= 0 && p.node < (int)nodes_.size())
             std::memcpy(p.modelMatrix, &nodeWorld_[p.node * 16], 16 * sizeof(float));
     }
+
+    // 4) Recompute joint matrices from the freshly walked hierarchy and push
+    //    them to the SSBO. jointMatrix[i] = nodeWorld[joint_i] * inverseBind[i]
+    //    (the skinned mesh node's own transform is intentionally omitted — see
+    //    ModelSkin). Static skinned models keep the identity SSBO from
+    //    finalizeModel, which is exactly the bind pose, so this only runs when a
+    //    clip is animating the skeleton.
+    if (!skins_.empty()) {
+        void* mapped = nullptr;
+        vkMapMemory(device_, jointBuffer_.memory, 0, jointBuffer_.size, 0, &mapped);
+        uint32_t base = 0;
+        for (const ModelSkin& s : skins_) {
+            for (size_t j = 0; j < s.joints.size(); ++j) {
+                const int node = s.joints[j];
+                const glm::mat4 nw = (node >= 0 && node < (int)nodes_.size())
+                    ? glm::make_mat4(&nodeWorld_[node * 16]) : glm::mat4(1.0f);
+                const glm::mat4 jm = nw * glm::make_mat4(&s.inverseBind[j * 16]);
+                std::memcpy((char*)mapped + (base + j) * 16 * sizeof(float),
+                            glm::value_ptr(jm), 16 * sizeof(float));
+            }
+            base += (uint32_t)s.joints.size();
+        }
+        vkUnmapMemory(device_, jointBuffer_.memory);
+    }
 }
 
 void ModelRenderer::renderEye(VkImage swapchainImage,
@@ -1137,6 +1216,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // skybox and model pipelines (same layout).
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
+    // Set 3 (joint-matrix SSBO): one buffer for the whole model, bound once.
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
 
     // Opaque mode: paint the analytic sky behind the model. Skipped in
     // transparent mode so the desktop shows through (depth untouched).
@@ -1152,12 +1233,22 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     for (const auto& p : primitives_) {
         PushBlock pb{};
-        std::memcpy(pb.model, p.modelMatrix, sizeof(pb.model));
         ModelMaterial m;  // defaults if material == -1
         if (p.material >= 0 && p.material < (int)materials_.size()) m = materials_[p.material];
         std::memcpy(pb.baseColorFactor, m.baseColorFactor, sizeof(pb.baseColorFactor));
         pb.mrParams[0] = m.metallic;
         pb.mrParams[1] = m.roughness;
+        if (p.skin >= 0) {
+            // Skinned: identity model — the joint matrices carry the full
+            // skin→world transform. mrParams.z flags the shader; .w = jointBase.
+            const glm::mat4 ident(1.0f);
+            std::memcpy(pb.model, glm::value_ptr(ident), sizeof(pb.model));
+            pb.mrParams[2] = 1.0f;
+            pb.mrParams[3] = (float)p.jointBase;
+        } else {
+            std::memcpy(pb.model, p.modelMatrix, sizeof(pb.model));
+            pb.mrParams[2] = 0.0f;
+        }
         pb.emissive[0] = m.emissive[0];
         pb.emissive[1] = m.emissive[1];
         pb.emissive[2] = m.emissive[2];
@@ -1237,6 +1328,12 @@ void ModelRenderer::cleanupModel() {
     if (matPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, matPool_, nullptr); matPool_ = VK_NULL_HANDLE; }
     materialSets_.clear();
     defaultMatSet_ = VK_NULL_HANDLE;
+    // Joint-matrix SSBO + its pool (frees jointSet_).
+    if (jointBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, jointBuffer_);
+    if (jointPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, jointPool_, nullptr); jointPool_ = VK_NULL_HANDLE; }
+    jointSet_ = VK_NULL_HANDLE;
+    skins_.clear();
+    jointCount_ = 0;
     materials_.clear();
     primitives_.clear();
     nodes_.clear();
@@ -1280,6 +1377,7 @@ void ModelRenderer::cleanup() {
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
     if (pipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (dsLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, dsLayout_, nullptr); dsLayout_ = VK_NULL_HANDLE; }
+    if (jointSetLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, jointSetLayout_, nullptr); jointSetLayout_ = VK_NULL_HANDLE; }
     if (framebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
     if (renderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
