@@ -640,7 +640,8 @@ bool EndFrameWithWindowSpaceLayers(
     uint32_t viewCount,
     const void* uiLayers, uint32_t uiLayerCount,
     int32_t srcX, int32_t srcY,
-    int32_t srcW, int32_t srcH
+    int32_t srcW, int32_t srcH,
+    bool submitHud
 ) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projectionLayer.space = xr.localSpace;
@@ -674,7 +675,10 @@ bool EndFrameWithWindowSpaceLayers(
     std::vector<const XrCompositionLayerBaseHeader*> layers;
     layers.reserve(2 + uiLayerCount);
     layers.push_back((const XrCompositionLayerBaseHeader*)&projectionLayer);
-    if (xr.hasHudSwapchain)
+    // `submitHud` lets the caller drop the primary HUD layer entirely on frames
+    // where it's hidden (true toggle, one fewer composited layer) — the caller
+    // must then also skip acquiring/releasing the HUD swapchain image that frame.
+    if (xr.hasHudSwapchain && submitHud)
         layers.push_back((const XrCompositionLayerBaseHeader*)&hudLayer);
     for (uint32_t i = 0; i < uiLayerCount; ++i)
         layers.push_back((const XrCompositionLayerBaseHeader*)&ui[i]);

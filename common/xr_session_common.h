@@ -269,7 +269,12 @@ bool EndFrameWithWindowSpaceLayers(
     uint32_t viewCount,
     const void* uiLayers, uint32_t uiLayerCount,
     int32_t srcX = 0, int32_t srcY = 0,
-    int32_t srcW = -1, int32_t srcH = -1);
+    int32_t srcW = -1, int32_t srcH = -1,
+    // When false, the primary HUD layer is NOT submitted (the caller must also
+    // skip acquiring/releasing the HUD swapchain image that frame). Lets a
+    // Tab-toggle make the HUD truly absent rather than transparent. Default
+    // true preserves every existing caller's behavior.
+    bool submitHud = true);
 
 // End frame with both projection layer and window-space HUD layer.
 // viewCount defaults to 2 (stereo); pass 1 for mono submission in 2D mode.
