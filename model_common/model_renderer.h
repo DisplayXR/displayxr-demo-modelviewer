@@ -76,7 +76,7 @@ private:
     struct PushBlock {
         float model[16];
         float baseColorFactor[4];
-        float mrParams[4];   // x=metallic, y=roughness
+        float mrParams[4];   // x=metallic, y=roughness, z=isSkinned(0/1), w=jointBase
         float emissive[4];   // rgb
     };
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag}).
@@ -161,6 +161,14 @@ private:
     VkDescriptorSetLayout iblSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool iblPool_ = VK_NULL_HANDLE;
     VkDescriptorSet iblSet_ = VK_NULL_HANDLE;
+
+    // ── Skinning (set = 3: joint-matrix SSBO, vertex stage) ──────────────
+    VkDescriptorSetLayout jointSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool jointPool_ = VK_NULL_HANDLE;       // recreated per model
+    VkDescriptorSet jointSet_ = VK_NULL_HANDLE;
+    ModelBuffer jointBuffer_;                            // host-visible mat4[] SSBO
+    std::vector<ModelSkin> skins_;
+    uint32_t jointCount_ = 0;                            // matrices in jointBuffer_
 
     // ── Loaded model GPU data ────────────────────────────────────────────
     ModelBuffer vertexBuffer_;

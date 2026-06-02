@@ -25,9 +25,15 @@
 #include <vector>
 
 struct ModelVertex {
-    float pos[3];
-    float normal[3];
-    float uv[2];
+    float    pos[3];
+    float    normal[3];
+    float    uv[2];
+    // Skinning (Phase 2). All-zero weights0 ⇒ vertex is not skinned; the
+    // renderer flags non-skinned primitives so the shader keeps the static
+    // push-constant model path. JOINTS_0 (u8/u16) is widened to u16; WEIGHTS_0
+    // (float or normalized int) is decoded to float at load.
+    uint16_t joints0[4]  = {0, 0, 0, 0};
+    float    weights0[4] = {0, 0, 0, 0};
 };
 
 // Decoded RGBA8 texture image. Indices below reference ModelData::textures.
@@ -60,6 +66,11 @@ struct ModelPrimitive {
     float    modelMatrix[16];      // baked node world transform (column-major).
                                    // Static fast-path value; overwritten per
                                    // frame when an animation drives this node.
+    int      skin = -1;            // glTF skin index, or -1 (not skinned). When
+                                   // ≥0 the renderer uses an identity model
+                                   // matrix and the joint-matrix SSBO instead.
+    int      jointBase = 0;        // offset of this skin's joints in the flat
+                                   // joint-matrix array (ModelData::totalJoints).
 };
 
 // ── Animation (Phase 1: node TRS only; no skinning/morph) ────────────────────
@@ -103,6 +114,17 @@ struct Animation {
     float duration = 0.0f;         // max last-input time across samplers (seconds)
 };
 
+// ── Skinning (Phase 2) ───────────────────────────────────────────────────────
+// Per frame the renderer computes jointMatrix[i] = nodeWorld[joints[i]] *
+// inverseBind[i] (the skinned mesh node's own transform is intentionally NOT
+// applied — glTF ignores it for skinned meshes; vertices stay in skin space and
+// the draw uses an identity model matrix).
+struct ModelSkin {
+    std::vector<int>   joints;       // node indices (this skin's joint list)
+    std::vector<float> inverseBind;  // 16 floats/joint (MAT4, column-major);
+                                     // identity per joint if the accessor is absent
+};
+
 struct ModelData {
     std::vector<ModelVertex>    vertices;
     std::vector<uint32_t>       indices;
@@ -115,6 +137,12 @@ struct ModelData {
     std::vector<ModelNode>      nodes;
     std::vector<Animation>      animations;
     std::vector<int>            rootNodes;   // scene roots (indices into nodes)
+
+    // Skins (Phase 2). Empty when the model has no skinned meshes. Joint
+    // matrices for every skin are packed back-to-back; a primitive's jointBase
+    // is its skin's offset into that flat array.
+    std::vector<ModelSkin>      skins;
+    uint32_t totalJoints = 0;                // sum of joint counts across skins
 
     uint32_t primitiveCount = 0;
     // World-space AABB over all primitives (bind-pose node transforms applied).

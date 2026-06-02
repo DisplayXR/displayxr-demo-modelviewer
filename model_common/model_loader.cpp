@@ -122,6 +122,50 @@ int readAccessorFloats(const tinygltf::Model& m, int accessorIdx,
     return comps;
 }
 
+// Read a JOINTS_0 accessor (VEC4 of UNSIGNED_BYTE or UNSIGNED_SHORT) into a flat
+// uint16 array (4 per vertex). glTF guarantees ≤ u16 joint indices.
+void readJoints(const tinygltf::Model& m, int accessorIdx,
+                std::vector<uint16_t>& out) {
+    out.clear();
+    if (accessorIdx < 0 || accessorIdx >= (int)m.accessors.size()) return;
+    const tinygltf::Accessor& acc = m.accessors[accessorIdx];
+    size_t stride = 0;
+    const unsigned char* base = accessorPtr(m, acc, stride);
+    out.resize(acc.count * 4);
+    const bool u8 = acc.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    for (size_t i = 0; i < acc.count; ++i) {
+        const unsigned char* p = base + i * stride;
+        for (int c = 0; c < 4; ++c)
+            out[i * 4 + c] = u8 ? (uint16_t)p[c]
+                                : *reinterpret_cast<const uint16_t*>(p + c * 2);
+    }
+}
+
+// Read a WEIGHTS_0 accessor (VEC4) into a flat float array (4 per vertex).
+// FLOAT passes through; normalized UNSIGNED_BYTE/SHORT are decoded to [0,1].
+void readWeights(const tinygltf::Model& m, int accessorIdx,
+                 std::vector<float>& out) {
+    out.clear();
+    if (accessorIdx < 0 || accessorIdx >= (int)m.accessors.size()) return;
+    const tinygltf::Accessor& acc = m.accessors[accessorIdx];
+    size_t stride = 0;
+    const unsigned char* base = accessorPtr(m, acc, stride);
+    out.resize(acc.count * 4);
+    for (size_t i = 0; i < acc.count; ++i) {
+        const unsigned char* p = base + i * stride;
+        for (int c = 0; c < 4; ++c) {
+            switch (acc.componentType) {
+                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+                    out[i * 4 + c] = p[c] / 255.0f; break;
+                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+                    out[i * 4 + c] = reinterpret_cast<const uint16_t*>(p)[c] / 65535.0f; break;
+                default:  // FLOAT
+                    out[i * 4 + c] = reinterpret_cast<const float*>(p)[c]; break;
+            }
+        }
+    }
+}
+
 uint32_t readIndex(const tinygltf::Model& m, const tinygltf::Accessor& acc,
                    const unsigned char* base, size_t stride, size_t i) {
     const unsigned char* p = base + i * stride;
@@ -147,11 +191,23 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
             if (itPos == prim.attributes.end()) continue;
             auto itNrm = prim.attributes.find("NORMAL");
             auto itUv  = prim.attributes.find("TEXCOORD_0");
+            auto itJnt = prim.attributes.find("JOINTS_0");
+            auto itWgt = prim.attributes.find("WEIGHTS_0");
 
-            std::vector<float> pos, nrm, uv;
+            std::vector<float> pos, nrm, uv, wgt;
+            std::vector<uint16_t> jnt;
             readVec(m, itPos->second, 3, pos);
             readVec(m, itNrm != prim.attributes.end() ? itNrm->second : -1, 3, nrm);
             readVec(m, itUv  != prim.attributes.end() ? itUv->second  : -1, 2, uv);
+            // A primitive is skinned only when the node has a skin AND carries
+            // both joint + weight attributes.
+            const bool skinned = node.skin >= 0 &&
+                                 itJnt != prim.attributes.end() &&
+                                 itWgt != prim.attributes.end();
+            if (skinned) {
+                readJoints(m, itJnt->second, jnt);
+                readWeights(m, itWgt->second, wgt);
+            }
 
             const size_t vcount = pos.size() / 3;
             const uint32_t vertexBase = (uint32_t)out.vertices.size();
@@ -162,10 +218,20 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
                 if (!nrm.empty()) { v.normal[0] = nrm[i*3+0]; v.normal[1] = nrm[i*3+1]; v.normal[2] = nrm[i*3+2]; }
                 else              { v.normal[0] = 0; v.normal[1] = 1; v.normal[2] = 0; }
                 if (!uv.empty())  { v.uv[0] = uv[i*2+0]; v.uv[1] = uv[i*2+1]; }
+                if (skinned && jnt.size() >= (i + 1) * 4 && wgt.size() >= (i + 1) * 4) {
+                    for (int c = 0; c < 4; ++c) {
+                        v.joints0[c]  = jnt[i * 4 + c];
+                        v.weights0[c] = wgt[i * 4 + c];
+                    }
+                }
                 out.vertices.push_back(v);
 
-                // AABB in world space.
-                glm::vec4 wp = world * glm::vec4(v.pos[0], v.pos[1], v.pos[2], 1.0f);
+                // AABB. Skinned meshes are placed purely by their joint matrices
+                // (the mesh node transform is ignored, per glTF), and in bind
+                // pose that resolves to the raw POSITION — so accumulate skinned
+                // verts untransformed; static verts use the baked world matrix.
+                glm::vec4 wp = skinned ? glm::vec4(v.pos[0], v.pos[1], v.pos[2], 1.0f)
+                                       : world * glm::vec4(v.pos[0], v.pos[1], v.pos[2], 1.0f);
                 if (!out.hasBBox) {
                     out.bboxMin[0] = out.bboxMax[0] = wp.x;
                     out.bboxMin[1] = out.bboxMax[1] = wp.y;
@@ -182,6 +248,7 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
             mp.firstIndex = (uint32_t)out.indices.size();
             mp.material = prim.material;
             mp.node = nodeIdx;   // owning node → animated world matrix per frame
+            mp.skin = skinned ? node.skin : -1;  // jointBase filled in after skins parse
             std::memcpy(mp.modelMatrix, glm::value_ptr(world), 16 * sizeof(float));
 
             if (prim.indices >= 0) {
@@ -332,6 +399,42 @@ bool model_loader_load(const char* gltfPath, ModelData& out) {
     } else {
         for (int n = 0; n < (int)out.nodes.size(); ++n)
             if (out.nodes[n].parent < 0) out.rootNodes.push_back(n);
+    }
+
+    // ── Parse skins[] (joint lists + inverse-bind matrices) ───────────────────
+    // Joint matrices for every skin are packed back-to-back; jointBase is each
+    // skin's offset into that flat array. A skin's inverseBindMatrices accessor
+    // may be absent → default each joint to identity (glTF allows this).
+    out.skins.resize(model.skins.size());
+    uint32_t jointBase = 0;
+    for (size_t s = 0; s < model.skins.size(); ++s) {
+        const tinygltf::Skin& src = model.skins[s];
+        ModelSkin& dst = out.skins[s];
+        dst.joints.assign(src.joints.begin(), src.joints.end());
+        const size_t nj = dst.joints.size();
+        if (src.inverseBindMatrices >= 0) {
+            readAccessorFloats(model, src.inverseBindMatrices, dst.inverseBind);
+        }
+        if (dst.inverseBind.size() != nj * 16) {  // absent / malformed → identity
+            dst.inverseBind.assign(nj * 16, 0.0f);
+            for (size_t j = 0; j < nj; ++j)
+                dst.inverseBind[j * 16 + 0] = dst.inverseBind[j * 16 + 5] =
+                dst.inverseBind[j * 16 + 10] = dst.inverseBind[j * 16 + 15] = 1.0f;
+        }
+        jointBase += (uint32_t)nj;
+    }
+    out.totalJoints = jointBase;
+    // Back-fill each skinned primitive's jointBase from its skin index.
+    {
+        std::vector<uint32_t> baseOf(out.skins.size(), 0);
+        uint32_t acc = 0;
+        for (size_t s = 0; s < out.skins.size(); ++s) {
+            baseOf[s] = acc;
+            acc += (uint32_t)out.skins[s].joints.size();
+        }
+        for (ModelPrimitive& p : out.primitives)
+            if (p.skin >= 0 && p.skin < (int)baseOf.size())
+                p.jointBase = (int)baseOf[p.skin];
     }
 
     // ── Parse animations[] (channels + samplers) ─────────────────────────────
