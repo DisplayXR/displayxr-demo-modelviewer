@@ -545,8 +545,9 @@ bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayer
     return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
 }
 
-bool CreateHudSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height) {
-    LOG_INFO("Creating HUD swapchain for window-space layer (%ux%u)...", width, height);
+bool CreateWindowSpaceSwapchain(XrSessionManager& xr, SwapchainInfo& out,
+                                uint32_t width, uint32_t height) {
+    LOG_INFO("Creating window-space swapchain (%ux%u)...", width, height);
 
     // Query supported swapchain formats
     uint32_t formatCount = 0;
@@ -584,53 +585,60 @@ bool CreateHudSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height) {
     swapchainInfo.arraySize = 1;
     swapchainInfo.mipCount = 1;
 
-    XR_CHECK_LOG(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.hudSwapchain.swapchain));
-    LOG_INFO("HUD swapchain created: 0x%p", (void*)xr.hudSwapchain.swapchain);
+    XR_CHECK_LOG(xrCreateSwapchain(xr.session, &swapchainInfo, &out.swapchain));
+    LOG_INFO("Window-space swapchain created: 0x%p", (void*)out.swapchain);
 
-    xr.hudSwapchain.format = selectedFormat;
-    xr.hudSwapchain.width = width;
-    xr.hudSwapchain.height = height;
+    out.format = selectedFormat;
+    out.width = width;
+    out.height = height;
 
     // Count swapchain images (API-specific enumeration is done by each app)
     uint32_t imageCount = 0;
-    XR_CHECK(xrEnumerateSwapchainImages(xr.hudSwapchain.swapchain, 0, &imageCount, nullptr));
-    xr.hudSwapchain.imageCount = imageCount;
+    XR_CHECK(xrEnumerateSwapchainImages(out.swapchain, 0, &imageCount, nullptr));
+    out.imageCount = imageCount;
 
-    LOG_INFO("Got %u HUD swapchain images", imageCount);
-    xr.hasHudSwapchain = true;
-
+    LOG_INFO("Got %u window-space swapchain images", imageCount);
     return true;
+}
+
+bool CreateHudSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height) {
+    if (!CreateWindowSpaceSwapchain(xr, xr.hudSwapchain, width, height)) return false;
+    xr.hasHudSwapchain = true;
+    return true;
+}
+
+bool AcquireWindowSpaceImage(SwapchainInfo& sc, uint32_t& imageIndex) {
+    XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(xrAcquireSwapchainImage(sc.swapchain, &acquireInfo, &imageIndex))) return false;
+
+    XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    waitInfo.timeout = XR_INFINITE_DURATION;
+    return XR_SUCCEEDED(xrWaitSwapchainImage(sc.swapchain, &waitInfo));
+}
+
+bool ReleaseWindowSpaceImage(SwapchainInfo& sc) {
+    XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    return XR_SUCCEEDED(xrReleaseSwapchainImage(sc.swapchain, &releaseInfo));
 }
 
 bool AcquireHudSwapchainImage(XrSessionManager& xr, uint32_t& imageIndex) {
     if (!xr.hasHudSwapchain) return false;
-
-    XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XrResult result = xrAcquireSwapchainImage(xr.hudSwapchain.swapchain, &acquireInfo, &imageIndex);
-    if (XR_FAILED(result)) return false;
-
-    XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    waitInfo.timeout = XR_INFINITE_DURATION;
-    result = xrWaitSwapchainImage(xr.hudSwapchain.swapchain, &waitInfo);
-    if (XR_FAILED(result)) return false;
-
-    return true;
+    return AcquireWindowSpaceImage(xr.hudSwapchain, imageIndex);
 }
 
 bool ReleaseHudSwapchainImage(XrSessionManager& xr) {
     if (!xr.hasHudSwapchain) return false;
-
-    XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.hudSwapchain.swapchain, &releaseInfo));
+    return ReleaseWindowSpaceImage(xr.hudSwapchain);
 }
 
-bool EndFrameWithWindowSpaceHud(
+bool EndFrameWithWindowSpaceLayers(
     XrSessionManager& xr,
     XrTime displayTime,
     const XrCompositionLayerProjectionView* projViews,
     float hudX, float hudY, float hudWidth, float hudHeight,
     float hudDisparity,
     uint32_t viewCount,
+    const void* uiLayers, uint32_t uiLayerCount,
     int32_t srcX, int32_t srcY,
     int32_t srcW, int32_t srcH
 ) {
@@ -660,19 +668,39 @@ bool EndFrameWithWindowSpaceHud(
     hudLayer.height = hudHeight;
     hudLayer.disparity = hudDisparity;
 
-    // Submit both layers - projection first, then HUD on top
-    const XrCompositionLayerBaseHeader* layers[] = {
-        (XrCompositionLayerBaseHeader*)&projectionLayer,
-        (XrCompositionLayerBaseHeader*)&hudLayer
-    };
+    // projection, [HUD], then each caller-built window-space UI layer on top.
+    const XrCompositionLayerWindowSpaceEXT* ui =
+        reinterpret_cast<const XrCompositionLayerWindowSpaceEXT*>(uiLayers);
+    std::vector<const XrCompositionLayerBaseHeader*> layers;
+    layers.reserve(2 + uiLayerCount);
+    layers.push_back((const XrCompositionLayerBaseHeader*)&projectionLayer);
+    if (xr.hasHudSwapchain)
+        layers.push_back((const XrCompositionLayerBaseHeader*)&hudLayer);
+    for (uint32_t i = 0; i < uiLayerCount; ++i)
+        layers.push_back((const XrCompositionLayerBaseHeader*)&ui[i]);
 
     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = displayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    endInfo.layerCount = xr.hasHudSwapchain ? 2 : 1;
-    endInfo.layers = layers;
+    endInfo.layerCount = (uint32_t)layers.size();
+    endInfo.layers = layers.data();
 
     return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
+}
+
+bool EndFrameWithWindowSpaceHud(
+    XrSessionManager& xr,
+    XrTime displayTime,
+    const XrCompositionLayerProjectionView* projViews,
+    float hudX, float hudY, float hudWidth, float hudHeight,
+    float hudDisparity,
+    uint32_t viewCount,
+    int32_t srcX, int32_t srcY,
+    int32_t srcW, int32_t srcH
+) {
+    return EndFrameWithWindowSpaceLayers(xr, displayTime, projViews,
+        hudX, hudY, hudWidth, hudHeight, hudDisparity, viewCount,
+        nullptr, 0, srcX, srcY, srcW, srcH);
 }
 
 // [Commented out — will be reused for 3D-positioned HUD later]
@@ -924,6 +952,14 @@ void CleanupOpenXR(XrSessionManager& xr) {
         xrDestroySwapchain(xr.hudSwapchain.swapchain);
         xr.hudSwapchain.swapchain = XR_NULL_HANDLE;
         xr.hasHudSwapchain = false;
+    }
+
+    // Destroy animation-button window-space swapchain
+    if (xr.animBtnSwapchain.swapchain != XR_NULL_HANDLE) {
+        LOG_INFO("Destroying animation-button swapchain...");
+        xrDestroySwapchain(xr.animBtnSwapchain.swapchain);
+        xr.animBtnSwapchain.swapchain = XR_NULL_HANDLE;
+        xr.hasAnimBtnSwapchain = false;
     }
 
     // Destroy quad layer swapchain

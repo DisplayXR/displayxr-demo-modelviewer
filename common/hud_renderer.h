@@ -77,6 +77,14 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     bool drawBody = true,
     bool bodyAtBottom = false);
 
+// Render a single button filling the ENTIRE texture (for a standalone button
+// swapchain submitted as its own window-space layer). Clears transparent, draws
+// one centered glassy button at full size. Returns mapped R8G8B8A8 pixels + row
+// pitch; caller uploads then calls UnmapHud(). Use a HudRenderer sized to the
+// button (e.g. 256×80), not the main HUD renderer.
+const void* RenderButtonStandalone(HudRenderer& hud, uint32_t* rowPitch,
+    const std::wstring& label, bool hovered);
+
 // Unmap the staging texture after pixel upload
 void UnmapHud(HudRenderer& hud);
 

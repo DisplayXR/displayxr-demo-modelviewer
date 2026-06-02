@@ -74,6 +74,36 @@ static const float MODE_BTN_Y_FRACTION = 0.010f;
 static const float MODE_BTN_WIDTH_FRACTION  = 0.140f;
 static const float MODE_BTN_HEIGHT_FRACTION = 0.030f;
 
+// Animation button — its OWN window-space composition layer (independent of the
+// aspect-locked, left-anchored HUD layer), so it pins to the true window right
+// edge with its own depth. Only shown/clickable when the model has clips. Label
+// = current clip name, or "Paused"; click = next clip (same as 'N'). The layer's
+// window-space x = 1 − width − margin; height is derived per-frame from the
+// window aspect + the button texture aspect so it isn't distorted.
+// Texture is a thin pill (~7.5:1) like a Mode button, so the aspect-preserved
+// layer height lands ~0.03 of the window (matching Open/Mode), not a fat block.
+static const uint32_t ANIM_BTN_TEX_W = 480;   // button swapchain size (px)
+static const uint32_t ANIM_BTN_TEX_H = 64;
+// Font base height for the button renderer — sized so the label fills the pill
+// like Open/Mode (smallFontSize = 15·base/470 ≈ 33px in a 64px-tall texture).
+static const uint32_t ANIM_BTN_FONT_BASE = ANIM_BTN_TEX_H * 16;
+static const float ANIM_BTN_WIDTH_FRACTION  = 0.140f;  // layer width (matches Mode)
+static const float ANIM_BTN_MARGIN_FRACTION = 0.010f;
+static const float ANIM_BTN_Y_FRACTION      = 0.010f;  // matches Open/Mode top
+static const float ANIM_BTN_DISPARITY       = 0.0f;    // screen-plane depth (tunable)
+
+// Height fraction that keeps the button texture's pixel aspect undistorted when
+// the layer (ANIM_BTN_WIDTH_FRACTION wide) is mapped into a windowW×windowH window.
+static inline float AnimBtnHeightFraction(uint32_t windowW, uint32_t windowH) {
+    if (windowW == 0 || windowH == 0) return ANIM_BTN_WIDTH_FRACTION;
+    const float windowAR = (float)windowW / (float)windowH;
+    const float texAR = (float)ANIM_BTN_TEX_W / (float)ANIM_BTN_TEX_H;
+    return ANIM_BTN_WIDTH_FRACTION * windowAR / texAR;
+}
+static inline float AnimBtnXFraction() {
+    return 1.0f - ANIM_BTN_WIDTH_FRACTION - ANIM_BTN_MARGIN_FRACTION;
+}
+
 
 // sim_display output mode switching (legacy — replaced by unified rendering mode)
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
@@ -110,6 +140,20 @@ static std::atomic<bool> g_captureAtlasRequested{false};
 static std::atomic<bool> g_transparentBg{false};
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
+// True when the loaded model has animation clips — gates the animation button
+// layer + its click hit-test (read on the UI thread, set on load).
+static std::atomic<bool> g_hasAnimations{false};
+
+// Animation-button window-space layer resources: created in main() (when the
+// HUD swapchain — i.e. window-space layers — is available), used by the render
+// thread. The swapchain itself lives in xr.animBtnSwapchain.
+static HudRenderer    g_animBtnHud = {};                 // own D3D11 text renderer (256×80)
+static bool           g_animBtnReady = false;            // all resources created
+static VkBuffer       g_animBtnStaging = VK_NULL_HANDLE;
+static VkDeviceMemory g_animBtnStagingMem = VK_NULL_HANDLE;
+static void*          g_animBtnStagingMapped = nullptr;
+static VkCommandPool  g_animBtnCmdPool = VK_NULL_HANDLE;
+static std::vector<XrSwapchainImageVulkanKHR> g_animBtnSwapImages;
 
 // Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
@@ -134,6 +178,8 @@ static std::atomic<bool> g_fitValid{false};
 // with mouse drag from a predictable starting pose.
 // Caller must hold g_sceneMutex (we read pickData_ from the renderer).
 static void ApplyAutoFitForLoadedScene_locked() {
+    // Gate the right-justified animation button on whether this model has clips.
+    g_hasAnimations.store(g_modelRenderer.hasAnimations());
     float center[3], extent[3];
     // Full model AABB: center for the rig position, extent[1] for the height fit.
     bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
@@ -240,6 +286,16 @@ static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH
     return PointInFractionRect(mouseX, mouseY, windowW, windowH,
         MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
         MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION);
+}
+
+static bool IsClickOnAnimButton(int mouseX, int mouseY, int windowW, int windowH) {
+    // Only live when the model actually has clips (else the top-right corner
+    // stays a normal scene-rotate region). The button is its own window-space
+    // layer at the true right edge, so the rect is plain window fractions.
+    if (!g_hasAnimations.load()) return false;
+    return PointInFractionRect(mouseX, mouseY, windowW, windowH,
+        AnimBtnXFraction(), ANIM_BTN_Y_FRACTION,
+        ANIM_BTN_WIDTH_FRACTION, AnimBtnHeightFraction(windowW, windowH));
 }
 
 // Atlas capture helpers live in test_apps/common/atlas_capture* — see
@@ -405,6 +461,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Mode button = cycle request (V-key equivalent). Main loop
             // reads runtime's current mode and computes the target.
             g_inputState.cycleRenderingModeRequested = true;
+            return 0;
+        }
+        if (IsClickOnAnimButton(mx, my, g_windowWidth, g_windowHeight)) {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.leftButton = false;
+            g_inputState.dragging = false;
+            // Animation button = next clip (N-key equivalent).
+            g_inputState.cycleClipRequested = true;
             return 0;
         }
         SetCapture(hwnd);
@@ -1284,16 +1348,6 @@ static void RenderThreadFunc(
                                     if (g_modelRenderer.hasModel()) {
                                         std::wstring fname(g_loadedFileName.begin(), g_loadedFileName.end());
                                         sceneText += L"\nLoaded: " + fname;
-                                        // Clip playback status (Phase 4) — same HUD layer.
-                                        std::string clip; int ci, cn; float ct, cd; bool playing;
-                                        if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing)) {
-                                            wchar_t cbuf[160];
-                                            swprintf(cbuf, 160,
-                                                L"\nClip: %hs [%d/%d]  %.1f/%.1fs  %s",
-                                                clip.c_str(), ci + 1, cn, ct, cd,
-                                                playing ? L"playing" : L"paused");
-                                            sceneText += cbuf;
-                                        }
                                     } else {
                                         sceneText += L"\nNo scene loaded (press L or click Load)";
                                     }
@@ -1408,6 +1462,7 @@ static void RenderThreadFunc(
                                         MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
                                         MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION,
                                         modeLabel));
+
                                 }
 
                                 uint32_t srcRowPitch = 0;
@@ -1488,20 +1543,98 @@ static void RenderThreadFunc(
                     }
                 }
 
+                // ── Animation button: render into its own swapchain + build its
+                //    independent window-space layer (true right edge, own depth). ──
+                XrCompositionLayerWindowSpaceEXT animLayer = {};
+                bool animLayerReady = false;
+                if (g_animBtnReady && xr->hasAnimBtnSwapchain && g_hasAnimations.load()) {
+                    std::wstring label;
+                    {
+                        std::string clip; int ci, cn; float ct, cd; bool playing;
+                        std::lock_guard<std::mutex> lk(g_sceneMutex);
+                        if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing))
+                            label = playing ? std::wstring(clip.begin(), clip.end()) : L"Paused";
+                    }
+                    uint32_t pitch = 0;
+                    const void* px = label.empty() ? nullptr
+                        : RenderButtonStandalone(g_animBtnHud, &pitch, label, /*hovered=*/false);
+                    uint32_t idx = 0;
+                    if (px && AcquireWindowSpaceImage(xr->animBtnSwapchain, idx)) {
+                        uint8_t* dst = (uint8_t*)g_animBtnStagingMapped;
+                        for (uint32_t row = 0; row < ANIM_BTN_TEX_H; ++row)
+                            memcpy(dst + row * ANIM_BTN_TEX_W * 4,
+                                   (const uint8_t*)px + row * pitch, ANIM_BTN_TEX_W * 4);
+                        UnmapHud(g_animBtnHud);
+
+                        VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                        cai.commandPool = g_animBtnCmdPool;
+                        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                        cai.commandBufferCount = 1;
+                        VkCommandBuffer cb = VK_NULL_HANDLE;
+                        vkAllocateCommandBuffers(vkDevice, &cai, &cb);
+                        VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                        bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                        vkBeginCommandBuffer(cb, &bgi);
+                        VkImage img = g_animBtnSwapImages[idx].image;
+                        VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                        bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                        bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                        bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        bar.image = img;
+                        bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+                        VkBufferImageCopy rg = {};
+                        rg.bufferRowLength = ANIM_BTN_TEX_W;
+                        rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                        rg.imageOffset = {0, 0, 0};
+                        rg.imageExtent = {ANIM_BTN_TEX_W, ANIM_BTN_TEX_H, 1};
+                        vkCmdCopyBufferToImage(cb, g_animBtnStaging, img,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+                        bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                        bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                        bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                        bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+                        vkEndCommandBuffer(cb);
+                        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+                        vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
+                        vkQueueWaitIdle(graphicsQueue);
+                        vkFreeCommandBuffers(vkDevice, g_animBtnCmdPool, 1, &cb);
+                        ReleaseWindowSpaceImage(xr->animBtnSwapchain);
+
+                        animLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+                        animLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                        animLayer.subImage.swapchain = xr->animBtnSwapchain.swapchain;
+                        animLayer.subImage.imageRect.offset = {0, 0};
+                        animLayer.subImage.imageRect.extent = {(int32_t)ANIM_BTN_TEX_W, (int32_t)ANIM_BTN_TEX_H};
+                        animLayer.subImage.imageArrayIndex = 0;
+                        animLayer.x = AnimBtnXFraction();
+                        animLayer.y = ANIM_BTN_Y_FRACTION;
+                        animLayer.width = ANIM_BTN_WIDTH_FRACTION;
+                        animLayer.height = AnimBtnHeightFraction(windowW, windowH);
+                        animLayer.disparity = ANIM_BTN_DISPARITY;
+                        animLayerReady = true;
+                    } else if (px) {
+                        UnmapHud(g_animBtnHud);
+                    }
+                }
+
                 // Submit frame
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
                 if (rendered && hudSubmitted) {
-                    // Layer footprint sized per-frame to match the HUD
-                    // swapchain's aspect (computed above as layerFracW ×
-                    // layerFracH), so the runtime's swapchain→layer rect
-                    // mapping is uniform across both axes — glyphs and
-                    // buttons keep their proportions on any tile aspect.
-                    // Empty regions stay alpha=0 (compositor honors source
-                    // alpha for window-space layers).
-                    EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount);
+                    // HUD layer (aspect-locked left strip) + any independent UI
+                    // layers (the animation button, placed at the true right edge
+                    // with its own depth). Empty regions stay alpha=0.
+                    EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
+                        0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
+                        animLayerReady ? &animLayer : nullptr, animLayerReady ? 1u : 0u);
                 } else if (rendered) {
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
                 } else {
@@ -1811,6 +1944,54 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
+    // ── Animation-button window-space layer resources ────────────────────────
+    // Own swapchain + text renderer + staging + cmd pool, so the button can be
+    // its own composition layer at the true window right edge (independent of
+    // the HUD). Only when window-space layers are available (hud swapchain ok).
+    if (hudOk && xr.hasHudSwapchain) {
+        if (InitializeHudRenderer(g_animBtnHud, ANIM_BTN_TEX_W, ANIM_BTN_TEX_H, ANIM_BTN_FONT_BASE) &&
+            CreateWindowSpaceSwapchain(xr, xr.animBtnSwapchain, ANIM_BTN_TEX_W, ANIM_BTN_TEX_H)) {
+            xr.hasAnimBtnSwapchain = true;
+            uint32_t c = xr.animBtnSwapchain.imageCount;
+            g_animBtnSwapImages.resize(c, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+            xrEnumerateSwapchainImages(xr.animBtnSwapchain.swapchain, c, &c,
+                (XrSwapchainImageBaseHeader*)g_animBtnSwapImages.data());
+
+            VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bi.size = (VkDeviceSize)ANIM_BTN_TEX_W * ANIM_BTN_TEX_H * 4;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            bool ok = vkCreateBuffer(vkDevice, &bi, nullptr, &g_animBtnStaging) == VK_SUCCESS;
+            if (ok) {
+                VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vkDevice, g_animBtnStaging, &mr);
+                VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(physDevice, &mp);
+                uint32_t mt = UINT32_MAX;
+                for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+                    if ((mr.memoryTypeBits & (1u << i)) &&
+                        (mp.memoryTypes[i].propertyFlags &
+                         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { mt = i; break; }
+                if (mt != UINT32_MAX) {
+                    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    ai.allocationSize = mr.size; ai.memoryTypeIndex = mt;
+                    vkAllocateMemory(vkDevice, &ai, nullptr, &g_animBtnStagingMem);
+                    vkBindBufferMemory(vkDevice, g_animBtnStaging, g_animBtnStagingMem, 0);
+                    vkMapMemory(vkDevice, g_animBtnStagingMem, 0, bi.size, 0, &g_animBtnStagingMapped);
+                } else ok = false;
+            }
+            if (ok) {
+                VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                pci.queueFamilyIndex = queueFamilyIndex;
+                ok = vkCreateCommandPool(vkDevice, &pci, nullptr, &g_animBtnCmdPool) == VK_SUCCESS;
+            }
+            g_animBtnReady = ok;
+            LOG_INFO("Animation-button layer resources %s", ok ? "created" : "FAILED");
+        } else {
+            LOG_WARN("Animation-button layer init failed — button will not show");
+        }
+    }
+
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -1867,6 +2048,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     if (hudStagingMemory != VK_NULL_HANDLE) vkFreeMemory(vkDevice, hudStagingMemory, nullptr);
     if (hudOk) CleanupHudRenderer(hudRenderer);
+
+    // Animation-button layer resources.
+    if (g_animBtnCmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, g_animBtnCmdPool, nullptr);
+    if (g_animBtnStaging != VK_NULL_HANDLE) {
+        if (g_animBtnStagingMapped) vkUnmapMemory(vkDevice, g_animBtnStagingMem);
+        vkDestroyBuffer(vkDevice, g_animBtnStaging, nullptr);
+    }
+    if (g_animBtnStagingMem != VK_NULL_HANDLE) vkFreeMemory(vkDevice, g_animBtnStagingMem, nullptr);
+    if (g_animBtnReady) CleanupHudRenderer(g_animBtnHud);
 
     g_xr = nullptr;
     CleanupOpenXR(xr);

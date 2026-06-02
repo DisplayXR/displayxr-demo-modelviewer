@@ -423,6 +423,8 @@ static NSVisualEffectView *g_hudBackdrop = nil;  // frosted wrapper sized to hud
 static NSView   *g_topBar = nil;
 static NSButton *g_openButton = nil;
 static NSButton *g_modeButton = nil;
+static NSButton *g_animButton = nil;   // right-justified clip button; hidden w/o clips
+static NSView   *g_animButtonBackdrop = nil;
 static NSView   *g_reticleView = nil;
 
 // Translucent dark background view used behind the top bar.
@@ -786,6 +788,18 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
                                        &g_modeButton);
     [g_topBar addSubview:modeBd];
 
+    // Animation button — right-justified (pinned to the right edge via
+    // NSViewMinXMargin so it stays put on resize). Hidden until a model with
+    // clips loads (see UpdateTopBarButtonTitles). Click = next clip (N-key).
+    const CGFloat animW = 160.0;
+    NSView *animBd = makeGlassyButton(NSMakeRect(width - animW - 12.0, btnY, animW, btnH),
+                                       @"", @selector(animationButtonClicked:),
+                                       &g_animButton);
+    [animBd setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
+    [animBd setHidden:YES];
+    g_animButtonBackdrop = animBd;
+    [g_topBar addSubview:animBd];
+
     // --- Reticle (non-interactive center crosshair) ---
     const CGFloat retSize = 20.0;
     NSRect retFrame = NSMakeRect((width - retSize) * 0.5f, (height - retSize) * 0.5f, retSize, retSize);
@@ -802,6 +816,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 @interface NSApplication (TopBarActions)
 - (void)openButtonClicked:(id)sender;
 - (void)modeButtonClicked:(id)sender;
+- (void)animationButtonClicked:(id)sender;
 @end
 
 @implementation NSApplication (TopBarActions)
@@ -817,6 +832,11 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         g_input.currentRenderingMode = (g_input.currentRenderingMode + 1) % g_input.renderingModeCount;
     }
     g_input.renderingModeChangeRequested = true;
+}
+- (void)animationButtonClicked:(id)sender {
+    (void)sender;
+    MarkUserInput(g_input);
+    g_input.cycleClipRequested = true;   // next clip (N-key equivalent)
 }
 @end
 
@@ -919,6 +939,20 @@ static void UpdateTopBarButtonTitles(AppXrSession& xr) {
             name = xr.renderingModeNames[g_input.currentRenderingMode];
         }
         [g_modeButton setTitle:[NSString stringWithFormat:@"Mode: %s", name]];
+    }
+}
+
+// Refresh the right-justified animation button: shown only when the model has
+// clips; label = current clip name, or "Paused". Called on load + N/K events.
+// xr-free so the load hook (ApplyAutoFitForLoadedScene) can call it.
+static void UpdateAnimButton() {
+    if (!g_animButton || !g_animButtonBackdrop) return;
+    std::string clip; int ci, cn; float ct, cd; bool playing;
+    if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing)) {
+        [g_animButtonBackdrop setHidden:NO];
+        [g_animButton setTitle:playing ? [NSString stringWithUTF8String:clip.c_str()] : @"Paused"];
+    } else {
+        [g_animButtonBackdrop setHidden:YES];
     }
 }
 
@@ -1394,6 +1428,7 @@ static bool FileExists(const std::string& p) {
 // authored +Z, which glTF places facing the viewer; the user can rotate
 // with mouse drag from a predictable starting pose.
 static void ApplyAutoFitForLoadedScene() {
+    UpdateAnimButton();   // show/hide + label the clip button for the new model
     float center[3], extent[3];
     // Robust AABB (5th–95th percentile per axis): center for the rig position,
     // extent[1] for the height fit. Percentile trim rejects stray outlier
@@ -1622,8 +1657,11 @@ int main() {
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
         // Clip playback (N=next, K=play/pause), applied before the per-frame
         // advance so this frame reflects it.
-        if (g_input.cycleClipRequested) { g_input.cycleClipRequested = false; g_modelRenderer.cycleAnimation(); }
-        if (g_input.playPauseRequested) { g_input.playPauseRequested = false; g_modelRenderer.togglePaused(); }
+        if (g_input.cycleClipRequested || g_input.playPauseRequested) {
+            if (g_input.cycleClipRequested) { g_input.cycleClipRequested = false; g_modelRenderer.cycleAnimation(); }
+            if (g_input.playPauseRequested) { g_input.playPauseRequested = false; g_modelRenderer.togglePaused(); }
+            UpdateAnimButton();   // refresh label (clip name ↔ "Paused")
+        }
         // Advance node/TRS animation once per frame (no-op for static models).
         g_modelRenderer.updateAnimation(deltaTime);
 
@@ -2023,18 +2061,9 @@ int main() {
             @autoreleasepool {
                 if (g_input.hudVisible && g_hudView != nil) {
                     double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
-                    NSString *sceneInfo;
-                    if (g_modelRenderer.hasModel()) {
-                        NSMutableString *s = [NSMutableString stringWithFormat:@"Model: %s", g_loadedFileName.c_str()];
-                        std::string clip; int ci, cn; float ct, cd; bool playing;
-                        if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing)) {
-                            [s appendFormat:@"\nClip: %s [%d/%d]  %.1f/%.1fs  %s",
-                                clip.c_str(), ci + 1, cn, ct, cd, playing ? "playing" : "paused"];
-                        }
-                        sceneInfo = s;
-                    } else {
-                        sceneInfo = @"No model loaded (press L)";
-                    }
+                    NSString *sceneInfo = g_modelRenderer.hasModel()
+                        ? [NSString stringWithFormat:@"Model: %s", g_loadedFileName.c_str()]
+                        : @"No model loaded (press L)";
 
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
                     const char *orbitLabel = g_input.animateEnabled
