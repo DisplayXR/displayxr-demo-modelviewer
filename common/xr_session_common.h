@@ -152,6 +152,12 @@ struct XrSessionManager {
     SwapchainInfo hudSwapchain;
     bool hasHudSwapchain = false;
 
+    // Independent window-space layer for the animation button (Phase 4): its own
+    // swapchain so it can be placed at the true window right edge with its own
+    // depth, decoupled from the (left-anchored, aspect-locked) HUD layer.
+    SwapchainInfo animBtnSwapchain;
+    bool hasAnimBtnSwapchain = false;
+
     // Per-view data (N-view: up to 8 views, matching XRT_MAX_VIEWS)
     uint32_t viewCount = 2;
     float eyePositions[8][3] = {};       // [view][x,y,z] — raw per-eye positions in display space
@@ -241,6 +247,29 @@ bool CreateHudSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height);
 // Acquire/release HUD swapchain image
 bool AcquireHudSwapchainImage(XrSessionManager& xr, uint32_t& imageIndex);
 bool ReleaseHudSwapchainImage(XrSessionManager& xr);
+
+// Generic window-space swapchain helpers (the Hud* ones above are thin wrappers
+// over these). Used for additional independent UI layers (e.g. the animation
+// button). Acquire/Release operate on the passed SwapchainInfo directly.
+bool CreateWindowSpaceSwapchain(XrSessionManager& xr, SwapchainInfo& out,
+                                uint32_t width, uint32_t height);
+bool AcquireWindowSpaceImage(SwapchainInfo& sc, uint32_t& imageIndex);
+bool ReleaseWindowSpaceImage(SwapchainInfo& sc);
+
+// End frame with the projection layer, the window-space HUD layer, AND any
+// number of extra pre-built window-space layers (each its own swapchain, placed
+// independently via x/y/width/height/disparity). EndFrameWithWindowSpaceHud is
+// the extraCount==0 case. `uiLayers` may alias the caller's stack array.
+bool EndFrameWithWindowSpaceLayers(
+    XrSessionManager& xr,
+    XrTime displayTime,
+    const XrCompositionLayerProjectionView* projViews,
+    float hudX, float hudY, float hudWidth, float hudHeight,
+    float hudDisparity,
+    uint32_t viewCount,
+    const void* uiLayers, uint32_t uiLayerCount,
+    int32_t srcX = 0, int32_t srcY = 0,
+    int32_t srcW = -1, int32_t srcH = -1);
 
 // End frame with both projection layer and window-space HUD layer.
 // viewCount defaults to 2 (stereo); pass 1 for mono submission in 2D mode.

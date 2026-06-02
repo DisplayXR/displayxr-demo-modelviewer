@@ -52,6 +52,7 @@ struct ModelRenderer {
     void cycleAnimation();                 // → next clip (wraps); no-op if <2 clips
     void togglePaused();
     bool isPaused() const { return paused_; }
+    bool hasAnimations() const { return !animations_.empty(); }
     // Fills the active clip's status for the HUD; false when the model has no
     // clips. name = clip name, or "Clip <i>" when the glTF clip is unnamed.
     bool getPlaybackInfo(std::string& name, int& index, int& count,
