@@ -134,9 +134,10 @@ struct InputState {
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
 // Initial virtual-display height as a multiple of the model's height: the
-// display-centric rig frames the (centered) model with 1.2× its height, i.e.
-// ~10% headroom top and bottom.
-static constexpr float kAutoFitVerticalComfort = 1.2f;
+// display-centric rig frames the (centered) model with 1.4× its height, i.e.
+// ~20% headroom top and bottom — enough that the window title bar doesn't
+// clip the subject.
+static constexpr float kAutoFitVerticalComfort = 1.4f;
 
 // Cached auto-fit result for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
