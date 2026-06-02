@@ -43,8 +43,19 @@ struct ModelRenderer {
 
     // Advance the active animation clip by dtSeconds and refresh per-primitive
     // model matrices. No-op (static fast-path) when the model has no animation.
-    // Call once per frame, before renderEye.
+    // Call once per frame, before renderEye. Frozen while paused (the pose is
+    // still recomputed, so a clip switch / pause shows the correct frame).
     void updateAnimation(float dtSeconds);
+
+    // ── Playback control (Phase 4). All no-op without animations. ────────────
+    void setActiveAnimation(int index);   // clamps/wraps; resets time + bind pose
+    void cycleAnimation();                 // → next clip (wraps); no-op if <2 clips
+    void togglePaused();
+    bool isPaused() const { return paused_; }
+    // Fills the active clip's status for the HUD; false when the model has no
+    // clips. name = clip name, or "Clip <i>" when the glTF clip is unnamed.
+    bool getPlaybackInfo(std::string& name, int& index, int& count,
+                         float& time, float& duration, bool& playing) const;
 
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
     bool getRobustSceneBounds(float loPct, float hiPct,
@@ -207,6 +218,8 @@ private:
     std::vector<float>      nodeWorld_;   // scratch: 16 floats/node, per-frame walk
     int   activeAnim_ = -1;              // -1 = none/static (fast-path guard)
     float animTime_   = 0.0f;            // playhead within the active clip (seconds)
+    bool  paused_     = false;           // freeze the playhead (Phase 4 play/pause)
+    std::vector<ModelNode> bindNodes_;   // bind-pose TRS snapshot; restored on clip switch
 
     // Display-rig bind: smoothed mean joint position (world space). Valid only
     // while a skinned model is animating; snaps on the first frame then eases.

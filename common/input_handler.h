@@ -117,6 +117,11 @@ struct InputState {
     bool animationActive = false;          // derived: (animateEnabled && idle>10s)
     bool animateToggleRequested = false;   // set by 'M' key or UI button
 
+    // glTF clip playback (Phase 4): one-shot, set by 'N' / 'K', cleared by the
+    // render loop after it drives ModelRenderer::cycleAnimation()/togglePaused().
+    bool cycleClipRequested = false;       // 'N' → next animation clip
+    bool playPauseRequested = false;       // 'K' → toggle play/pause
+
     // File-open / drag-drop queue (app-populated, app-consumed).
     std::string pendingLoadPath;
     bool loadRequested = false;            // app queues; caller shows dialog

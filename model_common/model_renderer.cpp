@@ -830,9 +830,11 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     animations_ = std::move(md.animations);
     rootNodes_ = std::move(md.rootNodes);
     morphs_ = std::move(md.morphs);
+    bindNodes_ = nodes_;                  // bind-pose snapshot for clean clip switches
     nodeWorld_.assign(nodes_.size() * 16, 0.0f);
     activeAnim_ = animations_.empty() ? -1 : 0;
     animTime_ = 0.0f;
+    paused_ = false;
 
     // ── Skinning: joint-matrix SSBO (set = 3) ────────────────────────────────
     // Sized to all skins' joints concatenated; ≥1 matrix so static models still
@@ -1109,11 +1111,14 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
     if (activeAnim_ < 0 || activeAnim_ >= (int)animations_.size()) return;
     const Animation& anim = animations_[activeAnim_];
 
-    // Advance + loop the playhead within the clip duration.
-    animTime_ += dtSeconds;
-    if (anim.duration > 0.0f) {
-        animTime_ = std::fmod(animTime_, anim.duration);
-        if (animTime_ < 0.0f) animTime_ += anim.duration;
+    // Advance + loop the playhead within the clip duration (frozen when paused;
+    // the pose below is still recomputed so the held frame stays correct).
+    if (!paused_) {
+        animTime_ += dtSeconds;
+        if (anim.duration > 0.0f) {
+            animTime_ = std::fmod(animTime_, anim.duration);
+            if (animTime_ < 0.0f) animTime_ += anim.duration;
+        }
     }
 
     // 1) Sample each channel → write the ABSOLUTE TRS value into its target
@@ -1225,6 +1230,39 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
 bool ModelRenderer::getAnimatedAnchor(float out[3]) const {
     if (!modelLoaded_ || !animAnchorValid_) return false;
     out[0] = animAnchor_[0]; out[1] = animAnchor_[1]; out[2] = animAnchor_[2];
+    return true;
+}
+
+void ModelRenderer::setActiveAnimation(int index) {
+    const int n = (int)animations_.size();
+    if (n == 0) return;
+    activeAnim_ = ((index % n) + n) % n;   // wrap
+    animTime_ = 0.0f;
+    // Channels mutate nodes_ in place with absolute TRS; restore the bind pose
+    // so a node the new clip doesn't target can't keep the old clip's value.
+    if (bindNodes_.size() == nodes_.size()) nodes_ = bindNodes_;
+    animAnchorValid_ = false;              // re-snap the rig bind to the new clip
+}
+
+void ModelRenderer::cycleAnimation() {
+    if (animations_.size() < 2) return;
+    setActiveAnimation(activeAnim_ + 1);
+}
+
+void ModelRenderer::togglePaused() {
+    if (!animations_.empty()) paused_ = !paused_;
+}
+
+bool ModelRenderer::getPlaybackInfo(std::string& name, int& index, int& count,
+                                    float& time, float& duration, bool& playing) const {
+    count = (int)animations_.size();
+    if (count == 0 || activeAnim_ < 0 || activeAnim_ >= count) return false;
+    const Animation& a = animations_[activeAnim_];
+    index = activeAnim_;
+    name = a.name.empty() ? ("Clip " + std::to_string(activeAnim_)) : a.name;
+    time = animTime_;
+    duration = a.duration;
+    playing = !paused_;
     return true;
 }
 
@@ -1577,6 +1615,8 @@ void ModelRenderer::cleanupModel() {
     nodeWorld_.clear();
     activeAnim_ = -1;
     animTime_ = 0.0f;
+    paused_ = false;
+    bindNodes_.clear();
     animAnchorValid_ = false;
     hasBBox_ = false;
     numPrimitives_ = 0;

@@ -191,6 +191,12 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         case 'M':
             state.animateToggleRequested = true;
             break;
+        case 'N':   // next glTF animation clip
+            state.cycleClipRequested = true;
+            break;
+        case 'K':   // play/pause the active clip
+            state.playPauseRequested = true;
+            break;
         case VK_OEM_MINUS: {
             float v = state.viewParams.ipdFactor - 0.1f;
             if (v < 0.1f) v = 0.1f;

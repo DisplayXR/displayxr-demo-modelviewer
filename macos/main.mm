@@ -586,6 +586,12 @@ static void OpenLoadDialog() {
         case 'm': case 'M':
             g_input.animateToggleRequested = true;
             break;
+        case 'n': case 'N':   // next glTF animation clip
+            g_input.cycleClipRequested = true;
+            break;
+        case 'k': case 'K':   // play/pause the active clip
+            g_input.playPauseRequested = true;
+            break;
         case 'c': case 'C':
             g_input.cameraMode = !g_input.cameraMode;
             break;
@@ -1614,6 +1620,10 @@ int main() {
         }
 
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
+        // Clip playback (N=next, K=play/pause), applied before the per-frame
+        // advance so this frame reflects it.
+        if (g_input.cycleClipRequested) { g_input.cycleClipRequested = false; g_modelRenderer.cycleAnimation(); }
+        if (g_input.playPauseRequested) { g_input.playPauseRequested = false; g_modelRenderer.togglePaused(); }
         // Advance node/TRS animation once per frame (no-op for static models).
         g_modelRenderer.updateAnimation(deltaTime);
 
@@ -2013,9 +2023,18 @@ int main() {
             @autoreleasepool {
                 if (g_input.hudVisible && g_hudView != nil) {
                     double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
-                    NSString *sceneInfo = g_modelRenderer.hasModel()
-                        ? [NSString stringWithFormat:@"Model: %s", g_loadedFileName.c_str()]
-                        : @"No model loaded (press L)";
+                    NSString *sceneInfo;
+                    if (g_modelRenderer.hasModel()) {
+                        NSMutableString *s = [NSMutableString stringWithFormat:@"Model: %s", g_loadedFileName.c_str()];
+                        std::string clip; int ci, cn; float ct, cd; bool playing;
+                        if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing)) {
+                            [s appendFormat:@"\nClip: %s [%d/%d]  %.1f/%.1fs  %s",
+                                clip.c_str(), ci + 1, cn, ct, cd, playing ? "playing" : "paused"];
+                        }
+                        sceneInfo = s;
+                    } else {
+                        sceneInfo = @"No model loaded (press L)";
+                    }
 
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
                     const char *orbitLabel = g_input.animateEnabled
@@ -2039,7 +2058,7 @@ int main() {
                         "%@"
                         "Vdisplay: (%.2f, %.2f, %.2f)\n"
                         "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
-                        "DblClick=Focus  -/= Depth  Space=Reset\n"
+                        "DblClick=Focus  -/= Depth  Space=Reset  N=Clip  K=Play/Pause\n"
                         "M=Auto-Orbit  V=Mode  L=Load  Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",

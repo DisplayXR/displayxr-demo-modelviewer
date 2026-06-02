@@ -630,6 +630,8 @@ static void RenderThreadFunc(
         bool animateToggle = false;
         bool loadReq = false;
         bool cycleModeRequested = false;
+        bool cycleClip = false;
+        bool playPause = false;
         int32_t absoluteModeRequest = -1;
         uint32_t windowW, windowH;
         {
@@ -666,6 +668,10 @@ static void RenderThreadFunc(
             }
             g_inputState.animateToggleRequested = false;
             g_inputState.loadRequested = false;
+            cycleClip = g_inputState.cycleClipRequested;
+            g_inputState.cycleClipRequested = false;
+            playPause = g_inputState.playPauseRequested;
+            g_inputState.playPauseRequested = false;
             if (animateToggle) {
                 g_inputState.animateEnabled = !g_inputState.animateEnabled;
                 inputSnapshot.animateEnabled = g_inputState.animateEnabled;
@@ -733,6 +739,10 @@ static void RenderThreadFunc(
 
         UpdatePerformanceStats(perfStats);
         UpdateCameraMovement(inputSnapshot, perfStats.deltaTime, xr->displayHeightM);
+        // Clip playback (N=next, K=play/pause). Render-thread only, like the
+        // updateAnimation call below; apply before it so this frame reflects it.
+        if (cycleClip) g_modelRenderer.cycleAnimation();
+        if (playPause) g_modelRenderer.togglePaused();
         // Advance node/TRS animation once per frame (no-op for static models).
         g_modelRenderer.updateAnimation(perfStats.deltaTime);
 
@@ -1274,6 +1284,16 @@ static void RenderThreadFunc(
                                     if (g_modelRenderer.hasModel()) {
                                         std::wstring fname(g_loadedFileName.begin(), g_loadedFileName.end());
                                         sceneText += L"\nLoaded: " + fname;
+                                        // Clip playback status (Phase 4) — same HUD layer.
+                                        std::string clip; int ci, cn; float ct, cd; bool playing;
+                                        if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing)) {
+                                            wchar_t cbuf[160];
+                                            swprintf(cbuf, 160,
+                                                L"\nClip: %hs [%d/%d]  %.1f/%.1fs  %s",
+                                                clip.c_str(), ci + 1, cn, ct, cd,
+                                                playing ? L"playing" : L"paused");
+                                            sceneText += cbuf;
+                                        }
                                     } else {
                                         sceneText += L"\nNo scene loaded (press L or click Load)";
                                     }
@@ -1333,7 +1353,7 @@ static void RenderThreadFunc(
                                     stereoText += vhBuf;
                                 }
                                 std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
-                                    L"[DblClick] Focus | [-/=] Depth | [Space] Reset\n"
+                                    L"[DblClick] Focus | [-/=] Depth | [Space] Reset | [N] Clip | [K] Play/Pause\n"
                                     L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
 
                                 // Top-bar buttons. Translate window-fraction click
