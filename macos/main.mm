@@ -113,6 +113,11 @@ struct InputState {
     bool animationActive = false;
     bool animateToggleRequested = false;     // set by UI button
 
+    // glTF clip playback (Phase 4): one-shot, set by 'N' / 'K', cleared by the
+    // render loop after it drives ModelRenderer::cycleAnimation()/togglePaused().
+    bool cycleClipRequested = false;         // 'N' → next animation clip
+    bool playPauseRequested = false;         // 'K' → toggle play/pause
+
     // Drag-and-drop / pending file load
     std::string pendingLoadPath;
 
