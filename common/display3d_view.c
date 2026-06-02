@@ -205,15 +205,21 @@ display3d_compute_projection(XrVector3f eye_pos,
 	float w = right - left;
 	float h = top - bottom;
 
-	// Column-major asymmetric frustum projection matrix
+	// Column-major asymmetric frustum projection matrix.
+	// Depth maps to the VULKAN clip range z_ndc in [0,1] (near->0, far->1), NOT
+	// the GL [-1,1] range: the renderer feeds this straight to gl_Position with
+	// no depth remap, and Vulkan clips z_ndc < 0. A GL-style matrix would clip
+	// the front half of the frustum (everything nearer than the harmonic mean of
+	// near/far) — invisible once far is pushed far back (e.g. far = ez + 1000*vH
+	// in opaque mode). The [0,1] form keeps the whole [near,far] band usable.
 	memset(out_matrix, 0, 16 * sizeof(float));
 	out_matrix[0] = 2.0f * near_z / w;
 	out_matrix[5] = 2.0f * near_z / h;
 	out_matrix[8] = (right + left) / w;
 	out_matrix[9] = (top + bottom) / h;
-	out_matrix[10] = -(far_z + near_z) / (far_z - near_z);
+	out_matrix[10] = -far_z / (far_z - near_z);
 	out_matrix[11] = -1.0f;
-	out_matrix[14] = -(2.0f * far_z * near_z) / (far_z - near_z);
+	out_matrix[14] = -(far_z * near_z) / (far_z - near_z);
 }
 
 void
@@ -263,8 +269,8 @@ display3d_compute_view(const XrVector3f *processed_eye,
                        const Display3DScreen *screen,
                        const Display3DTunables *tunables,
                        const XrPosef *display_pose,
-                       float clip_front,
-                       float clip_back,
+                       float near_offset,
+                       float far_offset,
                        Display3DView *out)
 {
 	Display3DTunables t = tunables ? *tunables : display3d_default_tunables();
@@ -297,19 +303,24 @@ display3d_compute_view(const XrVector3f *processed_eye,
 	eye_world.z += disp_pos.z;
 	out->eye_world = eye_world;
 
-	// ZDP-relative clip planes: a fixed fraction of this eye's perpendicular
-	// distance to the display/convergence plane (ZDP), in front of / behind it.
-	// eye_scaled.z is that per-eye distance (== out->eye_display.z), so the
-	// planes are automatically per-eye and scale with the virtual display
-	// (zoom). clip_back = 0 => far sits at the ZDP (foreground-only, e.g.
-	// transparent mode). See proposal in the demo's clip-plane discussion.
-	float ez_clip = eye_scaled.z;
-	if (ez_clip <= 0.001f)
-		ez_clip = 0.65f;
-	float near_z = ez_clip * (1.0f - clip_front);
-	float far_z = ez_clip * (1.0f + clip_back);
+	// ZDP-relative clip planes: near/far placed at fixed *absolute* offsets in
+	// front of / behind this eye's perpendicular distance to the display/
+	// convergence plane (ZDP). eye_scaled.z is that per-eye distance (==
+	// out->eye_display.z) in the same kooima-scaled units as the offsets, so
+	// the planes are per-eye and the offsets are expressed in virtual-display-
+	// height (vH) units by the caller. near = ez - near_offset, far = ez +
+	// far_offset. far_offset = 0 => far sits at the ZDP (foreground-only, e.g.
+	// transparent mode). Offsets are absolute (vH multiples), NOT fractions of
+	// ez — large scenes no longer scale the band with ez.
+	float ez = eye_scaled.z;
+	float near_z = ez - near_offset;
+	float far_z = ez + far_offset;
 	if (near_z < 1.0e-4f)
 		near_z = 1.0e-4f;
+	// Guarantee a valid frustum (far strictly past near) even when ez is tiny
+	// and far_offset is 0 (transparent mode at near-degenerate eye distance).
+	if (far_z < near_z + 1.0e-4f)
+		far_z = near_z + 1.0e-4f;
 
 	// Build view matrix + projection + FOV
 	build_view_matrix(out->view_matrix, disp_ori, eye_world);
@@ -495,8 +506,8 @@ display3d_compute_views(const XrVector3f *raw_eyes,
                                const Display3DScreen *screen,
                                const Display3DTunables *tunables,
                                const XrPosef *display_pose,
-                               float clip_front,
-                               float clip_back,
+                               float near_offset,
+                               float far_offset,
                                Display3DView *out_views)
 {
 	Display3DTunables t = tunables ? *tunables : display3d_default_tunables();
@@ -511,7 +522,7 @@ display3d_compute_views(const XrVector3f *raw_eyes,
 	// Compute each view via single-eye primitive
 	for (uint32_t i = 0; i < count; i++) {
 		display3d_compute_view(&processed[i], screen, &t,
-		                       display_pose, clip_front, clip_back,
+		                       display_pose, near_offset, far_offset,
 		                       &out_views[i]);
 	}
 

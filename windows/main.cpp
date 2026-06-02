@@ -57,51 +57,44 @@ static const float HUD_WIDTH_FRACTION = 0.30f;
 static const float HUD_HEIGHT_FRACTION = 1.0f;
 static const float HUD_FONT_BASE_FRACTION = 0.50f;
 
-// Top-bar buttons live inside the HUD overlay's window-space footprint
-// (left strip of the window, fracW × fracH = HUD_WIDTH_FRACTION × HUD_HEIGHT_FRACTION).
-// All values are absolute window-fractions for hit-testing; they're
-// translated into HUD-pixel coordinates when passed to RenderHudAndMap.
-// Button positions in HWND fractions. Now that the runtime no longer
-// applies a forwarding-rect inset (see displayxr-runtime fix), buttons
-// can sit close to the edge without clicks being eaten.
+// ── Top button bar ────────────────────────────────────────────────────────
+// All chrome buttons live in ONE full-width window-space layer at the top:
+// Open + Mode packed at the left, the Animation pill pinned to the right, and a
+// transparent center so the model shows through. This replaces the old split
+// (Open/Mode baked into the HUD layer + Animation on its own separate layer) —
+// per runtime issue #389: group co-planar controls into a single layer and keep
+// the HUD info panel as its own (toggleable) layer. Positions below are absolute
+// window-fractions, used both for hit-testing and for placing the pills inside
+// the bar texture (the bar layer spans the full window width, so window-x maps
+// straight onto bar-texture-x).
 static const float OPEN_BTN_X_FRACTION = 0.010f;
-static const float OPEN_BTN_Y_FRACTION = 0.010f;
 static const float OPEN_BTN_WIDTH_FRACTION  = 0.060f;
-static const float OPEN_BTN_HEIGHT_FRACTION = 0.030f;
 
 static const float MODE_BTN_X_FRACTION = 0.075f;
-static const float MODE_BTN_Y_FRACTION = 0.010f;
 static const float MODE_BTN_WIDTH_FRACTION  = 0.140f;
-static const float MODE_BTN_HEIGHT_FRACTION = 0.030f;
 
-// Animation button — its OWN window-space composition layer (independent of the
-// aspect-locked, left-anchored HUD layer), so it pins to the true window right
-// edge with its own depth. Only shown/clickable when the model has clips. Label
-// = current clip name, or "Paused"; click = next clip (same as 'N'). The layer's
-// window-space x = 1 − width − margin; height is derived per-frame from the
-// window aspect + the button texture aspect so it isn't distorted.
-// Texture is a thin pill (~7.5:1) like a Mode button, so the aspect-preserved
-// layer height lands ~0.03 of the window (matching Open/Mode), not a fat block.
-static const uint32_t ANIM_BTN_TEX_W = 480;   // button swapchain size (px)
-static const uint32_t ANIM_BTN_TEX_H = 64;
-// Font base height for the button renderer — sized so the label fills the pill
-// like Open/Mode (smallFontSize = 15·base/470 ≈ 33px in a 64px-tall texture).
-static const uint32_t ANIM_BTN_FONT_BASE = ANIM_BTN_TEX_H * 16;
-static const float ANIM_BTN_WIDTH_FRACTION  = 0.140f;  // layer width (matches Mode)
+// Animation pill — right-aligned within the bar. Only drawn/clickable when the
+// model has clips. Label = current clip name, or "Paused"; click = next clip
+// (same as 'N').
+static const float ANIM_BTN_WIDTH_FRACTION  = 0.140f;
 static const float ANIM_BTN_MARGIN_FRACTION = 0.010f;
-static const float ANIM_BTN_Y_FRACTION      = 0.010f;  // matches Open/Mode top
-static const float ANIM_BTN_DISPARITY       = 0.0f;    // screen-plane depth (tunable)
-
-// Height fraction that keeps the button texture's pixel aspect undistorted when
-// the layer (ANIM_BTN_WIDTH_FRACTION wide) is mapped into a windowW×windowH window.
-static inline float AnimBtnHeightFraction(uint32_t windowW, uint32_t windowH) {
-    if (windowW == 0 || windowH == 0) return ANIM_BTN_WIDTH_FRACTION;
-    const float windowAR = (float)windowW / (float)windowH;
-    const float texAR = (float)ANIM_BTN_TEX_W / (float)ANIM_BTN_TEX_H;
-    return ANIM_BTN_WIDTH_FRACTION * windowAR / texAR;
-}
 static inline float AnimBtnXFraction() {
     return 1.0f - ANIM_BTN_WIDTH_FRACTION - ANIM_BTN_MARGIN_FRACTION;
+}
+
+// Bar swapchain texture (wide + thin) and its window-space layer geometry. The
+// layer spans the full window width; its height preserves the texture aspect so
+// the pills aren't distorted as the tile is resized. The pills fill ~70% of the
+// bar height, vertically centered.
+static const uint32_t BTN_BAR_TEX_W = 1920;
+static const uint32_t BTN_BAR_TEX_H = 56;
+static const uint32_t BTN_BAR_FONT_BASE = BTN_BAR_TEX_H * 14;
+static const float    BTN_BAR_Y_FRACTION = 0.008f;
+static inline float BtnBarHeightFraction(uint32_t windowW, uint32_t windowH) {
+    if (windowW == 0 || windowH == 0) return 0.05f;
+    const float windowAR = (float)windowW / (float)windowH;
+    const float texAR = (float)BTN_BAR_TEX_W / (float)BTN_BAR_TEX_H;
+    return windowAR / texAR;  // layer width fraction = 1.0
 }
 
 
@@ -276,26 +269,27 @@ static bool PointInFractionRect(int mouseX, int mouseY, int windowW, int windowH
     return (fx >= xf && fx <= xf + wf && fy >= yf && fy <= yf + hf);
 }
 
+// All three buttons share the top bar's vertical band [BTN_BAR_Y, +barHeight];
+// each owns its own x-column. Keeps hit-testing aligned with the rendered pills.
 static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH) {
     return PointInFractionRect(mouseX, mouseY, windowW, windowH,
-        OPEN_BTN_X_FRACTION, OPEN_BTN_Y_FRACTION,
-        OPEN_BTN_WIDTH_FRACTION, OPEN_BTN_HEIGHT_FRACTION);
+        OPEN_BTN_X_FRACTION, BTN_BAR_Y_FRACTION,
+        OPEN_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
 }
 
 static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH) {
     return PointInFractionRect(mouseX, mouseY, windowW, windowH,
-        MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
-        MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION);
+        MODE_BTN_X_FRACTION, BTN_BAR_Y_FRACTION,
+        MODE_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
 }
 
 static bool IsClickOnAnimButton(int mouseX, int mouseY, int windowW, int windowH) {
     // Only live when the model actually has clips (else the top-right corner
-    // stays a normal scene-rotate region). The button is its own window-space
-    // layer at the true right edge, so the rect is plain window fractions.
+    // stays a normal scene-rotate region).
     if (!g_hasAnimations.load()) return false;
     return PointInFractionRect(mouseX, mouseY, windowW, windowH,
-        AnimBtnXFraction(), ANIM_BTN_Y_FRACTION,
-        ANIM_BTN_WIDTH_FRACTION, AnimBtnHeightFraction(windowW, windowH));
+        AnimBtnXFraction(), BTN_BAR_Y_FRACTION,
+        ANIM_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
 }
 
 // Atlas capture helpers live in test_apps/common/atlas_capture* — see
@@ -1032,15 +1026,16 @@ static void RenderThreadFunc(
                             tunables.perspective_factor = inputSnapshot.viewParams.perspectiveFactor;
                             tunables.virtual_display_height = inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
 
-                            // ZDP-relative clip: near/far are placed a fixed fraction of
-                            // the per-eye eye->display distance in front of / behind the
-                            // convergence plane (ZDP). display3d_compute_view computes them
-                            // per-eye from eye.z, so they scale with the virtual display
-                            // (zoom) and clip relative to the ZDP regardless of model size.
-                            // Transparent mode clips at the ZDP (clip_back = 0), matching the
-                            // foreground-only behavior.
-                            const float clip_front = 0.5f;
-                            const float clip_back  = g_transparentBg.load() ? 0.0f : 2.0f;
+                            // ZDP-relative clip: near/far are placed at fixed *absolute*
+                            // offsets (in virtual-display-height units) in front of / behind
+                            // the per-eye eye->display distance to the convergence plane
+                            // (ZDP). display3d_compute_view anchors them per-eye from eye.z
+                            // (near = ez - near_offset, far = ez + far_offset), so they scale
+                            // with the virtual display (zoom). Transparent mode clips at the
+                            // ZDP (far_offset = 0); opaque keeps a large recede band.
+                            const float vH = tunables.virtual_display_height;
+                            const float near_offset = vH;
+                            const float far_offset  = g_transparentBg.load() ? 0.0f : 1000.0f * vH;
 
                             XrPosef displayPose;
                             XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(
@@ -1062,7 +1057,7 @@ static void RenderThreadFunc(
                             display3d_compute_views(
                                 rawEyes, (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &displayPose,
-                                clip_front, clip_back, stereoViews);
+                                near_offset, far_offset, stereoViews);
                         }
 
                         // Double-click focus: center-eye ray through mouse, pick splat,
@@ -1105,10 +1100,11 @@ static void RenderThreadFunc(
                             displayPoseLocal.orientation = {q.x, q.y, q.z, q.w};
                             displayPoseLocal.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
                             Display3DView centerView;
-                            const float pick_clip_front = 0.5f;
-                            const float pick_clip_back  = g_transparentBg.load() ? 0.0f : 2.0f;
+                            const float pick_vH = tunables2.virtual_display_height;
+                            const float pick_near_offset = pick_vH;
+                            const float pick_far_offset  = g_transparentBg.load() ? 0.0f : 1000.0f * pick_vH;
                             display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
-                                                   &displayPoseLocal, pick_clip_front, pick_clip_back, &centerView);
+                                                   &displayPoseLocal, pick_near_offset, pick_far_offset, &centerView);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
@@ -1327,11 +1323,15 @@ static void RenderThreadFunc(
                             rendered = false;
                         }
 
-                        // Render HUD to window-space layer swapchain. Submitted
-                        // every frame so the chrome buttons (Open / Mode) stay
-                        // visible — the TAB toggle only hides the body backdrop
-                        // and text via the `drawBody` flag below.
-                        if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages) {
+                        // Render the HUD info-panel window-space layer. Body-only
+                        // now (chrome buttons moved to the top-bar layer below).
+                        // The TAB toggle hides the body via the `drawBody` flag;
+                        // the layer footprint stays the aspect-locked left strip.
+                        // Only render/acquire the HUD swapchain when the panel is
+                        // visible — when hidden the layer is dropped entirely (true
+                        // toggle), so we must NOT acquire its image this frame.
+                        if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages &&
+                            inputSnapshot.hudVisible) {
                             uint32_t hudImageIndex;
                             if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
                                 std::wstring sessionText(xr->systemName, xr->systemName + strlen(xr->systemName));
@@ -1410,65 +1410,14 @@ static void RenderThreadFunc(
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset | [N] Clip | [K] Play/Pause\n"
                                     L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
 
-                                // Top-bar buttons. Translate window-fraction click
-                                // regions into HUD-pixel coords scaled by the
-                                // per-frame layer footprint (layerFracW/H, computed
-                                // below the HUD block).
-                                std::vector<HudButton> buttons;
-                                {
-                                    // Hover tracking: compare current cursor (in HWND
-                                    // pixel space, captured by WM_MOUSEMOVE into
-                                    // inputSnapshot.mouseX/Y) against the button's
-                                    // HWND-fraction rect. Hovered buttons get a
-                                    // visual highlight in the HUD renderer.
-                                    const float mx_frac = (g_windowWidth > 0)
-                                        ? (float)inputSnapshot.mouseX / (float)g_windowWidth : 0.0f;
-                                    const float my_frac = (g_windowHeight > 0)
-                                        ? (float)inputSnapshot.mouseY / (float)g_windowHeight : 0.0f;
-                                    // HWND-fraction → HUD-pixel mapping must divide by
-                                    // the current layer footprint (layerFracW/H), not the
-                                    // legacy constants, otherwise on-screen position
-                                    // drifts as the tile aspect changes.
-                                    auto toHudPx = [&](float xf, float yf, float wf, float hf, const std::wstring& label) {
-                                        HudButton b;
-                                        b.label = label;
-                                        b.x = (xf / layerFracW) * (float)hudWidth;
-                                        b.y = (yf / layerFracH) * (float)hudHeight;
-                                        b.width  = (wf / layerFracW) * (float)hudWidth;
-                                        b.height = (hf / layerFracH) * (float)hudHeight;
-                                        b.hovered = (mx_frac >= xf && mx_frac <= xf + wf &&
-                                                     my_frac >= yf && my_frac <= yf + hf);
-                                        return b;
-                                    };
-                                    buttons.push_back(toHudPx(
-                                        OPEN_BTN_X_FRACTION, OPEN_BTN_Y_FRACTION,
-                                        OPEN_BTN_WIDTH_FRACTION, OPEN_BTN_HEIGHT_FRACTION,
-                                        L"Open…"));
-                                    std::wstring modeLabel = L"Mode";
-                                    if (xr->renderingModeCount > 0 &&
-                                        xr->currentModeIndex < xr->renderingModeCount &&
-                                        xr->renderingModeNames[xr->currentModeIndex]) {
-                                        const char* nm = xr->renderingModeNames[xr->currentModeIndex];
-                                        modeLabel = L"Mode: " + std::wstring(nm, nm + strlen(nm));
-                                    }
-                                    // v13: surface workspace mode-lock so user
-                                    // knows clicking the Mode button is a no-op.
-                                    if (xr->renderingModeCount > 0 &&
-                                        xr->currentModeIndex < xr->renderingModeCount &&
-                                        !xr->renderingModeIsRequestable[xr->currentModeIndex]) {
-                                        modeLabel += L" [locked]";
-                                    }
-                                    buttons.push_back(toHudPx(
-                                        MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
-                                        MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION,
-                                        modeLabel));
-
-                                }
-
+                                // Chrome buttons no longer live here — they are a
+                                // separate full-width top-bar window-space layer
+                                // (see the button-bar block below). This layer is
+                                // the info panel only, toggled by Tab via drawBody.
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, stereoText, helpText, buttons,
-                                    /*drawBody=*/inputSnapshot.hudVisible,
+                                    cameraText, stereoText, helpText, {},
+                                    /*drawBody=*/true,
                                     /*bodyAtBottom=*/true);
                                 if (pixels) {
                                     const uint8_t* src = (const uint8_t*)pixels;
@@ -1543,27 +1492,76 @@ static void RenderThreadFunc(
                     }
                 }
 
-                // ── Animation button: render into its own swapchain + build its
-                //    independent window-space layer (true right edge, own depth). ──
-                XrCompositionLayerWindowSpaceEXT animLayer = {};
-                bool animLayerReady = false;
-                if (g_animBtnReady && xr->hasAnimBtnSwapchain && g_hasAnimations.load()) {
-                    std::wstring label;
-                    {
-                        std::string clip; int ci, cn; float ct, cd; bool playing;
-                        std::lock_guard<std::mutex> lk(g_sceneMutex);
-                        if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing))
-                            label = playing ? std::wstring(clip.begin(), clip.end()) : L"Paused";
+                // ── Top button bar: ONE full-width window-space layer holding all
+                //    chrome buttons — Open + Mode packed left, Animation pinned
+                //    right, transparent center. Always submitted (decoupled from
+                //    the Tab-toggled HUD panel); the Animation pill is only added
+                //    when the model has clips. Reuses the window-space-layer
+                //    machinery (own swapchain / text renderer / staging) widened
+                //    to a bar — see runtime issue #389. ──
+                XrCompositionLayerWindowSpaceEXT barLayer = {};
+                bool barLayerReady = false;
+                if (g_animBtnReady && xr->hasAnimBtnSwapchain) {
+                    const float mxf = (g_windowWidth > 0)
+                        ? (float)inputSnapshot.mouseX / (float)g_windowWidth : 0.0f;
+                    const float myf = (g_windowHeight > 0)
+                        ? (float)inputSnapshot.mouseY / (float)g_windowHeight : 0.0f;
+                    const float barY = BTN_BAR_Y_FRACTION;
+                    const float barH = BtnBarHeightFraction(windowW, windowH);
+                    // Bar layer spans the full window width, so a button at
+                    // window-x-fraction xf maps straight onto bar-texture-x. Pills
+                    // fill ~70% of the bar height, vertically centered.
+                    const float pillY = (float)BTN_BAR_TEX_H * 0.15f;
+                    const float pillH = (float)BTN_BAR_TEX_H * 0.70f;
+                    auto makeBtn = [&](float xf, float wf, const std::wstring& label) {
+                        HudButton b;
+                        b.label = label;
+                        b.x = xf * (float)BTN_BAR_TEX_W;
+                        b.y = pillY;
+                        b.width = wf * (float)BTN_BAR_TEX_W;
+                        b.height = pillH;
+                        b.hovered = (mxf >= xf && mxf <= xf + wf &&
+                                     myf >= barY && myf <= barY + barH);
+                        return b;
+                    };
+                    std::vector<HudButton> barButtons;
+                    barButtons.push_back(makeBtn(OPEN_BTN_X_FRACTION, OPEN_BTN_WIDTH_FRACTION, L"Open…"));
+                    std::wstring modeLabel = L"Mode";
+                    if (xr->renderingModeCount > 0 &&
+                        xr->currentModeIndex < xr->renderingModeCount &&
+                        xr->renderingModeNames[xr->currentModeIndex]) {
+                        const char* nm = xr->renderingModeNames[xr->currentModeIndex];
+                        modeLabel = L"Mode: " + std::wstring(nm, nm + strlen(nm));
                     }
+                    // Surface workspace mode-lock so the user knows clicking Mode
+                    // is a no-op in a locked workspace.
+                    if (xr->renderingModeCount > 0 &&
+                        xr->currentModeIndex < xr->renderingModeCount &&
+                        !xr->renderingModeIsRequestable[xr->currentModeIndex]) {
+                        modeLabel += L" [locked]";
+                    }
+                    barButtons.push_back(makeBtn(MODE_BTN_X_FRACTION, MODE_BTN_WIDTH_FRACTION, modeLabel));
+                    if (g_hasAnimations.load()) {
+                        std::wstring animLabel = L"Anim";
+                        {
+                            std::string clip; int ci, cn; float ct, cd; bool playing;
+                            std::lock_guard<std::mutex> lk(g_sceneMutex);
+                            if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing))
+                                animLabel = playing ? std::wstring(clip.begin(), clip.end()) : L"Paused";
+                        }
+                        barButtons.push_back(makeBtn(AnimBtnXFraction(), ANIM_BTN_WIDTH_FRACTION, animLabel));
+                    }
+
                     uint32_t pitch = 0;
-                    const void* px = label.empty() ? nullptr
-                        : RenderButtonStandalone(g_animBtnHud, &pitch, label, /*hovered=*/false);
+                    const void* px = RenderHudAndMap(g_animBtnHud, &pitch,
+                        L"", L"", L"", L"", L"", L"", L"", L"",
+                        barButtons, /*drawBody=*/false, /*bodyAtBottom=*/true);
                     uint32_t idx = 0;
                     if (px && AcquireWindowSpaceImage(xr->animBtnSwapchain, idx)) {
                         uint8_t* dst = (uint8_t*)g_animBtnStagingMapped;
-                        for (uint32_t row = 0; row < ANIM_BTN_TEX_H; ++row)
-                            memcpy(dst + row * ANIM_BTN_TEX_W * 4,
-                                   (const uint8_t*)px + row * pitch, ANIM_BTN_TEX_W * 4);
+                        for (uint32_t row = 0; row < BTN_BAR_TEX_H; ++row)
+                            memcpy(dst + row * BTN_BAR_TEX_W * 4,
+                                   (const uint8_t*)px + row * pitch, BTN_BAR_TEX_W * 4);
                         UnmapHud(g_animBtnHud);
 
                         VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1587,10 +1585,10 @@ static void RenderThreadFunc(
                         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
                         VkBufferImageCopy rg = {};
-                        rg.bufferRowLength = ANIM_BTN_TEX_W;
+                        rg.bufferRowLength = BTN_BAR_TEX_W;
                         rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                         rg.imageOffset = {0, 0, 0};
-                        rg.imageExtent = {ANIM_BTN_TEX_W, ANIM_BTN_TEX_H, 1};
+                        rg.imageExtent = {BTN_BAR_TEX_W, BTN_BAR_TEX_H, 1};
                         vkCmdCopyBufferToImage(cb, g_animBtnStaging, img,
                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
                         bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1607,18 +1605,18 @@ static void RenderThreadFunc(
                         vkFreeCommandBuffers(vkDevice, g_animBtnCmdPool, 1, &cb);
                         ReleaseWindowSpaceImage(xr->animBtnSwapchain);
 
-                        animLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
-                        animLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                        animLayer.subImage.swapchain = xr->animBtnSwapchain.swapchain;
-                        animLayer.subImage.imageRect.offset = {0, 0};
-                        animLayer.subImage.imageRect.extent = {(int32_t)ANIM_BTN_TEX_W, (int32_t)ANIM_BTN_TEX_H};
-                        animLayer.subImage.imageArrayIndex = 0;
-                        animLayer.x = AnimBtnXFraction();
-                        animLayer.y = ANIM_BTN_Y_FRACTION;
-                        animLayer.width = ANIM_BTN_WIDTH_FRACTION;
-                        animLayer.height = AnimBtnHeightFraction(windowW, windowH);
-                        animLayer.disparity = ANIM_BTN_DISPARITY;
-                        animLayerReady = true;
+                        barLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+                        barLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                        barLayer.subImage.swapchain = xr->animBtnSwapchain.swapchain;
+                        barLayer.subImage.imageRect.offset = {0, 0};
+                        barLayer.subImage.imageRect.extent = {(int32_t)BTN_BAR_TEX_W, (int32_t)BTN_BAR_TEX_H};
+                        barLayer.subImage.imageArrayIndex = 0;
+                        barLayer.x = 0.0f;
+                        barLayer.y = BTN_BAR_Y_FRACTION;
+                        barLayer.width = 1.0f;
+                        barLayer.height = barH;
+                        barLayer.disparity = 0.0f;
+                        barLayerReady = true;
                     } else if (px) {
                         UnmapHud(g_animBtnHud);
                     }
@@ -1628,15 +1626,16 @@ static void RenderThreadFunc(
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
-                if (rendered && hudSubmitted) {
-                    // HUD layer (aspect-locked left strip) + any independent UI
-                    // layers (the animation button, placed at the true right edge
-                    // with its own depth). Empty regions stay alpha=0.
+                if (rendered) {
+                    // Always go through the window-space-layers path so the top
+                    // button bar (an extra layer) shows. The HUD info-panel layer
+                    // is gated by `submitHud = hudSubmitted`: when the panel is
+                    // toggled off it was never rendered/acquired this frame, so we
+                    // drop it entirely (true toggle, not a transparent layer).
                     EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
-                        animLayerReady ? &animLayer : nullptr, animLayerReady ? 1u : 0u);
-                } else if (rendered) {
-                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
+                        barLayerReady ? &barLayer : nullptr, barLayerReady ? 1u : 0u,
+                        0, 0, -1, -1, /*submitHud=*/hudSubmitted);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
@@ -1944,13 +1943,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // ── Animation-button window-space layer resources ────────────────────────
-    // Own swapchain + text renderer + staging + cmd pool, so the button can be
-    // its own composition layer at the true window right edge (independent of
-    // the HUD). Only when window-space layers are available (hud swapchain ok).
+    // ── Top button-bar window-space layer resources ──────────────────────────
+    // Own swapchain + text renderer + staging + cmd pool for the full-width top
+    // button bar (Open + Mode + Animation in one layer). Reuses the
+    // xr.animBtnSwapchain / g_animBtn* slots (named before the buttons were
+    // unified into a bar). Only when window-space layers are available.
     if (hudOk && xr.hasHudSwapchain) {
-        if (InitializeHudRenderer(g_animBtnHud, ANIM_BTN_TEX_W, ANIM_BTN_TEX_H, ANIM_BTN_FONT_BASE) &&
-            CreateWindowSpaceSwapchain(xr, xr.animBtnSwapchain, ANIM_BTN_TEX_W, ANIM_BTN_TEX_H)) {
+        if (InitializeHudRenderer(g_animBtnHud, BTN_BAR_TEX_W, BTN_BAR_TEX_H, BTN_BAR_FONT_BASE) &&
+            CreateWindowSpaceSwapchain(xr, xr.animBtnSwapchain, BTN_BAR_TEX_W, BTN_BAR_TEX_H)) {
             xr.hasAnimBtnSwapchain = true;
             uint32_t c = xr.animBtnSwapchain.imageCount;
             g_animBtnSwapImages.resize(c, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
@@ -1958,7 +1958,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 (XrSwapchainImageBaseHeader*)g_animBtnSwapImages.data());
 
             VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            bi.size = (VkDeviceSize)ANIM_BTN_TEX_W * ANIM_BTN_TEX_H * 4;
+            bi.size = (VkDeviceSize)BTN_BAR_TEX_W * BTN_BAR_TEX_H * 4;
             bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             bool ok = vkCreateBuffer(vkDevice, &bi, nullptr, &g_animBtnStaging) == VK_SUCCESS;

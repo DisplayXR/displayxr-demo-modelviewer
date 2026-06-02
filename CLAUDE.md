@@ -51,12 +51,14 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   swapchain-size change. `renderEye` sets viewport/scissor to the per-eye tile
   and blits `[0,0..vp]` into the swapchain at `(vpX,vpY)`. Mirrors gs_renderer.
 - **ZDP-relative clip planes.** `display3d_compute_view/_views` take
-  `(clip_front, clip_back)` (NOT absolute near/far) and compute per-eye
-  `near = ez·(1−clip_front)`, `far = ez·(1+clip_back)` from each eye's
-  perpendicular distance to the convergence plane (`eye_scaled.z`). Defaults
-  `0.5 / 2.0`; **transparent mode passes `clip_back = 0`** (far at the ZDP →
-  foreground only). Scales with zoom; keeps depth precision tight. macOS has no
-  transparent mode → `clip_back = 2.0` there.
+  `(near_offset, far_offset)` — **absolute** offsets in virtual-display-height
+  (`vH`) units, NOT fractions — and compute per-eye `near = ez − near_offset`,
+  `far = ez + far_offset` from each eye's perpendicular distance to the
+  convergence plane (`eye_scaled.z`). Callers pass `near_offset = vH`,
+  `far_offset = 1000·vH`; **transparent mode passes `far_offset = 0`** (far at
+  the ZDP → foreground only). Anchored to `vH` so the band no longer scales with
+  `ez` (large scenes don't clip). macOS has no transparent mode → `far_offset =
+  1000·vH` there.
 - **IBL** is generated once at init from a procedural analytic sky (`sky.glsl`):
   BRDF LUT + irradiance cube + roughness-mipped prefiltered cube; split-sum in
   `pbr.frag`. The **skybox** samples the prefiltered cube at a high mip

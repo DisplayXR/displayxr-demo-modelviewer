@@ -1835,17 +1835,19 @@ int main() {
                             tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
                             // ZDP-relative clip planes (computed per-eye from eye.z inside
-                            // display3d_compute_view): near = ez*(1-clip_front), far =
-                            // ez*(1+clip_back). Scales with the virtual display (zoom) so
-                            // large models don't clip. macOS has no transparent-bg mode, so
-                            // clip_back stays 2.0 (no foreground-only ZDP clamp here).
-                            const float clip_front = 0.5f;
-                            const float clip_back  = 2.0f;
+                            // display3d_compute_view): near = ez - near_offset, far =
+                            // ez + far_offset, with the offsets given as ABSOLUTE distances
+                            // in virtual-display-height (vH) units. Scales with the virtual
+                            // display (zoom) so large models don't clip. macOS has no
+                            // transparent-bg mode, so far_offset keeps a large recede band.
+                            const float vH = tunables.virtual_display_height;
+                            const float near_offset = vH;
+                            const float far_offset  = 1000.0f * vH;
 
                             display3d_compute_views(
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                clip_front, clip_back, eyeViews.data());
+                                near_offset, far_offset, eyeViews.data());
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
@@ -1902,8 +1904,9 @@ int main() {
                             XrPosef cameraPoseWorld = cameraPose;
                             cameraPoseWorld.position.y = g_input.cameraPosY;
                             Display3DView centerView;
+                            const float pick_vH = tunables2.virtual_display_height;
                             display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
-                                                   &cameraPoseWorld, 0.5f, 2.0f, &centerView);
+                                                   &cameraPoseWorld, pick_vH, 1000.0f * pick_vH, &centerView);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,

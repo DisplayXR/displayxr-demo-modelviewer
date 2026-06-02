@@ -17,8 +17,9 @@ renderer works today, see `CLAUDE.md` → *Renderer conventions*.
   retargeted to `ModelRenderer` (`loadModel`/`hasModel`/`getRobustSceneBounds`,
   `.glb/.gltf` dialogs + drag-drop, `sample.glb` auto-load, 1.2× auto-fit).
 - **ZDP clip planes** — `display3d_compute_view/_views` take
-  `(clip_front, clip_back)`; per-eye near/far from `eye.z`. Defaults 0.5/2.0;
-  transparent → clip_back 0.
+  `(near_offset, far_offset)` as absolute `vH`-unit offsets; per-eye
+  `near = eye.z − near_offset`, `far = eye.z + far_offset`. Callers pass
+  `near_offset = vH`, `far_offset = 1000·vH`; transparent → far_offset 0.
 - **Bundled `sample.glb`** = Khronos DamagedHelmet, copied next to the exe.
 - **Installer + sidecar** — Windows NSIS + macOS `.pkg`; per-app icon names
   (`model_viewer_icon{,_sbs}.png`). Wired into the meta-installer bundle.
