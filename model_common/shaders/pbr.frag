@@ -102,7 +102,14 @@ void main() {
 
     vec3 V = normalize(ubo.cameraPos.xyz - inWorldPos);
     vec3 Ng = normalize(inNormal);
-    if (dot(Ng, V) < 0.0) Ng = -Ng;            // two-sided
+    // Two-sided: flip the normal for genuinely back-facing triangles (cull is
+    // NONE) using the rasterizer's winding, NOT dot(N,V). The view test wrongly
+    // flips large flat *front* faces seen near edge-on, sending their normal to
+    // the dark lower hemisphere of the IBL irradiance cube (the dark-torso
+    // artifact on low-poly skinned meshes like Fox). gl_FrontFacing stays
+    // geometric under the renderer's Y-flipped projection, so flip only true
+    // back-faces — visible front faces keep their authored outward normal.
+    if (!gl_FrontFacing) Ng = -Ng;
     vec3 N = perturbNormal(Ng, inUV);
 
     vec3 L = normalize(ubo.lightDir.xyz);
