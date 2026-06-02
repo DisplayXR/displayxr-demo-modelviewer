@@ -71,6 +71,9 @@ struct ModelPrimitive {
                                    // matrix and the joint-matrix SSBO instead.
     int      jointBase = 0;        // offset of this skin's joints in the flat
                                    // joint-matrix array (ModelData::totalJoints).
+    uint32_t firstVertex = 0;      // base vertex index (a primitive's verts are
+    uint32_t vertexCount = 0;      // contiguous) — the range the morph blend writes.
+    int      morph = -1;           // index into ModelData::morphs, or -1 (no targets).
 };
 
 // ── Animation (Phase 1: node TRS only; no skinning/morph) ────────────────────
@@ -89,6 +92,9 @@ struct ModelNode {
     float scale[3]       = {1, 1, 1};
     bool  hasMatrix = false;       // node specified an explicit local matrix
     float matrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};  // used if hasMatrix
+    // Live morph weights (Phase 3). Size = the node's mesh's morph-target count;
+    // seeded from node/mesh defaults, overwritten per frame by a Weights channel.
+    std::vector<float> weights;
 };
 
 enum class AnimInterp { Linear, Step, CubicSpline };
@@ -125,6 +131,17 @@ struct ModelSkin {
                                      // identity per joint if the accessor is absent
 };
 
+// ── Morph targets (Phase 3) ──────────────────────────────────────────────────
+// Per-vertex position/normal deltas for each target of one primitive. The
+// renderer blends morphed = base + Σ weightᵢ·deltaᵢ on the CPU each frame.
+// Deltas are flat: target t, vertex v, component c → [(t*vertexCount + v)*3 + c].
+struct ModelMorph {
+    uint32_t targetCount = 0;
+    uint32_t vertexCount = 0;
+    std::vector<float> posDeltas;    // targetCount * vertexCount * 3
+    std::vector<float> nrmDeltas;    // same layout; empty when no NORMAL deltas
+};
+
 struct ModelData {
     std::vector<ModelVertex>    vertices;
     std::vector<uint32_t>       indices;
@@ -143,6 +160,10 @@ struct ModelData {
     // is its skin's offset into that flat array.
     std::vector<ModelSkin>      skins;
     uint32_t totalJoints = 0;                // sum of joint counts across skins
+
+    // Morph targets (Phase 3). Empty when the model has none. A primitive's
+    // ModelPrimitive::morph indexes into this; its owning node holds the weights.
+    std::vector<ModelMorph>     morphs;
 
     uint32_t primitiveCount = 0;
     // World-space AABB over all primitives (bind-pose node transforms applied).

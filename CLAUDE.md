@@ -96,6 +96,17 @@ and on **`v*` tags** (release: build + attach both installers to the GH Release 
 dispatch `versions-bump` to displayxr-runtime). So every PR is build-checked on
 both platforms — keep it that way.
 
+## Self-verifying a render (no 3D display needed)
+Pass a model path as the first CLI arg to skip auto-load:
+`model_viewer_handle_vk_win.exe <path.glb>`. Then press **`I`** to dump the
+multi-view atlas to `%USERPROFILE%\Pictures\DisplayXR\<model>-<cols>_<rows>x<n>.png`
+(skipped for 1×1 mono layouts) — readable to eyeball geometry/shading/framing
+without a glasses-free display. To drive it headlessly, launch the exe then
+`AppActivate` its window (title `DisplayXR 3D Model Viewer`) + SendKeys `i` via
+`WScript.Shell`, and read the newest PNG in that dir. Caveat: the capture is a
+single arbitrary frame — for animated models the timing is uncontrolled, so a
+"wrong" pose/face-on grab means bad luck, not a bug; recapture.
+
 ## Shell tile
 `windows/displayxr/` + `macos/displayxr/` carry the `.displayxr.json` sidecar +
 **per-app-named** icons `model_viewer_icon.png` (2D) + `model_viewer_icon_sbs.png`

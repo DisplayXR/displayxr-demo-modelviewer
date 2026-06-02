@@ -76,7 +76,12 @@ vec3 perturbNormal(vec3 N, vec2 uv) {
     vec3 dp2perp = cross(dp2, N), dp1perp = cross(N, dp1);
     vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
     vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-    float invmax = inversesqrt(max(dot(T, T), dot(B, B)));
+    // No usable UV gradient (mesh without TEXCOORD_0, e.g. AnimatedMorphCube) →
+    // T/B collapse to 0 and inversesqrt(0) would poison N with NaNs. Keep the
+    // geometric normal in that case (a flat normal map is identity here anyway).
+    float maxlen = max(dot(T, T), dot(B, B));
+    if (maxlen < 1e-12) return N;
+    float invmax = inversesqrt(maxlen);
     return normalize(mat3(T * invmax, B * invmax, N) * mapN);
 }
 

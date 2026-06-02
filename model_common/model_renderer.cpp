@@ -788,17 +788,30 @@ VkDescriptorSet ModelRenderer::makeMaterialSet(VkImageView baseColor, VkImageVie
 bool ModelRenderer::finalizeModel(ModelData& md) {
     cleanupModel();
 
-    vertexBuffer_ = modelCreateBuffer(device_, physDevice_,
-        md.vertices.size() * sizeof(ModelVertex),
+    // Morph models need a CPU-writable vertex buffer (re-blended each frame);
+    // everything else keeps the device-local staged upload.
+    hasMorph_ = !md.morphs.empty();
+    const VkDeviceSize vbSize = md.vertices.size() * sizeof(ModelVertex);
+    vertexBuffer_ = modelCreateBuffer(device_, physDevice_, vbSize,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        hasMorph_ ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     indexBuffer_ = modelCreateBuffer(device_, physDevice_,
         md.indices.size() * sizeof(uint32_t),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (vertexBuffer_.buffer == VK_NULL_HANDLE || indexBuffer_.buffer == VK_NULL_HANDLE) return false;
-    modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, vertexBuffer_,
-                      md.vertices.data(), vertexBuffer_.size);
+    if (hasMorph_) {
+        // Keep the base verts for re-blending; seed the buffer with them.
+        morphBase_ = md.vertices;
+        void* mapped = nullptr;
+        vkMapMemory(device_, vertexBuffer_.memory, 0, vbSize, 0, &mapped);
+        std::memcpy(mapped, md.vertices.data(), (size_t)vbSize);
+        vkUnmapMemory(device_, vertexBuffer_.memory);
+    } else {
+        modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, vertexBuffer_,
+                          md.vertices.data(), vertexBuffer_.size);
+    }
     modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, indexBuffer_,
                       md.indices.data(), indexBuffer_.size);
 
@@ -816,6 +829,7 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     nodes_ = std::move(md.nodes);
     animations_ = std::move(md.animations);
     rootNodes_ = std::move(md.rootNodes);
+    morphs_ = std::move(md.morphs);
     nodeWorld_.assign(nodes_.size() * 16, 0.0f);
     activeAnim_ = animations_.empty() ? -1 : 0;
     animTime_ = 0.0f;
@@ -870,6 +884,10 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     // bounds (correct height/center for the auto-fit). Needs primitives_/nodes_/
     // animations_/skins_ (set above) plus the still-intact CPU verts + indices.
     recomputeAnimatedBounds(md.vertices, md.indices);
+
+    // Apply the rest-pose morph once so a model with nonzero default weights and
+    // no clip still shows its morphed shape (animated models re-blend per frame).
+    blendMorphs();
 
     // Per-material descriptor sets (set = 1) + a default for material == -1.
     const uint32_t nSets = (uint32_t)materials_.size() + 1;
@@ -1113,7 +1131,10 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
                 node.rotation[2] = q.z; node.rotation[3] = q.w;
                 break;
             }
-            case AnimPath::Weights: break;   // morph targets → Phase 3
+            case AnimPath::Weights:
+                if (!node.weights.empty())
+                    sampleVec(s, (int)node.weights.size(), animTime_, node.weights.data());
+                break;
         }
     }
 
@@ -1138,6 +1159,12 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
         if (p.node >= 0 && p.node < (int)nodes_.size())
             std::memcpy(p.modelMatrix, &nodeWorld_[p.node * 16], 16 * sizeof(float));
     }
+
+    // Display-rig bind anchor: world centroid of the moving subject, tracked so
+    // the convergence plane stays on it. Skeleton mean for skinned models;
+    // morphed-vertex mean (computed in blendMorphs below) otherwise.
+    glm::vec3 anchorRaw(0.0f);
+    bool anchorValid = false;
 
     // 4) Recompute joint matrices from the freshly walked hierarchy and push
     //    them to the SSBO. jointMatrix[i] = nodeWorld[joint_i] * inverseBind[i]
@@ -1166,20 +1193,31 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
         }
         vkUnmapMemory(device_, jointBuffer_.memory);
 
-        // Display-rig bind anchor: smoothed mean joint position. Snap on the
-        // first frame, then ease with a ~0.15 s time constant so a pose pop
-        // doesn't jerk the frame. Tracks all 3 axes (subject pinned + centered).
-        if (jointTotal > 0) {
-            const glm::vec3 raw = glm::vec3(centroid / (double)jointTotal);
-            if (!animAnchorValid_) {
-                animAnchor_[0] = raw.x; animAnchor_[1] = raw.y; animAnchor_[2] = raw.z;
-                animAnchorValid_ = true;
-            } else {
-                const float a = 1.0f - std::exp(-dtSeconds / 0.15f);
-                animAnchor_[0] += (raw.x - animAnchor_[0]) * a;
-                animAnchor_[1] += (raw.y - animAnchor_[1]) * a;
-                animAnchor_[2] += (raw.z - animAnchor_[2]) * a;
-            }
+        if (jointTotal > 0) { anchorRaw = glm::vec3(centroid / (double)jointTotal); anchorValid = true; }
+    }
+
+    // 5) Re-blend morph targets into the (host-visible) vertex buffer. Runs
+    //    after the node walk so the Weights channels above are applied; morphed
+    //    verts are then skinned by the GPU (morph→skin, the glTF-correct order).
+    //    trackAnchor → it also computes the morphed-vertex world centroid.
+    blendMorphs(true);
+    if (!anchorValid && morphCentroidValid_) {
+        anchorRaw = glm::vec3(morphCentroid_[0], morphCentroid_[1], morphCentroid_[2]);
+        anchorValid = true;
+    }
+
+    // Smooth the chosen anchor into animAnchor_: snap on the first frame, then
+    // ease with a ~0.15 s time constant so a pose/shape pop doesn't jerk the
+    // frame. Tracks all 3 axes (subject stays pinned + centered at the ZDP).
+    if (anchorValid) {
+        if (!animAnchorValid_) {
+            animAnchor_[0] = anchorRaw.x; animAnchor_[1] = anchorRaw.y; animAnchor_[2] = anchorRaw.z;
+            animAnchorValid_ = true;
+        } else {
+            const float a = 1.0f - std::exp(-dtSeconds / 0.15f);
+            animAnchor_[0] += (anchorRaw.x - animAnchor_[0]) * a;
+            animAnchor_[1] += (anchorRaw.y - animAnchor_[1]) * a;
+            animAnchor_[2] += (anchorRaw.z - animAnchor_[2]) * a;
         }
     }
 }
@@ -1188,6 +1226,58 @@ bool ModelRenderer::getAnimatedAnchor(float out[3]) const {
     if (!modelLoaded_ || !animAnchorValid_) return false;
     out[0] = animAnchor_[0]; out[1] = animAnchor_[1]; out[2] = animAnchor_[2];
     return true;
+}
+
+void ModelRenderer::blendMorphs(bool trackAnchor) {
+    if (!hasMorph_ || vertexBuffer_.buffer == VK_NULL_HANDLE) return;
+    void* mapped = nullptr;
+    vkMapMemory(device_, vertexBuffer_.memory, 0, vertexBuffer_.size, 0, &mapped);
+    ModelVertex* dst = static_cast<ModelVertex*>(mapped);
+    glm::dvec3 sum(0.0);   // morphed-vertex world centroid for the rig bind
+    uint64_t   cnt = 0;
+    for (const ModelPrimitive& p : primitives_) {
+        if (p.morph < 0 || p.morph >= (int)morphs_.size()) continue;
+        const ModelMorph& mm = morphs_[p.morph];
+        const std::vector<float>* w = (p.node >= 0 && p.node < (int)nodes_.size())
+            ? &nodes_[p.node].weights : nullptr;
+        // World transform of the owning node (nodeWorld_ is fresh from the walk
+        // when trackAnchor; identity otherwise / at finalize).
+        const glm::mat4 nodeW = (trackAnchor && p.node >= 0 && p.node < (int)nodes_.size())
+            ? glm::make_mat4(&nodeWorld_[p.node * 16]) : glm::mat4(1.0f);
+        for (uint32_t v = 0; v < p.vertexCount; ++v) {
+            const uint32_t vi = p.firstVertex + v;
+            ModelVertex out = morphBase_[vi];   // base pos/normal + static uv/joints/weights
+            if (w) {
+                for (uint32_t t = 0; t < mm.targetCount && t < w->size(); ++t) {
+                    const float wt = (*w)[t];
+                    if (wt == 0.0f) continue;
+                    const size_t off = ((size_t)t * mm.vertexCount + v) * 3;
+                    out.pos[0] += wt * mm.posDeltas[off + 0];
+                    out.pos[1] += wt * mm.posDeltas[off + 1];
+                    out.pos[2] += wt * mm.posDeltas[off + 2];
+                    if (!mm.nrmDeltas.empty()) {
+                        out.normal[0] += wt * mm.nrmDeltas[off + 0];
+                        out.normal[1] += wt * mm.nrmDeltas[off + 1];
+                        out.normal[2] += wt * mm.nrmDeltas[off + 2];
+                    }
+                }
+            }
+            dst[vi] = out;
+            if (trackAnchor) {
+                sum += glm::dvec3(nodeW * glm::vec4(out.pos[0], out.pos[1], out.pos[2], 1.0f));
+                ++cnt;
+            }
+        }
+    }
+    vkUnmapMemory(device_, vertexBuffer_.memory);
+
+    if (trackAnchor) {
+        morphCentroidValid_ = cnt > 0;
+        if (cnt > 0) {
+            const glm::dvec3 c = sum / (double)cnt;
+            morphCentroid_[0] = (float)c.x; morphCentroid_[1] = (float)c.y; morphCentroid_[2] = (float)c.z;
+        }
+    }
 }
 
 void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& verts,
@@ -1222,7 +1312,10 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
                     glm::quat q = sampleQuat(s, t);
                     node.rotation[0]=q.x; node.rotation[1]=q.y; node.rotation[2]=q.z; node.rotation[3]=q.w;
                 } break;
-                case AnimPath::Weights: break;
+                case AnimPath::Weights:
+                    if (!node.weights.empty())
+                        sampleVec(s, (int)node.weights.size(), t, node.weights.data());
+                    break;
             }
         }
         // Walk hierarchy → world matrices (parent before child).
@@ -1251,11 +1344,28 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
             }
             base += (uint32_t)sk.joints.size();
         }
-        // Transform each primitive's verts (skinned or static) and union.
+        // Transform each primitive's verts (morphed, then skinned/static) and union.
         for (const ModelPrimitive& p : primitives_) {
+            const ModelMorph* mm = (p.morph >= 0 && p.morph < (int)morphs_.size())
+                ? &morphs_[p.morph] : nullptr;
+            const std::vector<float>* mw = (mm && p.node >= 0 && p.node < (int)nd.size())
+                ? &nd[p.node].weights : nullptr;
             for (uint32_t ii = 0; ii < p.indexCount; ii += step) {
-                const ModelVertex& v = verts[indices[p.firstIndex + ii]];
-                const glm::vec4 lp(v.pos[0], v.pos[1], v.pos[2], 1.0f);
+                const uint32_t gv = indices[p.firstIndex + ii];
+                const ModelVertex& v = verts[gv];
+                glm::vec3 lp3(v.pos[0], v.pos[1], v.pos[2]);
+                if (mm && mw) {
+                    const uint32_t lv = gv - p.firstVertex;   // vertex index within the prim
+                    for (uint32_t tt = 0; tt < mm->targetCount && tt < mw->size(); ++tt) {
+                        const float wt = (*mw)[tt];
+                        if (wt == 0.0f) continue;
+                        const size_t off = ((size_t)tt * mm->vertexCount + lv) * 3;
+                        lp3.x += wt * mm->posDeltas[off + 0];
+                        lp3.y += wt * mm->posDeltas[off + 1];
+                        lp3.z += wt * mm->posDeltas[off + 2];
+                    }
+                }
+                const glm::vec4 lp(lp3, 1.0f);
                 glm::vec4 wp;
                 if (p.skin >= 0) {
                     glm::mat4 m =
@@ -1455,6 +1565,10 @@ void ModelRenderer::cleanupModel() {
     jointSet_ = VK_NULL_HANDLE;
     skins_.clear();
     jointCount_ = 0;
+    morphs_.clear();
+    morphBase_.clear();
+    hasMorph_ = false;
+    morphCentroidValid_ = false;
     materials_.clear();
     primitives_.clear();
     nodes_.clear();

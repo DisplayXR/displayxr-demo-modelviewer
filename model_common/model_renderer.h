@@ -110,6 +110,10 @@ private:
     // wrong height/center for the fit. No-op when there's no active clip.
     void recomputeAnimatedBounds(const std::vector<ModelVertex>& verts,
                                  const std::vector<uint32_t>& indices);
+    // Re-blend morphed primitives (base + Σ weightᵢ·deltaᵢ) into the host-visible
+    // vertex buffer using each owning node's current weights. No-op without morph.
+    // trackAnchor → also accumulate the morphed verts' world centroid (rig bind).
+    void blendMorphs(bool trackAnchor = false);
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar);
     void cleanupModel();
 
@@ -181,6 +185,13 @@ private:
     ModelBuffer jointBuffer_;                            // host-visible mat4[] SSBO
     std::vector<ModelSkin> skins_;
     uint32_t jointCount_ = 0;                            // matrices in jointBuffer_
+
+    // ── Morph targets (Phase 3: CPU blend into a host-visible vertex buffer) ─
+    bool hasMorph_ = false;                  // → vertexBuffer_ is host-visible
+    std::vector<ModelMorph>  morphs_;
+    std::vector<ModelVertex> morphBase_;     // CPU base verts, re-blended per frame
+    float morphCentroid_[3] = {0, 0, 0};     // raw world centroid of morphed verts
+    bool  morphCentroidValid_ = false;       // (rig-bind fallback when no skeleton)
 
     // ── Loaded model GPU data ────────────────────────────────────────────
     ModelBuffer vertexBuffer_;
