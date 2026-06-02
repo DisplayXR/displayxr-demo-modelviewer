@@ -866,6 +866,11 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     hasBBox_ = md.hasBBox;
     numPrimitives_ = md.primitiveCount;
 
+    // For animated models, replace the bind-pose AABB with the swept animated
+    // bounds (correct height/center for the auto-fit). Needs primitives_/nodes_/
+    // animations_/skins_ (set above) plus the still-intact CPU verts + indices.
+    recomputeAnimatedBounds(md.vertices, md.indices);
+
     // Per-material descriptor sets (set = 1) + a default for material == -1.
     const uint32_t nSets = (uint32_t)materials_.size() + 1;
     VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * 5};
@@ -1144,6 +1149,8 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
         void* mapped = nullptr;
         vkMapMemory(device_, jointBuffer_.memory, 0, jointBuffer_.size, 0, &mapped);
         uint32_t base = 0;
+        glm::dvec3 centroid(0.0);   // accumulate joint world positions for the rig bind
+        uint32_t jointTotal = 0;
         for (const ModelSkin& s : skins_) {
             for (size_t j = 0; j < s.joints.size(); ++j) {
                 const int node = s.joints[j];
@@ -1152,10 +1159,124 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
                 const glm::mat4 jm = nw * glm::make_mat4(&s.inverseBind[j * 16]);
                 std::memcpy((char*)mapped + (base + j) * 16 * sizeof(float),
                             glm::value_ptr(jm), 16 * sizeof(float));
+                centroid += glm::dvec3(nw[3]);   // joint world translation
+                ++jointTotal;
             }
             base += (uint32_t)s.joints.size();
         }
         vkUnmapMemory(device_, jointBuffer_.memory);
+
+        // Display-rig bind anchor: smoothed mean joint position. Snap on the
+        // first frame, then ease with a ~0.15 s time constant so a pose pop
+        // doesn't jerk the frame. Tracks all 3 axes (subject pinned + centered).
+        if (jointTotal > 0) {
+            const glm::vec3 raw = glm::vec3(centroid / (double)jointTotal);
+            if (!animAnchorValid_) {
+                animAnchor_[0] = raw.x; animAnchor_[1] = raw.y; animAnchor_[2] = raw.z;
+                animAnchorValid_ = true;
+            } else {
+                const float a = 1.0f - std::exp(-dtSeconds / 0.15f);
+                animAnchor_[0] += (raw.x - animAnchor_[0]) * a;
+                animAnchor_[1] += (raw.y - animAnchor_[1]) * a;
+                animAnchor_[2] += (raw.z - animAnchor_[2]) * a;
+            }
+        }
+    }
+}
+
+bool ModelRenderer::getAnimatedAnchor(float out[3]) const {
+    if (!modelLoaded_ || !animAnchorValid_) return false;
+    out[0] = animAnchor_[0]; out[1] = animAnchor_[1]; out[2] = animAnchor_[2];
+    return true;
+}
+
+void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& verts,
+                                            const std::vector<uint32_t>& indices) {
+    if (activeAnim_ < 0 || activeAnim_ >= (int)animations_.size()) return;  // keep static box
+    if (verts.empty() || indices.empty() || nodes_.empty()) return;
+    const Animation& anim = animations_[activeAnim_];
+
+    // Sample the clip at N evenly-spaced times and union the skinned bounds.
+    // Subsample very dense meshes so load stays snappy (the box is robust to it).
+    const int N = 24;
+    const uint32_t step = indices.size() > 200000u
+        ? (uint32_t)(indices.size() / 200000u) + 1u : 1u;
+    std::vector<float> world(nodes_.size() * 16, 0.0f);
+    std::vector<float> jmats(std::max<uint32_t>(jointCount_, 1u) * 16, 0.0f);
+
+    bool has = false;
+    glm::vec3 mn(0.0f), mx(0.0f);
+    for (int si = 0; si < N; ++si) {
+        const float t = (anim.duration > 0.0f && N > 1)
+            ? anim.duration * (float)si / (float)(N - 1) : 0.0f;
+
+        // Sample channels onto a fresh copy of the bind-pose TRS.
+        std::vector<ModelNode> nd = nodes_;
+        for (const AnimChannel& ch : anim.channels) {
+            const AnimSampler& s = anim.samplers[ch.sampler];
+            ModelNode& node = nd[ch.targetNode];
+            switch (ch.path) {
+                case AnimPath::Translation: sampleVec(s, 3, t, node.translation); break;
+                case AnimPath::Scale:       sampleVec(s, 3, t, node.scale);       break;
+                case AnimPath::Rotation: {
+                    glm::quat q = sampleQuat(s, t);
+                    node.rotation[0]=q.x; node.rotation[1]=q.y; node.rotation[2]=q.z; node.rotation[3]=q.w;
+                } break;
+                case AnimPath::Weights: break;
+            }
+        }
+        // Walk hierarchy → world matrices (parent before child).
+        for (int root : rootNodes_) {
+            std::vector<int> stack(1, root);
+            while (!stack.empty()) {
+                int idx = stack.back(); stack.pop_back();
+                if (idx < 0 || idx >= (int)nd.size()) continue;
+                const ModelNode& n = nd[idx];
+                glm::mat4 pw = (n.parent >= 0 && n.parent < (int)nd.size())
+                    ? glm::make_mat4(&world[n.parent * 16]) : glm::mat4(1.0f);
+                glm::mat4 w = pw * nodeLocal(n);
+                std::memcpy(&world[idx * 16], glm::value_ptr(w), 16 * sizeof(float));
+                for (int c : n.children) stack.push_back(c);
+            }
+        }
+        // Joint matrices, same packing as updateAnimation.
+        uint32_t base = 0;
+        for (const ModelSkin& sk : skins_) {
+            for (size_t j = 0; j < sk.joints.size(); ++j) {
+                const int node = sk.joints[j];
+                glm::mat4 nw = (node >= 0 && node < (int)nd.size())
+                    ? glm::make_mat4(&world[node * 16]) : glm::mat4(1.0f);
+                glm::mat4 jm = nw * glm::make_mat4(&sk.inverseBind[j * 16]);
+                std::memcpy(&jmats[(base + j) * 16], glm::value_ptr(jm), 16 * sizeof(float));
+            }
+            base += (uint32_t)sk.joints.size();
+        }
+        // Transform each primitive's verts (skinned or static) and union.
+        for (const ModelPrimitive& p : primitives_) {
+            for (uint32_t ii = 0; ii < p.indexCount; ii += step) {
+                const ModelVertex& v = verts[indices[p.firstIndex + ii]];
+                const glm::vec4 lp(v.pos[0], v.pos[1], v.pos[2], 1.0f);
+                glm::vec4 wp;
+                if (p.skin >= 0) {
+                    glm::mat4 m =
+                        v.weights0[0] * glm::make_mat4(&jmats[(p.jointBase + v.joints0[0]) * 16]) +
+                        v.weights0[1] * glm::make_mat4(&jmats[(p.jointBase + v.joints0[1]) * 16]) +
+                        v.weights0[2] * glm::make_mat4(&jmats[(p.jointBase + v.joints0[2]) * 16]) +
+                        v.weights0[3] * glm::make_mat4(&jmats[(p.jointBase + v.joints0[3]) * 16]);
+                    wp = m * lp;
+                } else {
+                    wp = (p.node >= 0 && p.node < (int)nd.size())
+                        ? glm::make_mat4(&world[p.node * 16]) * lp : lp;
+                }
+                if (!has) { mn = mx = glm::vec3(wp); has = true; }
+                else { mn = glm::min(mn, glm::vec3(wp)); mx = glm::max(mx, glm::vec3(wp)); }
+            }
+        }
+    }
+    if (has) {
+        bboxMin_[0]=mn.x; bboxMin_[1]=mn.y; bboxMin_[2]=mn.z;
+        bboxMax_[0]=mx.x; bboxMax_[1]=mx.y; bboxMax_[2]=mx.z;
+        hasBBox_ = true;
     }
 }
 
@@ -1342,6 +1463,7 @@ void ModelRenderer::cleanupModel() {
     nodeWorld_.clear();
     activeAnim_ = -1;
     animTime_ = 0.0f;
+    animAnchorValid_ = false;
     hasBBox_ = false;
     numPrimitives_ = 0;
     modelLoaded_ = false;

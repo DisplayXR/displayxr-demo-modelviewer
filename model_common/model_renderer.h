@@ -49,6 +49,11 @@ struct ModelRenderer {
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
+    // Smoothed world-space centroid of the active skeleton (mean joint
+    // position), updated by updateAnimation. Lets the platform bind the
+    // display rig to a moving/skinned subject so it stays centered + at the
+    // ZDP. Returns false for static / non-skinned models (no binding).
+    bool getAnimatedAnchor(float out[3]) const;
     bool pickSurface(const float rayOrigin[3], const float rayDir[3],
                      float hitPos[3], float maxDistance = 100.0f) const;
     float findBestYaw(const float displayCenter[3],
@@ -98,6 +103,13 @@ private:
                                     VkImageView normal, VkImageView occ,
                                     VkImageView emissive);
     bool finalizeModel(struct ModelData& md);   // upload geometry+textures, build material sets
+    // Override the load-time (bind-pose) AABB with one measured from the active
+    // animation: sample the clip, skin the verts on the CPU, union the box. The
+    // bind pose lives in mesh space, which a re-orienting skeleton (e.g. a Z-up
+    // mesh stood up Y-up) renders very differently — so the bind box gives the
+    // wrong height/center for the fit. No-op when there's no active clip.
+    void recomputeAnimatedBounds(const std::vector<ModelVertex>& verts,
+                                 const std::vector<uint32_t>& indices);
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar);
     void cleanupModel();
 
@@ -184,6 +196,11 @@ private:
     std::vector<float>      nodeWorld_;   // scratch: 16 floats/node, per-frame walk
     int   activeAnim_ = -1;              // -1 = none/static (fast-path guard)
     float animTime_   = 0.0f;            // playhead within the active clip (seconds)
+
+    // Display-rig bind: smoothed mean joint position (world space). Valid only
+    // while a skinned model is animating; snaps on the first frame then eases.
+    float animAnchor_[3] = {0, 0, 0};
+    bool  animAnchorValid_ = false;
 
     float bboxMin_[3] = {0, 0, 0};
     float bboxMax_[3] = {0, 0, 0};

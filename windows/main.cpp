@@ -115,9 +115,10 @@ static std::mutex g_sceneMutex;
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
 static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
 // Initial virtual-display height as a multiple of the model's height: the
-// display-centric rig frames the (centered) model with 1.2× its height, i.e.
-// ~10% headroom top and bottom.
-static constexpr float kAutoFitVerticalComfort = 1.2f;
+// display-centric rig frames the (centered) model with 1.4× its height, i.e.
+// ~20% headroom top and bottom — enough that the window title bar doesn't
+// clip the subject.
+static constexpr float kAutoFitVerticalComfort = 1.4f;
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -763,6 +764,21 @@ static void RenderThreadFunc(
                 // animateEnabled=false on Space — re-assert true here.
                 g_inputState.animateEnabled = true;
                 g_inputState.transitioning = false;
+            }
+        }
+
+        // Bind the virtual-display rig to a moving/skinned subject: center the
+        // convergence plane on the smoothed skeleton centroid so the subject
+        // stays framed and at the ZDP as it animates. Position-only — yaw/pitch
+        // (orbit) and vHeight (zoom) stay user-driven. No-op for static models
+        // (getAnimatedAnchor returns false). Applied to inputSnapshot only, so
+        // g_inputState keeps the user's intended pose for when no model is bound.
+        {
+            float anchor[3];
+            if (g_fitValid.load() && g_modelRenderer.getAnimatedAnchor(anchor)) {
+                inputSnapshot.cameraPosX = anchor[0];
+                inputSnapshot.cameraPosY = anchor[1];
+                inputSnapshot.cameraPosZ = anchor[2];
             }
         }
 
