@@ -244,11 +244,47 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
                 }
             }
 
+            // Morph targets: flatten each target's POSITION/NORMAL deltas into a
+            // ModelMorph laid out [target][vertex][xyz]. The renderer blends
+            // base + Σ weightᵢ·deltaᵢ per frame; weights live on the owning node.
+            int morphIdx = -1;
+            if (!prim.targets.empty()) {
+                ModelMorph mm;
+                mm.targetCount = (uint32_t)prim.targets.size();
+                mm.vertexCount = (uint32_t)vcount;
+                mm.posDeltas.assign((size_t)mm.targetCount * vcount * 3, 0.0f);
+                bool anyNrm = false;
+                for (const auto& tgt : prim.targets) if (tgt.count("NORMAL")) { anyNrm = true; break; }
+                if (anyNrm) mm.nrmDeltas.assign((size_t)mm.targetCount * vcount * 3, 0.0f);
+                std::vector<float> tmp;
+                for (uint32_t t = 0; t < mm.targetCount; ++t) {
+                    const auto& tgt = prim.targets[t];
+                    const size_t off = (size_t)t * vcount * 3;
+                    auto pit = tgt.find("POSITION");
+                    if (pit != tgt.end()) {
+                        readVec(m, pit->second, 3, tmp);
+                        std::copy_n(tmp.begin(), std::min(tmp.size(), (size_t)vcount * 3),
+                                    mm.posDeltas.begin() + off);
+                    }
+                    auto nit = tgt.find("NORMAL");
+                    if (anyNrm && nit != tgt.end()) {
+                        readVec(m, nit->second, 3, tmp);
+                        std::copy_n(tmp.begin(), std::min(tmp.size(), (size_t)vcount * 3),
+                                    mm.nrmDeltas.begin() + off);
+                    }
+                }
+                morphIdx = (int)out.morphs.size();
+                out.morphs.push_back(std::move(mm));
+            }
+
             ModelPrimitive mp{};
             mp.firstIndex = (uint32_t)out.indices.size();
             mp.material = prim.material;
             mp.node = nodeIdx;   // owning node → animated world matrix per frame
             mp.skin = skinned ? node.skin : -1;  // jointBase filled in after skins parse
+            mp.firstVertex = vertexBase;
+            mp.vertexCount = (uint32_t)vcount;
+            mp.morph = morphIdx;
             std::memcpy(mp.modelMatrix, glm::value_ptr(world), 16 * sizeof(float));
 
             if (prim.indices >= 0) {
@@ -391,6 +427,20 @@ bool model_loader_load(const char* gltfPath, ModelData& out) {
             for (int k = 0; k < 4; ++k) dst.rotation[k] = (float)src.rotation[k];  // xyzw
         if (src.scale.size() == 3)
             for (int k = 0; k < 3; ++k) dst.scale[k] = (float)src.scale[k];
+        // Seed morph weights (size = the node's mesh's morph-target count) from
+        // the node override, else the mesh default, else zeros. A Weights anim
+        // channel overwrites these per frame.
+        if (src.mesh >= 0 && src.mesh < (int)model.meshes.size()) {
+            const tinygltf::Mesh& msh = model.meshes[src.mesh];
+            size_t nTargets = msh.primitives.empty() ? 0 : msh.primitives[0].targets.size();
+            if (nTargets > 0) {
+                dst.weights.assign(nTargets, 0.0f);
+                const std::vector<double>& defs =
+                    !src.weights.empty() ? src.weights : msh.weights;
+                for (size_t k = 0; k < nTargets && k < defs.size(); ++k)
+                    dst.weights[k] = (float)defs[k];
+            }
+        }
     }
     // Scene roots (same selection the world-bake walk used above).
     if (sceneIdx >= 0 && sceneIdx < (int)model.scenes.size()) {
