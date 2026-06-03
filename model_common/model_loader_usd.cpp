@@ -37,7 +37,9 @@ namespace {
 namespace tt = tinyusdz::tydra;
 
 // Resolve a tydra shader-param texture_id → ModelData texture index (or -1):
-// texture → image → embedded buffer bytes (USDZ) or external asset path.
+// texture → image → buffer. tydra (with load_texture_assets) hands back either
+// raw decoded texels or the still-encoded file bytes; we also fall back to an
+// external asset path for .usda referencing on-disk images.
 int loadUsdTexture(const tt::RenderScene& scene, int32_t texId,
                    const std::filesystem::path& dir, ModelData& out) {
     if (texId < 0 || texId >= (int32_t)scene.textures.size()) return -1;
@@ -45,15 +47,53 @@ int loadUsdTexture(const tt::RenderScene& scene, int32_t texId,
     if (imgId < 0 || imgId >= (int64_t)scene.images.size()) return -1;
     const tt::TextureImage& img = scene.images[(size_t)imgId];
 
-    // Embedded, still-encoded image data (the common USDZ case) → decode.
-    if (!img.decoded && img.buffer_id >= 0 && img.buffer_id < (int64_t)scene.buffers.size()) {
+    if (img.buffer_id >= 0 && img.buffer_id < (int64_t)scene.buffers.size()) {
         const std::vector<uint8_t>& data = scene.buffers[(size_t)img.buffer_id].data;
+        const size_t rawBytes = (size_t)img.width * img.height * img.channels;
+        (void)rawBytes;
+        // Decoded texels → repack to RGBA8. tydra may decode to 8/16/32-bit per
+        // channel (the AR-QuickLook teapot comes back as 32-bit float), so read
+        // each component per `texelComponentType` and normalise to u8.
+        const size_t texels = (size_t)img.width * img.height;
+        const size_t totalComp = texels * (size_t)img.channels;
+        if (img.decoded && totalComp > 0 && data.size() >= totalComp &&
+            (data.size() % totalComp) == 0) {
+            // Drive conversion off bytes-per-channel, NOT texelComponentType:
+            // tydra reports UInt8 for the AR-QuickLook teapot yet the buffer is
+            // float32 [0,1] (4 B/channel), so the type field can't be trusted.
+            const size_t bpc = data.size() / totalComp;
+            const int ch = img.channels;
+            auto comp = [&](size_t i) -> uint8_t {       // component i → u8
+                const uint8_t* b = data.data() + i * bpc;
+                switch (bpc) {
+                    case 1: return b[0];                                                  // u8
+                    case 2: { uint16_t v; std::memcpy(&v, b, 2); return (uint8_t)(v >> 8); }   // u16 (or half — rare)
+                    case 4: { float f;  std::memcpy(&f, b, 4); return (uint8_t)std::clamp(f * 255.0f + 0.5f, 0.0f, 255.0f); }  // float [0,1]
+                    case 8: { double d; std::memcpy(&d, b, 8); return (uint8_t)std::clamp(d * 255.0 + 0.5, 0.0, 255.0); }
+                    default: return b[0];
+                }
+            };
+            ModelTexture t;
+            t.width = img.width; t.height = img.height;
+            t.rgba.resize(texels * 4);
+            for (size_t p = 0; p < texels; ++p) {
+                const size_t base = p * (size_t)ch;
+                const uint8_t r = comp(base + 0);
+                const uint8_t g = (ch >= 3) ? comp(base + 1) : r;
+                const uint8_t b = (ch >= 3) ? comp(base + 2) : r;
+                const uint8_t a = (ch == 4) ? comp(base + 3) : ((ch == 2) ? comp(base + 1) : 255);
+                t.rgba[p*4+0] = r; t.rgba[p*4+1] = g; t.rgba[p*4+2] = b; t.rgba[p*4+3] = a;
+            }
+            out.textures.push_back(std::move(t));
+            return (int)out.textures.size() - 1;
+        }
+        // Else the buffer holds still-encoded PNG/JPEG bytes → stb decode.
         if (!data.empty()) {
             const int idx = material_load_texture_memory(data.data(), (int)data.size(), out);
             if (idx >= 0) return idx;
         }
     }
-    // External asset (typical for .usda referencing image files).
+    // External asset (typical for .usda referencing image files on disk).
     if (!img.asset_identifier.empty()) {
         int idx = material_load_texture_file(img.asset_identifier, out);
         if (idx >= 0) return idx;
@@ -93,7 +133,29 @@ bool model_load_usd(const char* path, ModelData& out) {
     tt::RenderScene scene;
     tt::RenderSceneConverter converter;
     tt::RenderSceneConverterEnv env(stage);
-    env.set_search_paths({ modelDir.string() });
+    env.scene_config.load_texture_assets = true;  // decode/extract texture images
+
+    // USDZ keeps its textures inside the zip package — a plain disk search path
+    // can't reach them, so install the USDZ asset resolver. usdz_asset must stay
+    // alive until ConvertToRenderScene() returns (it backs the resolver).
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    tinyusdz::USDZAsset usdz_asset;
+    tinyusdz::AssetResolutionResolver arr;
+    if (ext == ".usdz") {
+        std::string w2, e2;
+        if (tinyusdz::ReadUSDZAssetInfoFromFile(path, &usdz_asset, &w2, &e2) &&
+            tinyusdz::SetupUSDZAssetResolution(arr, &usdz_asset)) {
+            env.asset_resolver = arr;
+        } else {
+            std::fprintf(stderr, "[model_loader/usd] USDZ asset resolution setup failed: %s\n",
+                         e2.c_str());
+            env.set_search_paths({ modelDir.string() });
+        }
+    } else {
+        env.set_search_paths({ modelDir.string() });
+    }
+
     if (!converter.ConvertToRenderScene(env, &scene)) {
         std::fprintf(stderr, "[model_loader/usd] '%s': RenderScene convert failed: %s\n",
                      path, converter.GetError().c_str());
