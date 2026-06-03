@@ -72,10 +72,19 @@ OBJ + FBX share `model_loader_material.{h,cpp}` (texture decode + Phong→roughn
 The four open-dialog filters (Windows spatial picker + Win32 fallback, macOS
 `NSOpenPanel`) and `model_validate_file` gate the same extension set.
 
+**FBX skinning / animation (done):** `model_load_fbx` now emits skins (per-vertex
+top-4 joints/weights; `inverseBind` = ufbx `cluster->geometry_to_bone`; skinned
+meshes kept in geometry space), the node hierarchy (`HELPER_NODES` inherit mode
+so a plain parent×local walk matches ufbx's `node_to_world`), and each anim-stack
+baked to 30 fps Linear keyframes via `ufbx_evaluate_transform` (constant channels
+dropped) — all into the same `ModelData` fields the glTF path fills, so the
+renderer skins + animates with no renderer/shader changes. The skeleton-centroid
+display anchor gets a visual-centre correction (computed in
+`recomputeAnimatedBounds`) so joint-free geometry like a hat doesn't ride
+off-centre. Remaining FBX gaps: **blend shapes** (morph targets) aren't read, and
+**non-skinned meshes don't follow node animation** (still world-baked).
+
 **Format follow-ups:**
-- **FBX skinning / animation** — `model_load_fbx` loads static geometry only;
-  ufbx exposes skins + clips, and `ModelData` already carries the skin/anim
-  fields (from the glTF phases) to wire them into.
 - **USD textures beyond base-color/emissive** — UsdPreviewSurface keeps
   metallic + roughness as separate single-channel maps and normals as a normal
   map; today USD honours those as factors + base/emissive textures only.

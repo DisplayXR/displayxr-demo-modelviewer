@@ -235,6 +235,15 @@ private:
     float animAnchor_[3] = {0, 0, 0};
     bool  animAnchorValid_ = false;
 
+    // Correction added to the raw skeleton-centroid anchor so it lands on the
+    // model's visual centre instead of the joint mean. = (animated AABB centre −
+    // mean joint centroid), computed once over the clip in recomputeAnimatedBounds.
+    // ~0 when the skeleton already spans the geometry (most glTF rigs); non-zero
+    // when joint-free geometry sits off-centre (e.g. an FBX hat with no bones),
+    // which would otherwise let the subject ride high/low in frame.
+    float anchorOffset_[3] = {0, 0, 0};
+    bool  anchorOffsetValid_ = false;
+
     float bboxMin_[3] = {0, 0, 0};
     float bboxMax_[3] = {0, 0, 0};
     bool  hasBBox_ = false;

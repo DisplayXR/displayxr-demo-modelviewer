@@ -83,10 +83,12 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 
 ### Loader limits (today) → these are the next phases
 - **Multi-format:** glTF/STL/OBJ/FBX/USD all load (see PORTING.md → *Multi-format
-  import* for the per-backend table). **FBX is static-only** (ufbx skins/clips
-  not yet wired); **USD honours base-color/emissive textures + PBR factors** but
-  not normal/metallic-roughness maps yet. Non-glTF material fidelity is
-  best-effort (Phong→MR shim for OBJ/FBX).
+  import* for the per-backend table). **FBX now skins + animates** (ufbx skins +
+  baked anim-stack clips wired into the same ModelData fields the glTF path uses;
+  no blend shapes yet, and non-skinned meshes don't follow node animation);
+  **USD honours base-color/emissive textures + PBR factors** but not
+  normal/metallic-roughness maps yet. Non-glTF material fidelity is best-effort
+  (Phong→MR shim for OBJ/FBX).
 - **No Draco** mesh compression, **no KTX2/Basis** textures (stb = PNG/JPEG only).
 See **PORTING.md** for the phased roadmap.
 

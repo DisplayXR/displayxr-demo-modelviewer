@@ -1201,7 +1201,19 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
         }
         vkUnmapMemory(device_, jointBuffer_.memory);
 
-        if (jointTotal > 0) { anchorRaw = glm::vec3(centroid / (double)jointTotal); anchorValid = true; }
+        if (jointTotal > 0) {
+            anchorRaw = glm::vec3(centroid / (double)jointTotal);
+            // Lift the skeleton mean onto the model's visual centre (see
+            // recomputeAnimatedBounds) so joint-free geometry up high (a hat)
+            // doesn't make the subject ride off-centre. No-op (~0) for rigs whose
+            // joints already span the mesh.
+            if (anchorOffsetValid_) {
+                anchorRaw.x += anchorOffset_[0];
+                anchorRaw.y += anchorOffset_[1];
+                anchorRaw.z += anchorOffset_[2];
+            }
+            anchorValid = true;
+        }
     }
 
     // 5) Re-blend morph targets into the (host-visible) vertex buffer. Runs
@@ -1337,6 +1349,8 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
 
     bool has = false;
     glm::vec3 mn(0.0f), mx(0.0f);
+    glm::dvec3 centroidSum(0.0);   // mean joint position summed over all samples
+    uint32_t centroidCount = 0;    // (for the anchor visual-centre correction)
     for (int si = 0; si < N; ++si) {
         const float t = (anim.duration > 0.0f && N > 1)
             ? anim.duration * (float)si / (float)(N - 1) : 0.0f;
@@ -1382,6 +1396,7 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
                     ? glm::make_mat4(&world[node * 16]) : glm::mat4(1.0f);
                 glm::mat4 jm = nw * glm::make_mat4(&sk.inverseBind[j * 16]);
                 std::memcpy(&jmats[(base + j) * 16], glm::value_ptr(jm), 16 * sizeof(float));
+                centroidSum += glm::dvec3(nw[3]); ++centroidCount;   // joint world pos
             }
             base += (uint32_t)sk.joints.size();
         }
@@ -1428,6 +1443,17 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
         bboxMin_[0]=mn.x; bboxMin_[1]=mn.y; bboxMin_[2]=mn.z;
         bboxMax_[0]=mx.x; bboxMax_[1]=mx.y; bboxMax_[2]=mx.z;
         hasBBox_ = true;
+        // Offset that lifts the per-frame skeleton-centroid anchor onto the
+        // model's visual centre (the AABB centre), so joint-free geometry like a
+        // hat doesn't make the subject ride off-centre. ~0 for rigs whose joints
+        // already span the mesh; applied in updateAnimation.
+        if (centroidCount > 0) {
+            const glm::vec3 c = glm::vec3(centroidSum / (double)centroidCount);
+            anchorOffset_[0] = 0.5f * (mn.x + mx.x) - c.x;
+            anchorOffset_[1] = 0.5f * (mn.y + mx.y) - c.y;
+            anchorOffset_[2] = 0.5f * (mn.z + mx.z) - c.z;
+            anchorOffsetValid_ = true;
+        }
     }
 }
 

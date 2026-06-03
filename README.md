@@ -26,7 +26,7 @@ bundled sample is the Khronos DamagedHelmet, auto-loaded at startup.
 | glTF 2.0 | `.glb` `.gltf` | Full metallic-roughness PBR + textures | Reference path |
 | STL | `.stl` | Neutral default material | Binary + ASCII; geometry only |
 | OBJ | `.obj` (+ `.mtl`) | Phong → metallic-roughness shim | Best-effort material fidelity |
-| FBX | `.fbx` | PBR maps, Phong fallback | **Static only** — skinning/animation not yet wired |
+| FBX | `.fbx` | PBR maps, Phong fallback | Skinned + animated (auto-plays first clip); no blend shapes yet |
 | USD | `.usdz` `.usd` `.usda` `.usdc` | UsdPreviewSurface PBR | Base-color/emissive textures + PBR factors; normal & metallic-roughness *maps* not yet honoured |
 
 Every format feeds the same renderer (metallic-roughness PBR + image-based
