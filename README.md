@@ -1,9 +1,10 @@
 # DisplayXR Demo — 3D Model Viewer
 
-Real-time glTF 2.0 PBR model viewer for glasses-free 3D displays, built on the
-DisplayXR runtime via OpenXR with Vulkan. Loads `.glb` / `.gltf` models and
-renders them with asymmetric per-eye Kooima projection for the full multiview
-3D experience.
+Real-time PBR model viewer for glasses-free 3D displays, built on the
+DisplayXR runtime via OpenXR with Vulkan. Loads **glTF 2.0** (`.glb` / `.gltf`),
+**STL**, **OBJ**, **FBX**, and **USD** (`.usdz` / `.usd` / `.usda` / `.usdc`)
+models and renders them with asymmetric per-eye Kooima projection for the full
+multiview 3D experience.
 
 Loads metallic-roughness PBR materials with textures and image-based lighting,
 a blurred procedural skybox, and a transparent see-through mode (Windows). The
@@ -28,8 +29,8 @@ bundled sample is the Khronos DamagedHelmet, auto-loaded at startup.
 | `-` / `=` | Decrease / increase depth + IPD together (10 %–100 %) |
 | `M` | Auto-orbit: slow turntable rotation when idle |
 | `V` | Cycle rendering modes advertised by the display runtime |
-| `L` or top-bar **Open…** | Load a different `.glb` / `.gltf` file |
-| Drag-and-drop (macOS) | Load a `.glb` / `.gltf` dropped onto the window |
+| `L` or top-bar **Open…** | Load a different model (glTF / STL / OBJ / FBX / USD) |
+| Drag-and-drop (macOS) | Load a supported model dropped onto the window |
 | Space | Reset pose, zoom, depth |
 | Tab | Toggle HUD |
 | Ctrl+T | Toggle transparent background (desktop see-through; Windows only) |
@@ -44,8 +45,10 @@ bundled sample is the Khronos DamagedHelmet, auto-loaded at startup.
 - A DisplayXR-compatible runtime (install via `DisplayXRSetup-*.exe` from
   [displayxr-runtime releases](https://github.com/DisplayXR/displayxr-runtime/releases))
 
-`model_common/` fetches **tinygltf** and **glm** via CMake `FetchContent` on
-first configure (no submodules).
+`model_common/` fetches **tinygltf**, **glm**, and **tinyusdz** (USD) via CMake
+`FetchContent` on first configure (no submodules); **tinyobjloader** (OBJ) and
+**ufbx** (FBX) are vendored under `model_common/third_party/`. STL has no
+dependency. The first configure builds tinyusdz from source, so it is slower.
 
 ### macOS
 ```bash

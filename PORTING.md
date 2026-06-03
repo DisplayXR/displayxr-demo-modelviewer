@@ -54,6 +54,34 @@ viewer currently renders the **bind pose** only. Phased plan:
 Suggested bundled animated sample: Khronos **CesiumMan** or **Fox** (small,
 CC-licensed, exercises skin + clips).
 
+## Multi-format import (done)
+
+The loader is a thin **format dispatcher** (`model_loader.cpp`) routing by
+extension to a per-format backend, each filling the same `ModelData` the renderer
+consumes (adding a format is front-end work only):
+
+| Format | Backend | Parser | Materials |
+|---|---|---|---|
+| `.glb`/`.gltf` | `model_loader_gltf.cpp` | tinygltf (FetchContent) | PBR-native |
+| `.stl` | `model_loader_stl.cpp` | hand-rolled, no dep | single neutral default |
+| `.obj` | `model_loader_obj.cpp` | tinyobjloader (vendored) | Phong `.mtl` → MR shim |
+| `.fbx` | `model_loader_fbx.cpp` | ufbx (vendored) | PBR maps, Phong fallback |
+| `.usd*` | `model_loader_usd.cpp` | tinyusdz/tydra (FetchContent) | UsdPreviewSurface (PBR) |
+
+OBJ + FBX share `model_loader_material.{h,cpp}` (texture decode + Phong→roughness).
+The four open-dialog filters (Windows spatial picker + Win32 fallback, macOS
+`NSOpenPanel`) and `model_validate_file` gate the same extension set.
+
+**Format follow-ups:**
+- **FBX skinning / animation** — `model_load_fbx` loads static geometry only;
+  ufbx exposes skins + clips, and `ModelData` already carries the skin/anim
+  fields (from the glTF phases) to wire them into.
+- **USD textures beyond base-color/emissive** — UsdPreviewSurface keeps
+  metallic + roughness as separate single-channel maps and normals as a normal
+  map; today USD honours those as factors + base/emissive textures only.
+- **OBJ/FBX texture dedup** — repeated `map_Kd`/embedded textures are decoded
+  per material reference (minor; no caching yet).
+
 ## Other follow-ups (smaller)
 
 - **`pickSurface`** — ray/triangle intersection vs the loaded mesh (currently a

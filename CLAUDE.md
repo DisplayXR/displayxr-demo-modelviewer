@@ -4,9 +4,10 @@ Guidance for Claude Code (claude.ai/code) working on this repo.
 
 ## Project Overview
 
-DisplayXR Demo — **3D Model Viewer**. Real-time glTF 2.0 PBR model viewer for
+DisplayXR Demo — **3D Model Viewer**. Real-time PBR model viewer for
 glasses-free 3D displays, on the DisplayXR OpenXR runtime via Vulkan (Windows)
-and MoltenVK (macOS). Loads `.glb` / `.gltf`, renders with asymmetric per-eye
+and MoltenVK (macOS). Loads glTF 2.0 (`.glb`/`.gltf`), STL, OBJ, FBX, and USD
+(`.usdz`/`.usd`/`.usda`/`.usdc`), renders with asymmetric per-eye
 Kooima projection. Standalone repo, independent release cadence; `common/` +
 `openxr_includes/` were seeded from the runtime and are maintained here.
 
@@ -31,9 +32,15 @@ windows/main.cpp, macos/main.mm  — platform entry: window, OpenXR session,
                                     capture ('I'), file load (L / drag-drop)
 model_common/                     — the renderer (vendor-neutral, analog of
                                     3dgs_common in the gaussiansplat demo):
-  model_loader.{h,cpp}            — tinygltf parse → interleaved verts + indices
-                                    + materials + decoded RGBA textures + node-
-                                    baked world transforms + AABB; path helpers
+  model_loader.{h,cpp}            — format dispatcher (by extension) + path
+                                    helpers; fills ModelData = interleaved verts
+                                    + indices + materials + decoded RGBA textures
+                                    + node-baked world transforms + AABB
+  model_loader_gltf.cpp           — .glb/.gltf backend (tinygltf); the others
+  model_loader_{stl,obj,fbx,usd}.cpp  feed the SAME ModelData (renderer is
+  model_loader_material.{h,cpp}   — format-neutral). OBJ/FBX share this texture
+                                    + Phong→roughness shim. third_party/ vendors
+                                    tinyobjloader + ufbx; tinyusdz is FetchContent
   model_renderer.{h,cpp}          — metallic-roughness GGX raster pass into an
                                     internal colour image, blitted into the
                                     per-eye swapchain viewport; IBL generation
@@ -65,16 +72,23 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   (blurred) — sharp far features cause lightfield cross-talk.
 - **sRGB** base-color/emissive are decoded in the shader (textures uploaded
   UNORM). **Normal mapping is tangent-free** (screen-space derivative frame).
-- **stb / tinygltf:** `model_loader.cpp` uses `TINYGLTF_NO_STB_IMAGE` + a custom
-  image-loader callback calling `stbi_load_from_memory`. The stb *implementation*
-  comes from `common/d3d11_renderer.cpp` on Windows and
-  `common/stb_image_impl_macos.cpp` on macOS. Do NOT define
-  `STB_IMAGE_IMPLEMENTATION` in `model_loader.cpp` (duplicate-symbol clash).
+- **stb / tinygltf:** `model_loader_gltf.cpp` uses `TINYGLTF_NO_STB_IMAGE` + a
+  custom image-loader callback calling `stbi_load_from_memory`; the OBJ/FBX/USD
+  backends decode textures via `model_loader_material.cpp` the same way. The stb
+  *implementation* comes from `common/d3d11_renderer.cpp` on Windows and
+  `common/stb_image_impl_macos.cpp` on macOS — do NOT define
+  `STB_IMAGE_IMPLEMENTATION` in any model_common TU (duplicate-symbol clash).
+  `model_loader_gltf.cpp` is the one TU that defines `TINYGLTF_IMPLEMENTATION`;
+  `model_loader_obj.cpp` likewise owns `TINYOBJLOADER_IMPLEMENTATION`.
 
 ### Loader limits (today) → these are the next phases
-- **No skinning / animation / morph targets** — meshes render in bind pose.
+- **Multi-format:** glTF/STL/OBJ/FBX/USD all load (see PORTING.md → *Multi-format
+  import* for the per-backend table). **FBX is static-only** (ufbx skins/clips
+  not yet wired); **USD honours base-color/emissive textures + PBR factors** but
+  not normal/metallic-roughness maps yet. Non-glTF material fidelity is
+  best-effort (Phong→MR shim for OBJ/FBX).
 - **No Draco** mesh compression, **no KTX2/Basis** textures (stb = PNG/JPEG only).
-See **PORTING.md** for the phased roadmap (animation is the next big one).
+See **PORTING.md** for the phased roadmap.
 
 ## Build
 
