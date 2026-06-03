@@ -71,7 +71,7 @@ bool model_loader_load(const char* path, ModelData& out) {
 bool model_validate_file(const std::string& path) {
     if (path.empty()) return false;
     const std::string ext = lowerExt(path);
-    static constexpr std::array<const char*, 3> kSupported = { ".glb", ".gltf", ".stl" };
+    static constexpr std::array<const char*, 4> kSupported = { ".glb", ".gltf", ".stl", ".obj" };
     bool known = false;
     for (const char* e : kSupported) if (ext == e) { known = true; break; }
     if (!known) return false;

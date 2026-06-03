@@ -99,8 +99,10 @@ add_library(model_renderer STATIC
     model_loader_backends.h
     model_loader.cpp           # format dispatcher + path helpers
     model_loader_gltf.cpp      # .glb/.gltf backend (tinygltf, defines its impl)
+    model_loader_material.h
+    model_loader_material.cpp  # shared texture/material shim (OBJ + FBX)
     model_loader_stl.cpp       # .stl backend (hand-rolled, no dep)
-    model_loader_obj.cpp       # .obj backend (tinyobjloader) — stub
+    model_loader_obj.cpp       # .obj backend (tinyobjloader, vendored)
     model_loader_fbx.cpp       # .fbx backend (ufbx) — stub
     model_loader_usd.cpp       # .usdz/.usd backend (tinyusdz) — stub
     model_vulkan_utils.h
