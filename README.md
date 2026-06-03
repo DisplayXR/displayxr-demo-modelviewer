@@ -19,6 +19,21 @@ bundled sample is the Khronos DamagedHelmet, auto-loaded at startup.
 > The shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases))
 > is optional — only needed for the spatial workspace shell.
 
+## Supported formats
+
+| Format | Extensions | Materials | Notes |
+|---|---|---|---|
+| glTF 2.0 | `.glb` `.gltf` | Full metallic-roughness PBR + textures | Reference path |
+| STL | `.stl` | Neutral default material | Binary + ASCII; geometry only |
+| OBJ | `.obj` (+ `.mtl`) | Phong → metallic-roughness shim | Best-effort material fidelity |
+| FBX | `.fbx` | PBR maps, Phong fallback | **Static only** — skinning/animation not yet wired |
+| USD | `.usdz` `.usd` `.usda` `.usdc` | UsdPreviewSurface PBR | Base-color/emissive textures + PBR factors; normal & metallic-roughness *maps* not yet honoured |
+
+Every format feeds the same renderer (metallic-roughness PBR + image-based
+lighting). Not yet supported: **Draco** mesh compression and **KTX2 / Basis**
+textures (textures are PNG/JPEG only). See [`PORTING.md`](PORTING.md) for the
+per-backend breakdown and roadmap.
+
 ## Controls
 
 | Input | Action |
@@ -80,7 +95,7 @@ build\windows\model_viewer_handle_vk_win.exe
 .
 ├── macos/                  Platform entry + window handling (Cocoa / MoltenVK)
 ├── windows/                Platform entry + window handling (Win32 / Vulkan)
-├── model_common/           glTF 2.0 PBR renderer: loader + renderer + shaders
+├── model_common/           Multi-format PBR renderer: loaders + renderer + shaders
 ├── common/                 Shared helpers: Kooima math, input, HUD
 ├── openxr_includes/         Vendored OpenXR headers (incl. DisplayXR extensions)
 ├── installer/              Windows NSIS + macOS .pkg installers
