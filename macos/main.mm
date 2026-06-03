@@ -475,11 +475,12 @@ static void OpenLoadDialog() {
         [panel setCanChooseDirectories:NO];
         [panel setAllowsMultipleSelection:NO];
         [panel setTitle:@"Load 3D Model"];
-        [panel setMessage:@"Select a 3D model (.glb / .gltf / .stl / .obj / .fbx)"];
+        [panel setMessage:@"Select a 3D model (glTF / STL / OBJ / FBX / USD)"];
 
         if (@available(macOS 11.0, *)) {
             NSMutableArray<UTType *> *types = [NSMutableArray array];
-            for (NSString *ext in @[@"glb", @"gltf", @"stl", @"obj", @"fbx"]) {
+            for (NSString *ext in @[@"glb", @"gltf", @"stl", @"obj", @"fbx",
+                                    @"usdz", @"usd", @"usda", @"usdc"]) {
                 UTType *t = [UTType typeWithFilenameExtension:ext];
                 if (t) [types addObject:t];
             }

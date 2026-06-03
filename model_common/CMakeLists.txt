@@ -46,6 +46,26 @@ FetchContent_Declare(glm
 )
 FetchContent_MakeAvailable(glm)
 
+# ── USD / USDZ loading (tinyusdz, Apache-2.0) ─────────────────────────────
+# The one heavy import dependency (vs the vendored single-file OBJ/FBX libs).
+# tydra's RenderScene flattens a USD stage into triangulated meshes +
+# UsdPreviewSurface materials → mapped 1:1 into ModelData by model_loader_usd.cpp.
+# tinyusdz includes <windows.h> without NOMINMAX, whose min/max macros mangle
+# its own std::min/std::max calls — define it before adding the subproject.
+if(WIN32)
+    add_compile_definitions(NOMINMAX)
+endif()
+FetchContent_Declare(tinyusdz
+    GIT_REPOSITORY https://github.com/lighttransport/tinyusdz.git
+    GIT_TAG        v0.9.4
+)
+set(TINYUSDZ_BUILD_TESTS        OFF CACHE INTERNAL "" FORCE)
+set(TINYUSDZ_BUILD_EXAMPLES     OFF CACHE INTERNAL "" FORCE)
+set(TINYUSDZ_WITH_OPENSUBDIV    OFF CACHE INTERNAL "" FORCE)
+set(TINYUSDZ_WITH_AUDIO         OFF CACHE INTERNAL "" FORCE)
+set(TINYUSDZ_WITH_EXR           OFF CACHE INTERNAL "" FORCE)
+FetchContent_MakeAvailable(tinyusdz)
+
 # ── SPIR-V shader compilation ─────────────────────────────────────────────
 find_program(GLSLANGVALIDATOR_COMMAND glslangValidator)
 if(NOT GLSLANGVALIDATOR_COMMAND)
@@ -119,6 +139,7 @@ target_include_directories(model_renderer PUBLIC
 # from common/d3d11_renderer.cpp into the final executable (see model_loader.cpp).
 target_include_directories(model_renderer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    ${tinyusdz_SOURCE_DIR}/src        # tinyusdz.hh + tydra/render-data.hh
 )
 
 target_link_libraries(model_renderer PUBLIC
@@ -127,4 +148,5 @@ target_link_libraries(model_renderer PUBLIC
 )
 target_link_libraries(model_renderer PRIVATE
     tinygltf
+    tinyusdz::tinyusdz_static
 )
