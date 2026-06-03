@@ -1278,9 +1278,11 @@ static void RenderThreadFunc(
                                         if (stem.empty()) stem = "scene";
                                         std::string outPath = dxr_capture::MakeCapturePath(
                                             stem, cols, rows);
-                                        // GS writes via compute imageStore — bytes are
-                                        // linear even on an sRGB swapchain; tell the helper
-                                        // to mirror the runtime's display-side decode.
+                                        // The model viewer writes the swapchain via a
+                                        // render-pass + blit, which hardware-encodes correct
+                                        // sRGB bytes on store (unlike GS's compute imageStore,
+                                        // which writes linear bytes). So the read-back bytes
+                                        // are already correctly encoded — do NOT re-decode.
                                         bool ok = dxr_capture::CaptureAtlasRegionVk(
                                             vkDevice, physDevice,
                                             graphicsQueue, renderCmdPool,
@@ -1288,7 +1290,7 @@ static void RenderThreadFunc(
                                             (int)colorFormat,
                                             xr->swapchain.width, xr->swapchain.height,
                                             0, 0, atlasW, atlasH, outPath,
-                                            /*linearBytesInSrgbImage=*/true);
+                                            /*linearBytesInSrgbImage=*/false);
                                         if (ok) {
                                             LOG_INFO("Captured %ux%u (%ux%u tiles) -> %s",
                                                      atlasW, atlasH, cols, rows, outPath.c_str());
