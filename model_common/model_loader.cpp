@@ -49,10 +49,12 @@ bool model_loader_load(const char* path, ModelData& out) {
     switch (formatFromPath(path)) {
         case ModelFormat::Gltf:
             return model_load_gltf(path, out);
-        case ModelFormat::Obj:
         case ModelFormat::Stl:
+            return model_load_stl(path, out);
+        case ModelFormat::Obj:
+            return model_load_obj(path, out);
         case ModelFormat::Fbx:
-            return model_load_assimp(path, out);
+            return model_load_fbx(path, out);
         case ModelFormat::Usd:
             return model_load_usd(path, out);
         default:
@@ -69,7 +71,7 @@ bool model_loader_load(const char* path, ModelData& out) {
 bool model_validate_file(const std::string& path) {
     if (path.empty()) return false;
     const std::string ext = lowerExt(path);
-    static constexpr std::array<const char*, 2> kSupported = { ".glb", ".gltf" };
+    static constexpr std::array<const char*, 3> kSupported = { ".glb", ".gltf", ".stl" };
     bool known = false;
     for (const char* e : kSupported) if (ext == e) { known = true; break; }
     if (!known) return false;

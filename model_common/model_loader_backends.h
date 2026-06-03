@@ -18,13 +18,21 @@
 
 #include "model_loader.h"
 
-// .glb / .gltf — tinygltf. PBR-native. Implemented (model_loader_gltf.cpp).
+// .glb / .gltf — tinygltf. PBR-native. (model_loader_gltf.cpp)
 bool model_load_gltf(const char* path, ModelData& out);
 
-// .obj / .stl / .fbx — Assimp. Materials shimmed to metallic-roughness.
-// Stub today (model_loader_assimp.cpp) — see PORTING.md for the phased fill-in.
-bool model_load_assimp(const char* path, ModelData& out);
+// .stl — hand-rolled binary+ASCII parser, no dependency. Geometry only; a
+// single neutral default material (STL carries none). (model_loader_stl.cpp)
+bool model_load_stl(const char* path, ModelData& out);
+
+// .obj — tinyobjloader. Legacy (Phong/.mtl) materials shimmed to
+// metallic-roughness via model_loader_material.h. (model_loader_obj.cpp)
+bool model_load_obj(const char* path, ModelData& out);
+
+// .fbx — ufbx. PBR maps preferred, legacy Phong shimmed; static geometry only
+// (skinning/animation deferred). (model_loader_fbx.cpp)
+bool model_load_fbx(const char* path, ModelData& out);
 
 // .usdz / .usd / .usda / .usdc — tinyusdz. PBR-native (UsdPreviewSurface).
-// Stub today (model_loader_usd.cpp).
+// (model_loader_usd.cpp)
 bool model_load_usd(const char* path, ModelData& out);

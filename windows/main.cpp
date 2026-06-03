@@ -382,9 +382,9 @@ static void OpenLoadDialog(HWND hwnd) {
         strncpy(info.title, "Load 3D Model",
                 sizeof(info.title) - 1);
         info.filterCount = 3;
-        strncpy(info.filters[0].description, "glTF Models",
+        strncpy(info.filters[0].description, "3D Models",
                 sizeof(info.filters[0].description) - 1);
-        strncpy(info.filters[0].extensions, "*.glb;*.gltf",
+        strncpy(info.filters[0].extensions, "*.glb;*.gltf;*.stl",
                 sizeof(info.filters[0].extensions) - 1);
         strncpy(info.filters[1].description, "Binary glTF",
                 sizeof(info.filters[1].description) - 1);
@@ -413,7 +413,7 @@ static void OpenLoadDialog(HWND hwnd) {
     char filePath[MAX_PATH] = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = "glTF Models (*.glb;*.gltf)\0*.glb;*.gltf\0Binary glTF (*.glb)\0*.glb\0glTF (*.gltf)\0*.gltf\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFilter = "3D Models (*.glb;*.gltf;*.stl)\0*.glb;*.gltf;*.stl\0glTF (*.glb;*.gltf)\0*.glb;*.gltf\0STL (*.stl)\0*.stl\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = filePath;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrTitle = "Load 3D Model";

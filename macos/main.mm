@@ -475,14 +475,14 @@ static void OpenLoadDialog() {
         [panel setCanChooseDirectories:NO];
         [panel setAllowsMultipleSelection:NO];
         [panel setTitle:@"Load 3D Model"];
-        [panel setMessage:@"Select a .glb or .gltf glTF 2.0 model"];
+        [panel setMessage:@"Select a 3D model (.glb / .gltf / .stl)"];
 
         if (@available(macOS 11.0, *)) {
-            UTType *glbType  = [UTType typeWithFilenameExtension:@"glb"];
-            UTType *gltfType = [UTType typeWithFilenameExtension:@"gltf"];
             NSMutableArray<UTType *> *types = [NSMutableArray array];
-            if (glbType)  [types addObject:glbType];
-            if (gltfType) [types addObject:gltfType];
+            for (NSString *ext in @[@"glb", @"gltf", @"stl"]) {
+                UTType *t = [UTType typeWithFilenameExtension:ext];
+                if (t) [types addObject:t];
+            }
             if (types.count > 0) {
                 [panel setAllowedContentTypes:types];
             }
