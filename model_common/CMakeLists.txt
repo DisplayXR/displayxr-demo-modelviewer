@@ -103,7 +103,8 @@ add_library(model_renderer STATIC
     model_loader_material.cpp  # shared texture/material shim (OBJ + FBX)
     model_loader_stl.cpp       # .stl backend (hand-rolled, no dep)
     model_loader_obj.cpp       # .obj backend (tinyobjloader, vendored)
-    model_loader_fbx.cpp       # .fbx backend (ufbx) — stub
+    model_loader_fbx.cpp       # .fbx backend (ufbx, vendored)
+    third_party/ufbx.c         # ufbx implementation (C TU)
     model_loader_usd.cpp       # .usdz/.usd backend (tinyusdz) — stub
     model_vulkan_utils.h
     model_vulkan_utils.cpp
