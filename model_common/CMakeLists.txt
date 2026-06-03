@@ -96,7 +96,11 @@ add_library(model_renderer STATIC
     model_renderer.h
     model_renderer.cpp
     model_loader.h
-    model_loader.cpp
+    model_loader_backends.h
+    model_loader.cpp           # format dispatcher + path helpers
+    model_loader_gltf.cpp      # .glb/.gltf backend (tinygltf, defines its impl)
+    model_loader_assimp.cpp    # .obj/.stl/.fbx backend (Assimp) — stub
+    model_loader_usd.cpp       # .usdz/.usd backend (tinyusdz) — stub
     model_vulkan_utils.h
     model_vulkan_utils.cpp
     ${SHADER_HEADERS}
