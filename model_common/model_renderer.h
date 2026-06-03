@@ -143,6 +143,14 @@ private:
     std::string loadedModelPath_;
     uint32_t numPrimitives_ = 0;
 
+    // True when the swapchain is an sRGB *format* (set per-frame from the
+    // swapchainFormat passed to renderEye). The shader gamma-encodes its output
+    // ONLY when this is false: a UNORM swapchain (Windows) needs the shader to
+    // linear→sRGB encode, while an sRGB swapchain (macOS) gets the encode for
+    // free from the blit's hardware write — encoding in the shader too would
+    // double-encode. See pbr.frag / skybox.frag (ubo.cameraPos.w flag).
+    bool swapchainIsSrgb_ = false;
+
     // ── Render targets (internal; blitted to the swapchain viewport) ─────
     VkFormat colorFormat_ = VK_FORMAT_R8G8B8A8_UNORM;
     VkFormat depthFormat_ = VK_FORMAT_D32_SFLOAT;

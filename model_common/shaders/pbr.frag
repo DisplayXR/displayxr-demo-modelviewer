@@ -61,6 +61,14 @@ vec3 F_Schlick(float cosT, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
 vec3 srgbToLinear(vec3 c) { return pow(c, vec3(2.2)); }
+// Inverse sRGB EOTF (accurate piecewise), for encoding the final linear color
+// into a UNORM swapchain. Gated by ubo.cameraPos.w (1 = encode, 0 = skip).
+vec3 linearToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, vec3(lessThan(c, vec3(0.0031308))));
+}
 // Fresnel with a roughness-aware ceiling (for ambient specular).
 vec3 F_SchlickRoughness(float cosT, vec3 f0, float rough) {
     return f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
@@ -139,5 +147,6 @@ void main() {
     vec3 ambient = (diffuseIBL + specularIBL) * ao;
 
     vec3 color = direct + ambient + emissive;
+    if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);
     outColor = vec4(color, baseSample.a * pc.baseColorFactor.a);
 }

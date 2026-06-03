@@ -1278,11 +1278,12 @@ static void RenderThreadFunc(
                                         if (stem.empty()) stem = "scene";
                                         std::string outPath = dxr_capture::MakeCapturePath(
                                             stem, cols, rows);
-                                        // The model viewer writes the swapchain via a
-                                        // render-pass + blit, which hardware-encodes correct
-                                        // sRGB bytes on store (unlike GS's compute imageStore,
-                                        // which writes linear bytes). So the read-back bytes
-                                        // are already correctly encoded — do NOT re-decode.
+                                        // Swapchain is UNORM and the shader already
+                                        // gamma-encodes (see pbr.frag), so the read-back bytes
+                                        // are display-ready sRGB. This flag only matters for an
+                                        // sRGB-format swapchain (it isn't one here); kept for
+                                        // the GS-style compute path. The UNORM branch in the
+                                        // helper copies bytes through unchanged.
                                         bool ok = dxr_capture::CaptureAtlasRegionVk(
                                             vkDevice, physDevice,
                                             graphicsQueue, renderCmdPool,
@@ -1290,7 +1291,7 @@ static void RenderThreadFunc(
                                             (int)colorFormat,
                                             xr->swapchain.width, xr->swapchain.height,
                                             0, 0, atlasW, atlasH, outPath,
-                                            /*linearBytesInSrgbImage=*/false);
+                                            /*linearBytesInSrgbImage=*/true);
                                         if (ok) {
                                             LOG_INFO("Captured %ux%u (%ux%u tiles) -> %s",
                                                      atlasW, atlasH, cols, rows, outPath.c_str());

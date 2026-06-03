@@ -22,11 +22,22 @@ layout(set = 2, binding = 1) uniform samplerCube prefilteredMap;
 
 layout(location = 0) out vec4 outColor;
 
+// Inverse sRGB EOTF (accurate piecewise). Must match pbr.frag so the sky and
+// the model encode identically. Gated by ubo.cameraPos.w (1 = encode, 0 = skip).
+vec3 linearToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, vec3(lessThan(c, vec3(0.0031308))));
+}
+
 void main() {
     vec4 farp = ubo.invViewProj * vec4(inUV, 1.0, 1.0);
     vec3 world = farp.xyz / farp.w;
     vec3 dir = normalize(world - ubo.cameraPos.xyz);
     // Blur the background: sample well up the roughness-mip chain.
     float lod = float(textureQueryLevels(prefilteredMap) - 1) * 0.6;
-    outColor = vec4(textureLod(prefilteredMap, dir, lod).rgb, 1.0);
+    vec3 color = textureLod(prefilteredMap, dir, lod).rgb;
+    if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);
+    outColor = vec4(color, 1.0);
 }

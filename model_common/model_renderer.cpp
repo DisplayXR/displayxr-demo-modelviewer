@@ -1002,7 +1002,10 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.cameraPos[0] = -(vmFlipped[0] * tx + vmFlipped[1] * ty + vmFlipped[2] * tz);
     ub.cameraPos[1] = -(vmFlipped[4] * tx + vmFlipped[5] * ty + vmFlipped[6] * tz);
     ub.cameraPos[2] = -(vmFlipped[8] * tx + vmFlipped[9] * ty + vmFlipped[10] * tz);
-    ub.cameraPos[3] = 1.0f;
+    // .w = shader gamma-encode flag: encode linear→sRGB at output for a UNORM
+    // swapchain (the DisplayXR compositor decodes it for presentation); skip for
+    // an sRGB swapchain, whose blit already encodes. Repurposes an unused slot.
+    ub.cameraPos[3] = swapchainIsSrgb_ ? 0.0f : 1.0f;
 
     // Fixed key light (world space), normalized.
     float lx = 0.4f, ly = 0.8f, lz = 0.5f;
@@ -1429,7 +1432,7 @@ void ModelRenderer::recomputeAnimatedBounds(const std::vector<ModelVertex>& vert
 }
 
 void ModelRenderer::renderEye(VkImage swapchainImage,
-                              VkFormat /*swapchainFormat*/,
+                              VkFormat swapchainFormat,
                               uint32_t imageWidth,
                               uint32_t imageHeight,
                               uint32_t viewportX,
@@ -1449,6 +1452,12 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     if (imageWidth != width_ || imageHeight != height_) {
         if (!ensureTargets(imageWidth, imageHeight)) return;
     }
+
+    // An sRGB swapchain gets the linear→sRGB encode for free from the blit's HW
+    // write; a UNORM swapchain needs the shader to encode (see updateUniforms).
+    swapchainIsSrgb_ = (swapchainFormat == VK_FORMAT_R8G8B8A8_SRGB ||
+                        swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB ||
+                        swapchainFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
 
     updateUniforms(viewMatrix, projMatrix, clipFarViewSpace);
 

@@ -139,20 +139,13 @@ bool CreateSwapchain(XrSessionManager& xr) {
         LOG_DEBUG("  Format[%u]: %lld (0x%llX)", i, formats[i], formats[i]);
     }
 
-    // Prefer an sRGB swapchain so the internal-image→swapchain blit
-    // hardware-encodes linear→sRGB on write (the internal target is linear
-    // UNORM and the shaders output linear). Without this the linear bytes reach
-    // the display's sRGB EOTF and midtones/darks crush. Mirrors the macOS path
-    // (macos/main.mm). Fall back to a UNORM variant, then formats[0].
-    // VkFormat values inline (this TU is graphics-API-agnostic — no <vulkan.h>):
-    //   37=R8G8B8A8_UNORM  43=R8G8B8A8_SRGB  44=B8G8R8A8_UNORM  50=B8G8R8A8_SRGB
-    constexpr int64_t kR8G8B8A8_UNORM = 37, kR8G8B8A8_SRGB = 43;
-    constexpr int64_t kB8G8R8A8_UNORM = 44, kB8G8R8A8_SRGB = 50;
+    // Use runtime's preferred format (first in the list per OpenXR spec). The
+    // DisplayXR Windows compositor applies its own srgbToLinear to the swapchain
+    // for presentation, and an sRGB *format* swapchain would additionally decode
+    // on the compositor's HW sample — cancelling any encode. So we keep the
+    // runtime's UNORM format and gamma-encode in the shader instead (see
+    // model_renderer / pbr.frag: encode gated on a non-sRGB swapchain).
     int64_t selectedFormat = formats[0];
-    for (int64_t f : formats) {
-        if (f == kB8G8R8A8_SRGB || f == kR8G8B8A8_SRGB) { selectedFormat = f; break; }
-        if (f == kB8G8R8A8_UNORM || f == kR8G8B8A8_UNORM) selectedFormat = f;
-    }
     LOG_INFO("Selected swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
 
     const auto& view = xr.configViews[0];
