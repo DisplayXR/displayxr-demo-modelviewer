@@ -26,6 +26,7 @@
 #include "xr_session.h"
 #include "model_renderer.h"
 #include "display3d_view.h"
+#include "projection_depth.h"
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
@@ -1059,7 +1060,12 @@ static void RenderThreadFunc(
                             display3d_compute_views(
                                 rawEyes, (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &displayPose,
-                                near_offset, far_offset, stereoViews);
+                                near_offset, far_offset, /*vulkan_flip_y=*/0, stereoViews);
+                            // displayxr::math emits a GL ([-1,1] clip-z) projection; this is a
+                            // Vulkan renderer, so remap each per-view projection to [0,1]
+                            // (reproduces modelviewer's prior direct-[0,1] output). [#396 W3]
+                            for (uint32_t _v = 0; _v < (uint32_t)eyeCount; _v++)
+                                convert_projection_gl_to_zero_to_one(stereoViews[_v].projection_matrix);
                         }
 
                         // Double-click focus: center-eye ray through mouse, pick splat,
