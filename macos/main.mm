@@ -52,6 +52,7 @@
 #include "view_params.h"
 #include "display3d_view.h"
 #include "camera3d_view.h"
+#include "projection_depth.h"
 #include "model_renderer.h"
 #include "atlas_capture.h"
 
@@ -1861,7 +1862,12 @@ int main() {
                             display3d_compute_views(
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                near_offset, far_offset, eyeViews.data());
+                                near_offset, far_offset, /*vulkan_flip_y=*/0, eyeViews.data());
+                            // displayxr::math emits a GL ([-1,1] clip-z) projection; this is a
+                            // Vulkan renderer, so remap each per-view projection to [0,1]
+                            // (reproduces modelviewer's prior direct-[0,1] output). [#396 W3]
+                            for (uint32_t _v = 0; _v < (uint32_t)eyeCount; _v++)
+                                convert_projection_gl_to_zero_to_one(eyeViews[_v].projection_matrix);
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
