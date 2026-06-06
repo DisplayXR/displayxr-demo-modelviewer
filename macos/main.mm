@@ -30,6 +30,7 @@
 #include <openxr/XR_EXT_cocoa_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_atlas_capture.h>
+#include <openxr/XR_EXT_mcp_tools.h>
 
 #include <cmath>
 #include <csignal>
@@ -277,6 +278,7 @@ static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
 struct AppXrSession;
 static void UpdateTopBarButtonTitles(AppXrSession& xr);
 static void ApplyAutoFitForLoadedScene();
+static void UpdateMcpAnimationTools();
 
 // ============================================================================
 // Input timestamp helper
@@ -922,6 +924,18 @@ struct AppXrSession {
     bool hasAtlasCaptureExt = false;
     PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
 
+    // XR_EXT_mcp_tools (#22): app-defined agent tools on the runtime-hosted
+    // per-process MCP server. The whole path is inert when the extension or
+    // the MCP capability gate is absent — never load-bearing.
+    bool hasMcpToolsExt = false;
+    PFN_xrSetMCPAppInfoEXT pfnSetMCPAppInfo = nullptr;
+    PFN_xrRegisterMCPToolEXT pfnRegisterMCPTool = nullptr;
+    PFN_xrUnregisterMCPToolEXT pfnUnregisterMCPTool = nullptr;
+    PFN_xrGetMCPToolCallArgsEXT pfnGetMCPToolCallArgs = nullptr;
+    PFN_xrSubmitMCPToolResultEXT pfnSubmitMCPToolResult = nullptr;
+    bool mcpToolsReady = false;           // appId declared + base tools registered
+    bool mcpAnimToolsRegistered = false;  // list/play/stop_animation currently live
+
     // Enumerated rendering mode info
     uint32_t renderingModeCount = 0;
     char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
@@ -940,6 +954,11 @@ struct AppXrSession {
 
     void* windowHandle = nullptr;  // unused on macOS, kept for compatibility
 };
+
+// Session reachable from the model-load paths (they all funnel through
+// ApplyAutoFitForLoadedScene, which is xr-free) so they can flip the
+// animation-tool registration. Set in main() right after CreateSession.
+static AppXrSession* g_xrForMcp = nullptr;
 
 static void UpdateTopBarButtonTitles(AppXrSession& xr) {
     if (g_modeButton) {
@@ -964,6 +983,62 @@ static void UpdateAnimButton() {
         [g_animButton setTitle:playing ? [NSString stringWithUTF8String:clip.c_str()] : @"Paused"];
     } else {
         [g_animButtonBackdrop setHidden:YES];
+    }
+}
+
+// ★ XR_EXT_mcp_tools late registration (#22): the animation tools exist only
+// while a model with clips is loaded; they are unregistered when the model is
+// replaced by one without. Each transition makes the runtime broadcast the MCP
+// tools/list_changed notification, so agents connected BEFORE a load see the
+// tools appear/disappear live. Called from every successful load path (they
+// all funnel through ApplyAutoFitForLoadedScene).
+static void UpdateMcpAnimationTools() {
+    AppXrSession* xr = g_xrForMcp;
+    if (!xr || !xr->mcpToolsReady || !xr->pfnRegisterMCPTool || !xr->pfnUnregisterMCPTool)
+        return;
+    const bool want = g_modelRenderer.hasAnimations();
+    if (want == xr->mcpAnimToolsRegistered) return;
+
+    if (want) {
+        XrMCPToolInfoEXT listTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+        listTool.name = "list_animations";
+        listTool.description =
+            "List the loaded model's animation clips: index, name and duration in "
+            "seconds, plus the active clip index and whether playback is running. "
+            "Only available while a model with animation clips is loaded.";
+        listTool.inputSchemaJson = "{\"type\":\"object\"}";
+        XrResult r1 = xr->pfnRegisterMCPTool(xr->session, &listTool);
+
+        XrMCPToolInfoEXT playTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+        playTool.name = "play_animation";
+        playTool.description =
+            "Play an animation clip, selected by 'index' or 'name' (see "
+            "list_animations). Omit both to resume the active clip. Selecting a "
+            "different clip restarts it from t=0. Returns the now-playing clip; "
+            "verify visually with capture_frame.";
+        playTool.inputSchemaJson =
+            "{\"type\":\"object\",\"properties\":{"
+            "\"index\":{\"type\":\"integer\",\"description\":\"Clip index from list_animations.\"},"
+            "\"name\":{\"type\":\"string\",\"description\":\"Clip name from list_animations.\"}}}";
+        XrResult r2 = xr->pfnRegisterMCPTool(xr->session, &playTool);
+
+        XrMCPToolInfoEXT stopTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+        stopTool.name = "stop_animation";
+        stopTool.description =
+            "Pause animation playback, freezing the model at its current pose. "
+            "Resume with play_animation.";
+        stopTool.inputSchemaJson = "{\"type\":\"object\"}";
+        XrResult r3 = xr->pfnRegisterMCPTool(xr->session, &stopTool);
+
+        xr->mcpAnimToolsRegistered = XR_SUCCEEDED(r1) || XR_SUCCEEDED(r2) || XR_SUCCEEDED(r3);
+        LOG_INFO("XR_EXT_mcp_tools: animation tools registered (%d clip(s)) [%d %d %d]",
+                 g_modelRenderer.animationCount(), r1, r2, r3);
+    } else {
+        xr->pfnUnregisterMCPTool(xr->session, "list_animations");
+        xr->pfnUnregisterMCPTool(xr->session, "play_animation");
+        xr->pfnUnregisterMCPTool(xr->session, "stop_animation");
+        xr->mcpAnimToolsRegistered = false;
+        LOG_INFO("XR_EXT_mcp_tools: animation tools unregistered (model has no clips)");
     }
 }
 
@@ -1005,6 +1080,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasCocoaWindowBinding = true;
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
+        if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
@@ -1014,6 +1090,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasCocoaWindowBinding) enabled.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasAtlasCaptureExt) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+    if (xr.hasMcpToolsExt) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -1062,6 +1139,22 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasAtlasCaptureExt) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT", (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
         LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+    }
+
+    // XR_EXT_mcp_tools (#22): resolve the agent-tool entry points. Tools are
+    // registered after session create (CreateSession) and dispatched from
+    // PollEvents.
+    if (xr.hasMcpToolsExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoEXT", (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfo);
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolEXT", (PFN_xrVoidFunction*)&xr.pfnRegisterMCPTool);
+        xrGetInstanceProcAddr(xr.instance, "xrUnregisterMCPToolEXT", (PFN_xrVoidFunction*)&xr.pfnUnregisterMCPTool);
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsEXT", (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgs);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultEXT", (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResult);
+        const bool resolved = xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool &&
+            xr.pfnUnregisterMCPTool && xr.pfnGetMCPToolCallArgs && xr.pfnSubmitMCPToolResult;
+        LOG_INFO("XR_EXT_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
+    } else {
+        LOG_INFO("XR_EXT_mcp_tools: not advertised by runtime");
     }
 
     LOG_INFO("OpenXR initialized: %s", xr.systemName);
@@ -1192,6 +1285,78 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     si.next = &vkBinding; si.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
 
+    // XR_EXT_mcp_tools (#22): declare identity + register the base agent
+    // tools. The appId MUST match `id` in
+    // displayxr/model_viewer_handle_vk_macos.displayxr.json (INV-10.1).
+    // Failure is non-fatal by design — the MCP capability gate may simply be
+    // off on this machine; the viewer runs identically without an agent
+    // surface. The animation tools are NOT registered here: they appear only
+    // once a model with clips loads (UpdateMcpAnimationTools).
+    if (xr.hasMcpToolsExt && xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool) {
+        XrMCPAppInfoEXT mcpAppInfo = {XR_TYPE_MCP_APP_INFO_EXT};
+        strncpy(mcpAppInfo.appId, "modelviewer", sizeof(mcpAppInfo.appId) - 1);
+        XrResult ar = xr.pfnSetMCPAppInfo(xr.session, &mcpAppInfo);
+        if (XR_SUCCEEDED(ar)) {
+            XrMCPToolInfoEXT loadTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            loadTool.name = "load_model";
+            loadTool.description =
+                "Load a 3D model file into the viewer, replacing the current model. "
+                "Supported formats: glTF (.glb/.gltf), STL, OBJ, FBX, USD "
+                "(.usdz/.usd/.usda/.usdc). The path must be absolute and readable by "
+                "the viewer process. On success the camera re-frames the model "
+                "automatically, and the animation tools (list_animations / "
+                "play_animation / stop_animation) appear or disappear depending on "
+                "whether the new model has animation clips.";
+            loadTool.inputSchemaJson =
+                "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
+                "\"description\":\"Absolute filesystem path of the model file to load.\"}},"
+                "\"required\":[\"path\"]}";
+            XrResult t1 = xr.pfnRegisterMCPTool(xr.session, &loadTool);
+
+            XrMCPToolInfoEXT statusTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            statusTool.name = "get_status";
+            statusTool.description =
+                "Read the viewer's live state: loaded model file and primitive count, "
+                "animation clip count + active clip + playing flag, camera orbit "
+                "(azimuth/elevation in degrees, world position, zoom factor), active "
+                "rendering-mode index, and whether the XR session is running.";
+            statusTool.inputSchemaJson = "{\"type\":\"object\"}";
+            XrResult t2 = xr.pfnRegisterMCPTool(xr.session, &statusTool);
+
+            XrMCPToolInfoEXT orbitTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            orbitTool.name = "set_orbit";
+            orbitTool.description =
+                "Orbit the camera around the model. azimuth_deg rotates around the "
+                "vertical axis (0 = the model's authored front, increasing turns the "
+                "model to the right), elevation_deg tilts the view up/down (clamped to "
+                "±85), zoom scales the model on screen (>1 = larger, clamped 0.1–10, "
+                "default 1). All fields are optional; omitted ones keep their current "
+                "value. Also resets the idle auto-orbit timer, like any user input. "
+                "Verify the result visually with capture_frame.";
+            orbitTool.inputSchemaJson =
+                "{\"type\":\"object\",\"properties\":{"
+                "\"azimuth_deg\":{\"type\":\"number\",\"description\":\"Orbit angle around the vertical axis, degrees.\"},"
+                "\"elevation_deg\":{\"type\":\"number\",\"description\":\"Tilt above (+) / below (−) the horizon, degrees, clamped to ±85.\"},"
+                "\"zoom\":{\"type\":\"number\",\"description\":\"View scale factor, 0.1–10; 1 = the auto-fit framing.\"}}}";
+            XrResult t3 = xr.pfnRegisterMCPTool(xr.session, &orbitTool);
+
+            XrMCPToolInfoEXT frameTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            frameTool.name = "frame_model";
+            frameTool.description =
+                "Reset the camera to the loaded model's auto-fit framed pose (same as "
+                "pressing Space): centers the model with comfortable headroom and "
+                "restores zoom to 1. Requires a model to be loaded.";
+            frameTool.inputSchemaJson = "{\"type\":\"object\"}";
+            XrResult t4 = xr.pfnRegisterMCPTool(xr.session, &frameTool);
+
+            xr.mcpToolsReady = true;
+            LOG_INFO("XR_EXT_mcp_tools: appId=modelviewer load_model=%d get_status=%d "
+                     "set_orbit=%d frame_model=%d", t1, t2, t3, t4);
+        } else {
+            LOG_INFO("XR_EXT_mcp_tools: appId not accepted (%d) — no agent surface", ar);
+        }
+    }
+
     // Enumerate available rendering modes and store names
     if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
         uint32_t modeCount = 0;
@@ -1305,6 +1470,294 @@ static bool CreateSwapchains(AppXrSession& xr) {
     return true;
 }
 
+// ============================================================================
+// XR_EXT_mcp_tools dispatch (#22)
+// ============================================================================
+// Minimal JSON helpers — hand-rolled on purpose, matching the runtime
+// reference adopter (cube_handle_metal_macos): tool args are tiny one-level
+// objects, so a JSON dependency isn't warranted.
+
+static std::string JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Extract "key":"value" (string) with backslash-escape handling, incl. a
+// basic \uXXXX → UTF-8 decode (no surrogate pairs — file paths don't need
+// them). False when the key is absent or its value is not a string.
+static bool JsonGetString(const char* json, const char* key, std::string& out) {
+    std::string pat = "\"" + std::string(key) + "\"";
+    const char* k = strstr(json, pat.c_str());
+    if (!k) return false;
+    const char* c = strchr(k + pat.size(), ':');
+    if (!c) return false;
+    c++;
+    while (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r') c++;
+    if (*c != '"') return false;
+    c++;
+    out.clear();
+    while (*c && *c != '"') {
+        if (*c == '\\' && c[1]) {
+            c++;
+            switch (*c) {
+                case 'n': out += '\n'; break;
+                case 't': out += '\t'; break;
+                case 'r': out += '\r'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'u': {
+                    unsigned cp = 0;
+                    int ndig = 0;
+                    while (ndig < 4 && c[1]) {
+                        char h = c[1];
+                        unsigned v;
+                        if (h >= '0' && h <= '9') v = (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') v = (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') v = (unsigned)(h - 'A' + 10);
+                        else break;
+                        cp = (cp << 4) | v;
+                        c++;
+                        ndig++;
+                    }
+                    if (cp < 0x80) out += (char)cp;
+                    else if (cp < 0x800) {
+                        out += (char)(0xC0 | (cp >> 6));
+                        out += (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out += (char)(0xE0 | (cp >> 12));
+                        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out += (char)(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default: out += *c; break;  // \" \\ \/
+            }
+        } else {
+            out += *c;
+        }
+        c++;
+    }
+    return *c == '"';
+}
+
+// Extract "key": <number>. False when absent or not numeric (strtod refuses
+// a leading quote, so string values correctly fail).
+static bool JsonGetNumber(const char* json, const char* key, double& out) {
+    std::string pat = "\"" + std::string(key) + "\"";
+    const char* k = strstr(json, pat.c_str());
+    if (!k) return false;
+    const char* c = strchr(k + pat.size(), ':');
+    if (!c) return false;
+    char* end = nullptr;
+    double v = strtod(c + 1, &end);
+    if (end == c + 1) return false;
+    out = v;
+    return true;
+}
+
+// Dispatch one agent tool call. Runs on the main loop (called from
+// PollEvents), where app state is naturally consistent — no locking. EVERY
+// call is answered — success=XR_FALSE + {"error":…} for bad args — because an
+// unanswered call only fails to the agent after the runtime's ~5 s timeout.
+static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallEXT* call) {
+    // Two-call idiom: argsSize from the event is the required capacity incl. NUL.
+    std::string args;
+    if (xr.pfnGetMCPToolCallArgs && call->argsSize > 0) {
+        std::vector<char> buf(call->argsSize, '\0');
+        uint32_t needed = 0;
+        if (XR_SUCCEEDED(xr.pfnGetMCPToolCallArgs(xr.session, call->callId,
+                                                  (uint32_t)buf.size(), &needed, buf.data())))
+            args.assign(buf.data());
+    }
+    const char* a = args.c_str();
+    std::string result;
+    XrBool32 ok = XR_TRUE;
+    char buf[1024];
+
+    if (strcmp(call->toolName, "load_model") == 0) {
+        std::string path;
+        if (!JsonGetString(a, "path", path) || path.empty()) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"missing required string argument 'path'\"}";
+        } else if (!model_validate_file(path)) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"not a readable supported model file: " +
+                     JsonEscape(path) + "\"}";
+        } else if (!g_modelRenderer.loadModel(path.c_str())) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"failed to load (corrupt or unsupported): " +
+                     JsonEscape(path) + "\"}";
+        } else {
+            g_loadedFileName = model_basename(path);
+            LOG_INFO("Model loaded via MCP: %s (%s)", g_loadedFileName.c_str(),
+                     model_filesize_str(path).c_str());
+            // Re-frames the camera, refreshes the clip button, and registers/
+            // unregisters the agent animation tools for the new model.
+            ApplyAutoFitForLoadedScene();
+            snprintf(buf, sizeof(buf),
+                     "{\"file\":\"%s\",\"primitives\":%u,\"animation_count\":%d}",
+                     JsonEscape(g_loadedFileName).c_str(),
+                     g_modelRenderer.primitiveCount(), g_modelRenderer.animationCount());
+            result = buf;
+        }
+    } else if (strcmp(call->toolName, "get_status") == 0) {
+        std::string clip; int ci = -1, cn = 0; float ct = 0, cd = 0; bool playing = false;
+        const bool hasClip = g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing);
+        const float azDeg = fmodf(g_input.yaw * 57.29578f, 360.0f);
+        const float elDeg = g_input.pitch * 57.29578f;
+        std::string clipJson = hasClip ? "\"" + JsonEscape(clip) + "\"" : "null";
+        snprintf(buf, sizeof(buf),
+                 "{\"file\":\"%s\",\"loaded\":%s,\"primitives\":%u,"
+                 "\"animation_count\":%d,\"active_animation\":%d,"
+                 "\"active_animation_name\":%s,\"animation_playing\":%s,"
+                 "\"camera\":{\"azimuth_deg\":%.1f,\"elevation_deg\":%.1f,"
+                 "\"position\":[%.3f,%.3f,%.3f],\"zoom\":%.2f},"
+                 "\"rendering_mode\":%u,\"session_running\":%s}",
+                 JsonEscape(g_loadedFileName).c_str(),
+                 g_modelRenderer.hasModel() ? "true" : "false",
+                 g_modelRenderer.primitiveCount(),
+                 g_modelRenderer.animationCount(),
+                 hasClip ? ci : -1, clipJson.c_str(),
+                 (hasClip && playing) ? "true" : "false",
+                 azDeg, elDeg,
+                 g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
+                 g_input.viewParams.scaleFactor,
+                 g_input.currentRenderingMode,
+                 xr.sessionRunning ? "true" : "false");
+        result = buf;
+    } else if (strcmp(call->toolName, "set_orbit") == 0) {
+        double az, el, zm;
+        bool any = false;
+        if (JsonGetNumber(a, "azimuth_deg", az)) {
+            g_input.yaw = (float)(az * 0.0174532925);
+            any = true;
+        }
+        if (JsonGetNumber(a, "elevation_deg", el)) {
+            if (el > 85.0) el = 85.0;
+            if (el < -85.0) el = -85.0;
+            g_input.pitch = (float)(el * 0.0174532925);
+            any = true;
+        }
+        if (JsonGetNumber(a, "zoom", zm)) {
+            if (zm < 0.1) zm = 0.1;
+            if (zm > 10.0) zm = 10.0;
+            g_input.viewParams.scaleFactor = (float)zm;
+            any = true;
+        }
+        if (!any) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"provide at least one of azimuth_deg, elevation_deg, zoom\"}";
+        } else {
+            MarkUserInput(g_input);  // agent input is input: reset the auto-orbit idle timer
+            snprintf(buf, sizeof(buf),
+                     "{\"azimuth_deg\":%.1f,\"elevation_deg\":%.1f,\"zoom\":%.2f}",
+                     g_input.yaw * 57.29578f, g_input.pitch * 57.29578f,
+                     g_input.viewParams.scaleFactor);
+            result = buf;
+        }
+    } else if (strcmp(call->toolName, "frame_model") == 0) {
+        if (!g_modelRenderer.hasModel()) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"no model loaded — call load_model first\"}";
+        } else {
+            g_input.resetViewRequested = true;  // applied by UpdateCameraMovement next frame
+            result = "{\"framed\":true}";
+        }
+    } else if (strcmp(call->toolName, "list_animations") == 0) {
+        const int n = g_modelRenderer.animationCount();
+        std::string clips = "[";
+        for (int i = 0; i < n; i++) {
+            std::string nm; float dur = 0;
+            g_modelRenderer.getAnimationInfo(i, nm, dur);
+            snprintf(buf, sizeof(buf), "%s{\"index\":%d,\"name\":\"%s\",\"duration_s\":%.2f}",
+                     i ? "," : "", i, JsonEscape(nm).c_str(), dur);
+            clips += buf;
+        }
+        clips += "]";
+        snprintf(buf, sizeof(buf), ",\"active_index\":%d,\"playing\":%s}",
+                 g_modelRenderer.activeAnimation(),
+                 (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) ? "true" : "false");
+        result = "{\"animations\":" + clips + buf;
+    } else if (strcmp(call->toolName, "play_animation") == 0) {
+        const int n = g_modelRenderer.animationCount();
+        int target = -1;
+        double idx; std::string nm;
+        if (JsonGetNumber(a, "index", idx)) {
+            target = (int)idx;
+            if (target < 0 || target >= n) {
+                ok = XR_FALSE;
+                snprintf(buf, sizeof(buf), "{\"error\":\"index out of range (0..%d)\"}", n - 1);
+                result = buf;
+            }
+        } else if (JsonGetString(a, "name", nm)) {
+            for (int i = 0; i < n && target < 0; i++) {
+                std::string c; float d;
+                g_modelRenderer.getAnimationInfo(i, c, d);
+                if (c == nm) target = i;
+            }
+            if (target < 0) {
+                ok = XR_FALSE;
+                result = "{\"error\":\"no clip named '" + JsonEscape(nm) +
+                         "' — see list_animations\"}";
+            }
+        } else {
+            target = g_modelRenderer.activeAnimation();  // resume the active clip
+            if (target < 0) target = 0;
+        }
+        if (ok == XR_TRUE) {
+            if (n == 0) {
+                ok = XR_FALSE;
+                result = "{\"error\":\"the loaded model has no animation clips\"}";
+            } else {
+                if (target != g_modelRenderer.activeAnimation())
+                    g_modelRenderer.setActiveAnimation(target);
+                g_modelRenderer.setPaused(false);
+                UpdateAnimButton();
+                std::string c; float d = 0;
+                g_modelRenderer.getAnimationInfo(target, c, d);
+                snprintf(buf, sizeof(buf),
+                         "{\"playing\":\"%s\",\"index\":%d,\"duration_s\":%.2f}",
+                         JsonEscape(c).c_str(), target, d);
+                result = buf;
+            }
+        }
+    } else if (strcmp(call->toolName, "stop_animation") == 0) {
+        g_modelRenderer.setPaused(true);
+        UpdateAnimButton();
+        std::string c; float d = 0;
+        const int active = g_modelRenderer.activeAnimation();
+        if (active >= 0) g_modelRenderer.getAnimationInfo(active, c, d);
+        snprintf(buf, sizeof(buf), "{\"playing\":false,\"paused_clip\":%s%s%s}",
+                 active >= 0 ? "\"" : "", active >= 0 ? JsonEscape(c).c_str() : "null",
+                 active >= 0 ? "\"" : "");
+        result = buf;
+    } else {
+        ok = XR_FALSE;
+        result = "{\"error\":\"unhandled tool\"}";
+    }
+
+    if (xr.pfnSubmitMCPToolResult)
+        xr.pfnSubmitMCPToolResult(xr.session, call->callId, ok, result.c_str());
+}
+
 static void PollEvents(AppXrSession& xr) {
     XrEventDataBuffer event = {};
     event.type = XR_TYPE_EVENT_DATA_BUFFER;
@@ -1333,6 +1786,9 @@ static void PollEvents(AppXrSession& xr) {
                     rmc->previousModeIndex, rmc->currentModeIndex,
                     xr.renderingModeNames[rmc->currentModeIndex]);
             }
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT) {
+            // An agent invoked one of our XR_EXT_mcp_tools tools (#22).
+            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallEXT*)&event);
         }
         event.type = XR_TYPE_EVENT_DATA_BUFFER;
     }
@@ -1447,7 +1903,8 @@ static bool FileExists(const std::string& p) {
 // authored +Z, which glTF places facing the viewer; the user can rotate
 // with mouse drag from a predictable starting pose.
 static void ApplyAutoFitForLoadedScene() {
-    UpdateAnimButton();   // show/hide + label the clip button for the new model
+    UpdateAnimButton();        // show/hide + label the clip button for the new model
+    UpdateMcpAnimationTools(); // (un)register the agent animation tools (#22)
     float center[3], extent[3];
     // Robust AABB (5th–95th percentile per axis): center for the rig position,
     // extent[1] for the height fit. Percentile trim rejects stray outlier
@@ -1587,6 +2044,11 @@ int main() {
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
         vkDestroyDevice(vkDevice, nullptr); vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr); return 1; }
+
+    // Model-load paths can now flip the agent animation-tool registration
+    // (XR_EXT_mcp_tools late registration, #22). Set before the bundled-scene
+    // auto-load below so it too funnels through UpdateMcpAnimationTools.
+    g_xrForMcp = &xr;
 
     if (!CreateSpaces(xr) || !CreateSwapchains(xr)) {
         CleanupOpenXR(xr); vkDestroyDevice(vkDevice, nullptr);
@@ -2152,6 +2614,7 @@ int main() {
     }
 
     LOG_INFO("=== Shutting down ===");
+    g_xrForMcp = nullptr;  // session is going away; stop touching MCP tools
     g_modelRenderer.cleanup();
     if (cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, cmdPool, nullptr);
     CleanupOpenXR(xr);
