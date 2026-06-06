@@ -57,6 +57,19 @@ struct ModelRenderer {
     // clips. name = clip name, or "Clip <i>" when the glTF clip is unnamed.
     bool getPlaybackInfo(std::string& name, int& index, int& count,
                          float& time, float& duration, bool& playing) const;
+    // ── Agent-facing read/seek accessors (XR_EXT_mcp_tools adoption). ───────
+    int  animationCount() const { return (int)animations_.size(); }
+    int  activeAnimation() const { return activeAnim_; }
+    void setPaused(bool p) { paused_ = p; }
+    // Clip name + duration by index; the name falls back to "Clip <i>" exactly
+    // like getPlaybackInfo so list_animations and the HUD agree.
+    bool getAnimationInfo(int index, std::string& name, float& duration) const {
+        if (index < 0 || index >= (int)animations_.size()) return false;
+        name = animations_[index].name.empty()
+            ? ("Clip " + std::to_string(index)) : animations_[index].name;
+        duration = animations_[index].duration;
+        return true;
+    }
 
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
     bool getRobustSceneBounds(float loPct, float hiPct,
