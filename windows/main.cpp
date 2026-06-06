@@ -105,6 +105,13 @@ static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
 
 // Global state
 static InputState g_inputState;
+// Standalone demo: bare TAB toggles the HUD (displayxr::common defaults to
+// SHIFT+TAB so runtime test apps don't shadow the workspace shell's
+// focus-cycle binding).
+static const bool g_inputInit = [] {
+    g_inputState.hudToggleRequiresShift = false;
+    return true;
+}();
 static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
@@ -140,7 +147,11 @@ static std::atomic<bool> g_hasAnimations{false};
 
 // Animation-button window-space layer resources: created in main() (when the
 // HUD swapchain — i.e. window-space layers — is available), used by the render
-// thread. The swapchain itself lives in xr.animBtnSwapchain.
+// thread. The swapchain is app-owned state (displayxr::common's
+// XrSessionManager carries no app-named fields, #396 W4) — created via the
+// lib's CreateWindowSpaceSwapchain generic, destroyed before CleanupOpenXR.
+static SwapchainInfo  g_animBtnSwapchain;                // app-owned window-space swapchain
+static bool           g_hasAnimBtnSwapchain = false;
 static HudRenderer    g_animBtnHud = {};                 // own D3D11 text renderer (256×80)
 static bool           g_animBtnReady = false;            // all resources created
 static VkBuffer       g_animBtnStaging = VK_NULL_HANDLE;
@@ -1504,7 +1515,7 @@ static void RenderThreadFunc(
                 //    to a bar — see runtime issue #389. ──
                 XrCompositionLayerWindowSpaceEXT barLayer = {};
                 bool barLayerReady = false;
-                if (g_animBtnReady && xr->hasAnimBtnSwapchain) {
+                if (g_animBtnReady && g_hasAnimBtnSwapchain) {
                     const float mxf = (g_windowWidth > 0)
                         ? (float)inputSnapshot.mouseX / (float)g_windowWidth : 0.0f;
                     const float myf = (g_windowHeight > 0)
@@ -1560,7 +1571,7 @@ static void RenderThreadFunc(
                         L"", L"", L"", L"", L"", L"", L"", L"",
                         barButtons, /*drawBody=*/false, /*bodyAtBottom=*/true);
                     uint32_t idx = 0;
-                    if (px && AcquireWindowSpaceImage(xr->animBtnSwapchain, idx)) {
+                    if (px && AcquireWindowSpaceImage(g_animBtnSwapchain, idx)) {
                         uint8_t* dst = (uint8_t*)g_animBtnStagingMapped;
                         for (uint32_t row = 0; row < BTN_BAR_TEX_H; ++row)
                             memcpy(dst + row * BTN_BAR_TEX_W * 4,
@@ -1606,11 +1617,11 @@ static void RenderThreadFunc(
                         vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
                         vkQueueWaitIdle(graphicsQueue);
                         vkFreeCommandBuffers(vkDevice, g_animBtnCmdPool, 1, &cb);
-                        ReleaseWindowSpaceImage(xr->animBtnSwapchain);
+                        ReleaseWindowSpaceImage(g_animBtnSwapchain);
 
                         barLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
                         barLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                        barLayer.subImage.swapchain = xr->animBtnSwapchain.swapchain;
+                        barLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
                         barLayer.subImage.imageRect.offset = {0, 0};
                         barLayer.subImage.imageRect.extent = {(int32_t)BTN_BAR_TEX_W, (int32_t)BTN_BAR_TEX_H};
                         barLayer.subImage.imageArrayIndex = 0;
@@ -1635,10 +1646,15 @@ static void RenderThreadFunc(
                     // is gated by `submitHud = hudSubmitted`: when the panel is
                     // toggled off it was never rendered/acquired this frame, so we
                     // drop it entirely (true toggle, not a transparent layer).
+                    // SOURCE_ALPHA on the projection layer: displayxr::common
+                    // defaults projectionLayerFlags to 0, so pass the bit
+                    // explicitly (the vendored copy hardcoded it; required for
+                    // the Ctrl+T transparent-background path).
                     EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
                         barLayerReady ? &barLayer : nullptr, barLayerReady ? 1u : 0u,
-                        0, 0, -1, -1, /*submitHud=*/hudSubmitted);
+                        0, 0, -1, -1, /*submitHud=*/hudSubmitted,
+                        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
@@ -1949,15 +1965,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // ── Top button-bar window-space layer resources ──────────────────────────
     // Own swapchain + text renderer + staging + cmd pool for the full-width top
     // button bar (Open + Mode + Animation in one layer). Reuses the
-    // xr.animBtnSwapchain / g_animBtn* slots (named before the buttons were
+    // g_animBtnSwapchain / g_animBtn* slots (named before the buttons were
     // unified into a bar). Only when window-space layers are available.
     if (hudOk && xr.hasHudSwapchain) {
         if (InitializeHudRenderer(g_animBtnHud, BTN_BAR_TEX_W, BTN_BAR_TEX_H, BTN_BAR_FONT_BASE) &&
-            CreateWindowSpaceSwapchain(xr, xr.animBtnSwapchain, BTN_BAR_TEX_W, BTN_BAR_TEX_H)) {
-            xr.hasAnimBtnSwapchain = true;
-            uint32_t c = xr.animBtnSwapchain.imageCount;
+            CreateWindowSpaceSwapchain(xr, g_animBtnSwapchain, BTN_BAR_TEX_W, BTN_BAR_TEX_H)) {
+            g_hasAnimBtnSwapchain = true;
+            uint32_t c = g_animBtnSwapchain.imageCount;
             g_animBtnSwapImages.resize(c, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-            xrEnumerateSwapchainImages(xr.animBtnSwapchain.swapchain, c, &c,
+            xrEnumerateSwapchainImages(g_animBtnSwapchain.swapchain, c, &c,
                 (XrSwapchainImageBaseHeader*)g_animBtnSwapImages.data());
 
             VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -2060,6 +2076,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     if (g_animBtnStagingMem != VK_NULL_HANDLE) vkFreeMemory(vkDevice, g_animBtnStagingMem, nullptr);
     if (g_animBtnReady) CleanupHudRenderer(g_animBtnHud);
+
+    // App-owned animation-button swapchain: destroy before CleanupOpenXR tears
+    // the session down (used to live in the vendored XrSessionManager cleanup).
+    if (g_animBtnSwapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_animBtnSwapchain.swapchain);
+        g_animBtnSwapchain.swapchain = XR_NULL_HANDLE;
+        g_hasAnimBtnSwapchain = false;
+    }
 
     g_xr = nullptr;
     CleanupOpenXR(xr);
