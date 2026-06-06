@@ -46,10 +46,9 @@ endif()
 
 add_executable(model_viewer_handle_vk_macos
     main.mm
-    # stb_image (read) implementation. model_loader.cpp takes stb declarations
-    # only; on Windows the impl comes from common/d3d11_renderer.cpp, which is
-    # Windows-only — macOS supplies it through this dedicated TU instead.
-    ${CMAKE_SOURCE_DIR}/common/stb_image_impl_macos.cpp
+    # stb_image (read) implementation TU comes from displayxr::common
+    # (stb_image_impl_macos.cpp) — model_loader.cpp takes declarations only
+    # (#396 W4).
 )
 
 target_include_directories(model_viewer_handle_vk_macos PRIVATE
