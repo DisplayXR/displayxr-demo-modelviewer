@@ -156,3 +156,28 @@ Independent cadence from the runtime.
 | [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | Sibling splat-viewer demo; shares the `common/` view math. |
 | [`displayxr-installer`](https://github.com/DisplayXR/displayxr-installer) | Windows meta-installer bundle (chains this demo). |
 | [`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases) | Shell installer (optional add-on). |
+
+## MCP atlas capture (agent-side debugging)
+
+`.mcp.json` registers the `displayxr` MCP server — the DisplayXR MCP adapter
+installed by `DisplayXRMCPSetup` (`HKLM\Software\DisplayXR\Capabilities\MCP`).
+When that capability is installed, **every OpenXR app process hosts an
+in-process MCP server**, so a running `model_viewer_handle_vk_win` exposes:
+
+- `capture_frame` — writes the composed atlas as
+  `%TEMP%\displayxr-mcp-capture-<pid>-<frame>.png` and returns the path
+  (modes: `post-compose` default, `projection-only`). Read the PNG to see
+  exactly what the display processor receives, per tile.
+- `diff_projection`, `get_kooima_params`, `get_submitted_projection`,
+  `get_display_info`, `get_runtime_metrics`, `tail_log`.
+
+Workflow:
+
+1. **Launch the app first**, then start the Claude session — or run `/mcp` →
+   reconnect `displayxr` after launching (the adapter binds at spawn time).
+2. `--target auto` attaches shell → service → unique app PID. If more than
+   one OpenXR app is running, pin it: change args to `--target pid:<pid>`.
+3. Call `capture_frame`, then Read the returned PNG path.
+
+Non-Windows: set `DISPLAYXR_MCP_ADAPTER` to the adapter's install path before
+launching Claude (the `.mcp.json` default is the Windows path).
