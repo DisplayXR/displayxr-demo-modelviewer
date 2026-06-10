@@ -49,6 +49,10 @@ bool model_loader_load(const char* path, ModelData& out) {
     switch (formatFromPath(path)) {
         case ModelFormat::Gltf:
             return model_load_gltf(path, out);
+#if !defined(__ANDROID__)
+        // Android port: glTF-only. The OBJ/STL/FBX/USD backends (+ their heavy
+        // deps: tinyobjloader, ufbx, tinyusdz) are dropped — the bundled sample
+        // is .glb and Android ships gltf-only (see android/src/main/cpp/CMakeLists.txt).
         case ModelFormat::Stl:
             return model_load_stl(path, out);
         case ModelFormat::Obj:
@@ -57,8 +61,13 @@ bool model_loader_load(const char* path, ModelData& out) {
             return model_load_fbx(path, out);
         case ModelFormat::Usd:
             return model_load_usd(path, out);
+#endif
         default:
+#if defined(__ANDROID__)
+            std::fprintf(stderr, "[model_loader] '%s': only glTF is supported on Android\n", path);
+#else
             std::fprintf(stderr, "[model_loader] '%s': unsupported format\n", path);
+#endif
             return false;
     }
 }

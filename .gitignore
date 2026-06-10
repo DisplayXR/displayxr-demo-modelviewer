@@ -4,3 +4,10 @@ installer/macos/*.pkg
 _artifact/
 _package/
 *.log
+
+# Android
+local.properties
+.gradle/
+android/build/
+android/.cxx/
+*.iml
