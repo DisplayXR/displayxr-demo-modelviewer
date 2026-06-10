@@ -30,6 +30,7 @@
 #include <openxr/XR_EXT_cocoa_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_atlas_capture.h>
+#include <openxr/XR_EXT_view_rig.h>
 #include <openxr/XR_EXT_mcp_tools.h>
 
 #include <cmath>
@@ -270,6 +271,22 @@ static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
     *ox = vx + q.w * tx + (q.y * tz - q.z * ty);
     *oy = vy + q.w * ty + (q.z * tx - q.x * tz);
     *oz = vz + q.w * tz + (q.x * ty - q.y * tx);
+}
+
+// Display-local eye distance for the ZDP-anchored clip (#396 W7 consume path):
+// z of (rigPose^-1 * eyeWorld). Equals the old eye_display.z so near = ez - vH /
+// far = ez + far_offset stays identical. fov is clip-independent — this is all
+// the app keeps of the old per-eye Kooima math.
+static float RigLocalEyeZ(const XrPosef& rig, const XrVector3f& eyeWorld) {
+    XrQuaternionf inv = {-rig.orientation.x, -rig.orientation.y,
+                         -rig.orientation.z, rig.orientation.w};
+    float ox, oy, oz;
+    quat_rotate_vec3(inv,
+                     eyeWorld.x - rig.position.x,
+                     eyeWorld.y - rig.position.y,
+                     eyeWorld.z - rig.position.z,
+                     &ox, &oy, &oz);
+    return oz;
 }
 
 // ============================================================================
@@ -558,12 +575,12 @@ static void OpenLoadDialog() {
 - (void)mouseDragged:(NSEvent *)event {
     MarkUserInput(g_input);
     g_input.yaw -= (float)[event deltaX] * 0.005f;
-    // pitch += because the renderer Y-mirrors the world internally
-    // (model_renderer.cpp); without this, mouse-drag-up would tilt the
-    // camera DOWN. cube_handle apps go the other way (-= deltaY)
-    // because they Y-flip at rasterization (negative VkViewport.height),
-    // not at view stage.
-    g_input.pitch += (float)[event deltaY] * 0.005f;
+    // pitch -= deltaY: since W7 (#396) model_renderer flips Vulkan-Y at the
+    // RASTER stage (negative VkViewport.height), NOT by reflecting the view
+    // matrix. A view-stage reflection would invert rotational handedness
+    // (needing += here); the raster flip does not, so we use the same -=
+    // convention as the cube_handle apps.
+    g_input.pitch -= (float)[event deltaY] * 0.005f;
     float maxPitch = 1.5f;
     if (g_input.pitch > maxPitch) g_input.pitch = maxPitch;
     if (g_input.pitch < -maxPitch) g_input.pitch = -maxPitch;
@@ -925,6 +942,10 @@ struct AppXrSession {
     bool hasAtlasCaptureExt = false;
     PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
 
+    // XR_EXT_view_rig (W7 of #396): runtime owns the off-axis Kooima and returns
+    // render-ready XrView{pose, fov}; the app deletes its own.
+    bool hasViewRigExt = false;
+
     // XR_EXT_mcp_tools (#22): app-defined agent tools on the runtime-hosted
     // per-process MCP server. The whole path is inert when the extension or
     // the MCP capability gate is absent — never load-bearing.
@@ -1082,6 +1103,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
         if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
+        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
@@ -1092,6 +1114,8 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasAtlasCaptureExt) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
     if (xr.hasMcpToolsExt) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
+    if (xr.hasViewRigExt) enabled.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+    LOG_INFO("XR_EXT_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -2188,6 +2212,32 @@ int main() {
                     eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
                     viewState.next = &eyeTrackingState;
 
+                    // Clean +Y-up world camera pose (no Y negation — the ModelRenderer
+                    // now flips Vulkan-Y via a negative viewport, not a view/world
+                    // reflection; see model_renderer.cpp).
+                    XrPosef cameraPose;
+                    quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
+                    cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+                    const float rigVH =
+                        g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
+
+                    // XR_EXT_view_rig (#396 W7): chain the display rig so the runtime
+                    // owns the off-axis Kooima + window resolve, returning render-ready
+                    // XrView{pose, fov}. The raw channel carries display-space eyes for HUD.
+                    const bool useRig =
+                        xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
+                    XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+                    XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    if (useRig) {
+                        displayRig.pose = cameraPose;
+                        displayRig.virtualDisplayHeight = rigVH;
+                        displayRig.ipdFactor = g_input.viewParams.ipdFactor;
+                        displayRig.parallaxFactor = g_input.viewParams.parallaxFactor;
+                        displayRig.perspectiveFactor = g_input.viewParams.perspectiveFactor;
+                        locateInfo.next = &displayRig;
+                        eyeTrackingState.next = &viewRigRaw;
+                    }
+
                     uint32_t runtimeViewCount = xr.maxViewCount > 0 ? xr.maxViewCount : 2;
                     if (runtimeViewCount > 8) runtimeViewCount = 8;
                     XrView views[8] = {};
@@ -2216,42 +2266,24 @@ int main() {
 
                         int eyeCount = monoMode ? 1 : (int)modeViewCount;
 
-                        // Collect raw eye positions for every view this mode uses.
-                        std::vector<XrVector3f> rawEyePos(modeViewCount);
-                        for (uint32_t v = 0; v < modeViewCount; v++)
-                            rawEyePos[v] = views[v].pose.position;
-
-                        // HUD exposes the first two for display; log everything up to 8.
-                        for (uint32_t v = 0; v < modeViewCount && v < 8; v++) {
-                            xr.eyePositions[v][0] = rawEyePos[v].x;
-                            xr.eyePositions[v][1] = rawEyePos[v].y;
-                            xr.eyePositions[v][2] = rawEyePos[v].z;
+                        // HUD eye readout. Under the rig, views[] carries render-ready
+                        // WORLD eyes, so the display-space eyes come from the raw channel
+                        // (XrViewDisplayRawEXT); without the rig, fall back to views[].
+                        if (useRig && viewRigRaw.eyeCountOutput > 0) {
+                            for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
+                                xr.eyePositions[v][0] = viewRigRaw.rawEyes[v].x;
+                                xr.eyePositions[v][1] = viewRigRaw.rawEyes[v].y;
+                                xr.eyePositions[v][2] = viewRigRaw.rawEyes[v].z;
+                            }
+                        } else {
+                            for (uint32_t v = 0; v < modeViewCount && v < 8; v++) {
+                                xr.eyePositions[v][0] = views[v].pose.position.x;
+                                xr.eyePositions[v][1] = views[v].pose.position.y;
+                                xr.eyePositions[v][2] = views[v].pose.position.z;
+                            }
                         }
                         xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
                         xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
-
-                        // Mono mode: centroid of all runtime views.
-                        if (monoMode) {
-                            XrVector3f c = {0, 0, 0};
-                            for (uint32_t v = 0; v < modeViewCount; v++) {
-                                c.x += rawEyePos[v].x; c.y += rawEyePos[v].y; c.z += rawEyePos[v].z;
-                            }
-                            float inv = 1.0f / (float)modeViewCount;
-                            c.x *= inv; c.y *= inv; c.z *= inv;
-                            rawEyePos.assign(1, c);
-                        }
-
-                        XrPosef cameraPose;
-                        quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
-                        // ModelRenderer Y-mirrors the world inside updateUniforms (see comment
-                        // in model_renderer.cpp). The off-axis Kooima projection assumes the
-                        // mirror is reflected in the displayPose passed to display3d_compute_view,
-                        // so negate Y here to keep the eye-vs-display geometry consistent.
-                        cameraPose.position = {g_input.cameraPosX, -g_input.cameraPosY, g_input.cameraPosZ};
-
-                        // nominalViewer in render frame (Y mirrored) — used for
-                        // parallax-factor lerp, must match the eye/cameraPose frame.
-                        XrVector3f nominalViewer = {xr.nominalViewerX, -xr.nominalViewerY, xr.nominalViewerZ};
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims
@@ -2268,75 +2300,65 @@ int main() {
                         if (renderH == 0) renderH = 1;
                         g_renderW = renderW; g_renderH = renderH;
 
-                        // Per-view Kooima pose + projection — one entry per view in this
-                        // multiview mode (1 for mono, 2 for stereo, 4 for quad, etc.).
+                        // --- Consume the runtime's render-ready XrView{pose, fov} (#396 W7) ---
+                        // The runtime owns the off-axis Kooima (window resolve included); the
+                        // app keeps only the clip policy (fov is clip-independent). near =
+                        // ez - vH, far = ez + 1000*vH (macOS modelviewer is always opaque),
+                        // ez = RigLocalEyeZ (== the display-space eye Z display3d resolved).
+                        // The view matrix is the plain clean-frame mat4_view_from_xr_pose —
+                        // ModelRenderer owns the Vulkan Y-down flip via a negative viewport.
+                        // GL projection → [0,1] depth remap kept (mesh uses the depth buffer).
                         std::vector<Display3DView> eyeViews((size_t)eyeCount);
-                        bool hasKooima = (xr.displayWidthM > 0 && xr.displayHeightM > 0);
-                        if (hasKooima) {
-                            float dispPxW = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
-                            float dispPxH = xr.displayPixelHeight > 0 ? (float)xr.displayPixelHeight : (float)xr.swapchain.height;
-                            float pxSizeX = xr.displayWidthM / dispPxW;
-                            float pxSizeY = xr.displayHeightM / dispPxH;
-                            float winW_m = (float)g_windowW * pxSizeX;
-                            float winH_m = (float)g_windowH * pxSizeY;
-
-                            // Window-relative Kooima: compute eye offset from window center
-                            float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
-                            if (g_window != nil) {
-                                NSRect winFrame = [g_window frame];
-                                NSScreen *screen_ns = [g_window screen] ?: [NSScreen mainScreen];
-                                NSRect screenFrame = [screen_ns frame];
-                                float winCenterX = (winFrame.origin.x - screenFrame.origin.x) + winFrame.size.width / 2.0f;
-                                float winCenterY = (winFrame.origin.y - screenFrame.origin.y) + winFrame.size.height / 2.0f;
-                                float dispCenterX = screenFrame.size.width / 2.0f;
-                                float dispCenterY = screenFrame.size.height / 2.0f;
-                                CGFloat backingScale = [g_window backingScaleFactor];
-                                float pxSizeXBacking = pxSizeX / (float)backingScale;
-                                float pxSizeYBacking = pxSizeY / (float)backingScale;
-                                eyeOffsetX = (winCenterX - dispCenterX) * pxSizeXBacking;
-                                eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
+                        bool hasKooima = useRig;
+                        if (useRig) {
+                            // Mono: collapse the active views to their centroid (pose + fov).
+                            std::vector<XrView> srcViews;
+                            if (monoMode && modeViewCount >= 1) {
+                                XrView cv = views[0];
+                                XrVector3f c = {0, 0, 0};
+                                XrFovf f = {0, 0, 0, 0};
+                                for (uint32_t v = 0; v < modeViewCount; v++) {
+                                    c.x += views[v].pose.position.x;
+                                    c.y += views[v].pose.position.y;
+                                    c.z += views[v].pose.position.z;
+                                    f.angleLeft  += views[v].fov.angleLeft;
+                                    f.angleRight += views[v].fov.angleRight;
+                                    f.angleUp    += views[v].fov.angleUp;
+                                    f.angleDown  += views[v].fov.angleDown;
+                                }
+                                float inv = 1.0f / (float)modeViewCount;
+                                cv.pose.position = {c.x * inv, c.y * inv, c.z * inv};
+                                cv.fov = {f.angleLeft * inv, f.angleRight * inv,
+                                          f.angleUp * inv, f.angleDown * inv};
+                                srcViews.assign(1, cv);
+                            } else {
+                                for (int e = 0; e < eyeCount; e++)
+                                    srcViews.push_back(views[e < (int)runtimeViewCount ? e : 0]);
                             }
-                            for (auto& e : rawEyePos) { e.x -= eyeOffsetX; e.y -= eyeOffsetY; }
-                            // ModelRenderer Y-mirrors the world; cameraPose Y is negated
-                            // below at the display3d_compute_views boundary. Eyes must
-                            // live in the same render frame so the asymmetric Kooima
-                            // projection's eye-vs-display geometry stays consistent —
-                            // otherwise vertical eye parallax comes out inverted.
-                            for (auto& e : rawEyePos) { e.y = -e.y; }
 
-                            Display3DScreen screen = {winW_m, winH_m};
-                            Display3DTunables tunables;
-                            tunables.ipd_factor = g_input.viewParams.ipdFactor;
-                            tunables.parallax_factor = g_input.viewParams.parallaxFactor;
-                            tunables.perspective_factor = g_input.viewParams.perspectiveFactor;
-                            tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
-
-                            // ZDP-relative clip planes (computed per-eye from eye.z inside
-                            // display3d_compute_view): near = ez - near_offset, far =
-                            // ez + far_offset, with the offsets given as ABSOLUTE distances
-                            // in virtual-display-height (vH) units. Scales with the virtual
-                            // display (zoom) so large models don't clip. macOS has no
-                            // transparent-bg mode, so far_offset keeps a large recede band.
-                            const float vH = tunables.virtual_display_height;
-                            const float near_offset = vH;
-                            const float far_offset  = 1000.0f * vH;
-
-                            display3d_compute_views(
-                                rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
-                                &screen, &tunables, &cameraPose,
-                                near_offset, far_offset, /*vulkan_flip_y=*/0, eyeViews.data());
-                            // displayxr::math emits a GL ([-1,1] clip-z) projection; this is a
-                            // Vulkan renderer, so remap each per-view projection to [0,1]
-                            // (reproduces modelviewer's prior direct-[0,1] output). [#396 W3]
-                            for (uint32_t _v = 0; _v < (uint32_t)eyeCount; _v++)
-                                convert_projection_gl_to_zero_to_one(eyeViews[_v].projection_matrix);
+                            for (int eye = 0; eye < eyeCount; eye++) {
+                                const XrView& sv = srcViews[eye];
+                                float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
+                                float near_z = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
+                                float far_z  = ez + 1000.0f * rigVH;
+                                mat4_view_from_xr_pose(eyeViews[eye].view_matrix, sv.pose);
+                                mat4_from_xr_fov(eyeViews[eye].projection_matrix, sv.fov, near_z, far_z);
+                                // GL ([-1,1] clip-z) → Vulkan [0,1] depth for the mesh's depth buffer.
+                                convert_projection_gl_to_zero_to_one(eyeViews[eye].projection_matrix);
+                                eyeViews[eye].fov = sv.fov;
+                                eyeViews[eye].eye_world = sv.pose.position;
+                                eyeViews[eye].orientation = sv.pose.orientation;
+                                eyeViews[eye].eye_display = {0.0f, 0.0f, ez};
+                                eyeViews[eye].near_z = near_z;
+                                eyeViews[eye].far_z = far_z;
+                            }
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
                         // physical mouse location on the display surface, pick nearest surface,
                         // then smoothly move & re-orient the virtual display to face back
                         // along the ray.
-                        if (g_input.teleportRequested && hasKooima) {
+                        if (g_input.teleportRequested && useRig) {
                             g_input.teleportRequested = false;
                             NSSize viewSize = [[g_window contentView] bounds].size;
                             float ndcX = 2.0f * g_input.teleportMouseX / (float)viewSize.width - 1.0f;
@@ -2346,65 +2368,49 @@ int main() {
                             // Win32 mouse y=0 is at the TOP.)
                             float ndcY = 2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f;
 
-                            // Build a center-eye Display3DView from the averaged processed
-                            // display-space eye so unprojection is truly from the viewpoint
-                            // midpoint (not from the left eye, which is off by ~IPD/2).
-                            float dispPxW2 = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
-                            float dispPxH2 = xr.displayPixelHeight > 0 ? (float)xr.displayPixelHeight : (float)xr.swapchain.height;
-                            float winW_m2 = (float)g_windowW * (xr.displayWidthM / dispPxW2);
-                            float winH_m2 = (float)g_windowH * (xr.displayHeightM / dispPxH2);
-                            Display3DScreen screen2 = {winW_m2, winH_m2};
-                            Display3DTunables tunables2;
-                            tunables2.ipd_factor = g_input.viewParams.ipdFactor;
-                            tunables2.parallax_factor = g_input.viewParams.parallaxFactor;
-                            tunables2.perspective_factor = g_input.viewParams.perspectiveFactor;
-                            tunables2.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
-
-                            XrVector3f centerEyeDisp = {0, 0, 0};
-                            for (const auto& sv : eyeViews) {
-                                centerEyeDisp.x += sv.eye_display.x;
-                                centerEyeDisp.y += sv.eye_display.y;
-                                centerEyeDisp.z += sv.eye_display.z;
+                            // Center-eye pick view reconstructed from the render-ready rig
+                            // views: average the active eye poses + fovs into a symmetric
+                            // center frustum in the clean +Y-up world frame the model lives in
+                            // (no Y flip — the pick ray must match the world, not the Vulkan
+                            // raster). GL projection (no [0,1] remap) since the ray is a full
+                            // line.
+                            XrVector3f cpos = {0, 0, 0};
+                            XrFovf cfov = {0, 0, 0, 0};
+                            for (int e = 0; e < eyeCount; e++) {
+                                cpos.x += eyeViews[e].eye_world.x;
+                                cpos.y += eyeViews[e].eye_world.y;
+                                cpos.z += eyeViews[e].eye_world.z;
+                                cfov.angleLeft  += eyeViews[e].fov.angleLeft;
+                                cfov.angleRight += eyeViews[e].fov.angleRight;
+                                cfov.angleUp    += eyeViews[e].fov.angleUp;
+                                cfov.angleDown  += eyeViews[e].fov.angleDown;
                             }
-                            float invN = 1.0f / (float)eyeViews.size();
-                            centerEyeDisp.x *= invN;
-                            centerEyeDisp.y *= invN;
-                            centerEyeDisp.z *= invN;
-                            // eye_display is processed_eye * (perspective_factor * virtual_display_height / winH_m);
-                            // invert so display3d_compute_view can re-apply it consistently.
-                            float m2v_post = tunables2.virtual_display_height / winH_m2;
-                            float es = tunables2.perspective_factor * m2v_post;
-                            XrVector3f centerEyeProcessed = (es != 0.0f)
-                                ? (XrVector3f){centerEyeDisp.x / es, centerEyeDisp.y / es, centerEyeDisp.z / es}
-                                : centerEyeDisp;
-                            // Use a real-world-frame displayPose for picking — the unproject
-                            // ray needs to be in the same frame as the model (un-Y-flipped
-                            // world). cameraPose has its Y negated for the renderer's view-
-                            // stage Y mirror; using it here would put rayOrigin in a mirror
-                            // frame and pickSurface would intersect against the mesh in the
-                            // wrong frame.
-                            XrPosef cameraPoseWorld = cameraPose;
-                            cameraPoseWorld.position.y = g_input.cameraPosY;
-                            Display3DView centerView;
-                            const float pick_vH = tunables2.virtual_display_height;
-                            display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
-                                                   &cameraPoseWorld, pick_vH, 1000.0f * pick_vH, &centerView);
+                            float invE = 1.0f / (float)eyeCount;
+                            XrPosef cpose;
+                            cpose.position = {cpos.x * invE, cpos.y * invE, cpos.z * invE};
+                            cpose.orientation = cameraPose.orientation;
+                            cfov = {cfov.angleLeft * invE, cfov.angleRight * invE,
+                                    cfov.angleUp * invE, cfov.angleDown * invE};
+                            float ez = RigLocalEyeZ(cameraPose, cpose.position);
+                            float pickNear = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
+                            float pickFar = ez + 1000.0f * rigVH;
+                            float pickView[16], pickProj[16];
+                            mat4_view_from_xr_pose(pickView, cpose);
+                            mat4_from_xr_fov(pickProj, cfov, pickNear, pickFar);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
-                                centerView.view_matrix, centerView.projection_matrix,
-                                &rayOriginV, &rayDirV);
+                                pickView, pickProj, &rayOriginV, &rayDirV);
 
                             float rayOrigin[3] = {rayOriginV.x, rayOriginV.y, rayOriginV.z};
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
                             if (g_modelRenderer.pickSurface(rayOrigin, rayDir, hitPos)) {
-                                // Both endpoints stored in WORLD frame (the same frame as
-                                // g_input.cameraPosX/Y/Z) so the slerp interpolates
-                                // consistently. cameraPose has its Y negated for the
-                                // display3d_compute_view boundary; we mustn't store that
-                                // negated copy as the slerp's "from" pose, otherwise the
-                                // mid-transition lerp drifts vertically toward 2·cy − y.
+                                // Both endpoints stored in the clean +Y-up WORLD frame
+                                // (the same frame as g_input.cameraPosX/Y/Z and the model)
+                                // so the slerp interpolates consistently. (#396 W7: cameraPose
+                                // is no longer Y-negated — the renderer flips at the raster
+                                // stage — so this is just the world camera position.)
                                 XrPosef fromWorld;
                                 fromWorld.orientation = cameraPose.orientation;
                                 fromWorld.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};

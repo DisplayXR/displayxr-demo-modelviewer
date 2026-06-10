@@ -972,15 +972,16 @@ float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const
 
 void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                                    float clipFar) {
-    // Mirror gs_renderer: flip world Y at the view stage (right-multiply by
-    // diag(1,-1,1,1) → negate view column 1) so the model is upright and
-    // consistent with the demo's Y-mirrored display-pose contract.
+    // W7 (#396): consume a plain clean +Y-up-world view matrix (the render-ready
+    // XR_EXT_view_rig XrView pose). Vulkan Y-down is handled at the RASTER stage
+    // via a negative-height viewport in renderEye — NOT by reflecting the view
+    // matrix. A view reflection renders correctly but flips rotational handedness
+    // (inverting mouse pitch); the viewport flip does not, and keeps the off-axis
+    // projection in its native +Y-up frame. -R^T·t below recovers the true world
+    // camera for lighting/skybox. (vmFlipped kept as the name downstream; it is
+    // now the un-reflected view.)
     float vmFlipped[16];
     std::memcpy(vmFlipped, viewMatrix, sizeof(vmFlipped));
-    vmFlipped[4] = -vmFlipped[4];
-    vmFlipped[5] = -vmFlipped[5];
-    vmFlipped[6] = -vmFlipped[6];
-    vmFlipped[7] = -vmFlipped[7];
 
     UniformBlock ub{};
     mat4Mul(projMatrix, vmFlipped, ub.viewProj);
@@ -1511,7 +1512,11 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     rpbi.pClearValues = clears;
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkViewport vpRect = {0.0f, 0.0f, (float)viewportWidth, (float)viewportHeight, 0.0f, 1.0f};
+    // Negative-height viewport flips Vulkan Y-down at the rasterizer (W7, #396),
+    // so a clean +Y-up-world view+projection renders upright without a view-matrix
+    // Y reflection (which would invert mouse pitch). Requires VK_KHR_maintenance1
+    // (core in Vulkan 1.1). Origin moves to the bottom (y = height), height < 0.
+    VkViewport vpRect = {0.0f, (float)viewportHeight, (float)viewportWidth, -(float)viewportHeight, 0.0f, 1.0f};
     VkRect2D scissor = {{0, 0}, {viewportWidth, viewportHeight}};
     vkCmdSetViewport(cmd, 0, 1, &vpRect);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
