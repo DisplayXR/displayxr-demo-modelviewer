@@ -11,6 +11,13 @@
 #include <vulkan/vulkan.h>
 #define XR_USE_GRAPHICS_API_VULKAN
 #include "xr_session_common.h"
+#include <openxr/XR_EXT_view_rig.h>
+
+// XR_EXT_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
+// returns render-ready XrView{pose, fov}; the app deletes its own. App-owned
+// flag (displayxr::common's XrSessionManager carries no app-named fields,
+// #396 W4); set by InitializeOpenXR.
+extern bool g_hasViewRigExt;
 
 // Initialize OpenXR instance with Vulkan + win32_window_binding extensions
 bool InitializeOpenXR(XrSessionManager& xr);
