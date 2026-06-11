@@ -24,12 +24,19 @@ import android.app.NativeActivity
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.Toast
 
 class MainActivity : NativeActivity() {
@@ -82,6 +89,23 @@ class MainActivity : NativeActivity() {
     // Hand a picked model (already copied into app-private storage) to native.
     private external fun nativeOpenModelPath(path: String)
 
+    // ── Widget button bar (default UI while runtime#506 is open) ────────────
+    // True when debug.dxr.mv.ws_ui=1 selected the native window-space bar
+    // instead (the #506 test client) — taps are then forwarded to nativeOnTap.
+    private external fun nativeUseWindowSpaceUi(): Boolean
+
+    // Mode button → next display rendering mode (serviced on android_main).
+    private external fun nativeCycleMode()
+
+    // Animation button → next clip / play-pause toggle.
+    private external fun nativeAnimAction()
+
+    // "Mode: <name>" for the Mode button.
+    private external fun nativeGetModeLabel(): String
+
+    // Clip name / "Paused"; empty = model has no animations (hide the button).
+    private external fun nativeGetAnimLabel(): String
+
     // First installed runtime package, preferring out_of_process. Null if none.
     private val installedRuntime: String? by lazy {
         RUNTIME_PACKAGES.firstOrNull {
@@ -108,7 +132,11 @@ class MainActivity : NativeActivity() {
 
                 override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                     try {
-                        nativeOnTap(e.x, e.y)
+                        if (nativeUseWindowSpaceUi()) {
+                            nativeOnTap(e.x, e.y)  // #506 test path
+                        } else {
+                            showButtonBar()
+                        }
                     } catch (_: Throwable) {
                     }
                     return true
@@ -118,7 +146,10 @@ class MainActivity : NativeActivity() {
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        gestureDetector.onTouchEvent(event) // double-tap → re-frame
+        gestureDetector.onTouchEvent(event) // tap → menu, double-tap → re-frame
+        // Any touch on the scene re-arms the bar's 5 s idle timer (touches on
+        // the bar's buttons land in its own window and re-arm via onClick).
+        if (barView?.visibility == View.VISIBLE) armBarHideTimer()
         val n = event.pointerCount
         val x1 = if (n > 1) event.getX(1) else 0f
         val y1 = if (n > 1) event.getY(1) else 0f
@@ -219,6 +250,131 @@ class MainActivity : NativeActivity() {
         showControlsHint()
     }
 
+    // ── Widget button bar ([Open] [Mode: <name>] [<anim>]) ──────────────────
+    // The runtime's MonadoView weave surface is its own WindowManager window
+    // ABOVE the activity, so plain content views would be hidden under it. The
+    // bar is therefore added as ANOTHER application window — lazily, on first
+    // show, which is always after MonadoView attached (taps arrive through it)
+    // → later windows stack on top. The window is a top strip (WRAP_CONTENT
+    // height), so scene touches outside it still reach MonadoView.
+    private var barView: LinearLayout? = null
+    private var modeButton: Button? = null
+    private var animButton: Button? = null
+    private val barHandler = Handler(Looper.getMainLooper())
+    private val hideBarRunnable = Runnable { hideButtonBar() }
+
+    private fun pillBackground(): GradientDrawable {
+        val density = resources.displayMetrics.density
+        return GradientDrawable().apply {
+            cornerRadius = 24f * density
+            setColor(0xD11A1C21.toInt())          // dark translucent fill
+            setStroke((1.5f * density).toInt(), 0x8C8C94A0.toInt())  // light rim
+        }
+    }
+
+    private fun makePill(label: String, onClick: () -> Unit): Button {
+        val density = resources.displayMetrics.density
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 16f
+            background = pillBackground()
+            stateListAnimator = null
+            setPadding((20 * density).toInt(), (8 * density).toInt(),
+                (20 * density).toInt(), (8 * density).toInt())
+            minimumWidth = 0
+            minimumHeight = 0
+            setOnClickListener {
+                onClick()
+                armBarHideTimer()
+            }
+        }
+    }
+
+    private fun ensureBar() {
+        if (barView != null) return
+        val density = resources.displayMetrics.density
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding((14 * density).toInt(), (10 * density).toInt(),
+                (14 * density).toInt(), (10 * density).toInt())
+        }
+        val pillLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { marginEnd = (10 * density).toInt() }
+        bar.addView(makePill("Open") { launchModelPicker() }, pillLp)
+        modeButton = makePill("Mode") {
+            try { nativeCycleMode() } catch (_: Throwable) {}
+            scheduleLabelRefresh()
+        }
+        bar.addView(modeButton, pillLp)
+        // Spacer pushes the animation pill to the right edge (Windows layout).
+        bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        animButton = makePill("Anim") {
+            try { nativeAnimAction() } catch (_: Throwable) {}
+            scheduleLabelRefresh()
+        }
+        bar.addView(animButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ))
+        val wlp = WindowManager.LayoutParams().apply {
+            width = WindowManager.LayoutParams.MATCH_PARENT
+            height = WindowManager.LayoutParams.WRAP_CONTENT
+            gravity = Gravity.TOP
+            type = WindowManager.LayoutParams.TYPE_APPLICATION
+            flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            format = PixelFormat.TRANSLUCENT
+        }
+        windowManager.addView(bar, wlp)
+        barView = bar
+    }
+
+    private fun showButtonBar() {
+        try {
+            ensureBar()
+            refreshBarLabels()
+            barView?.apply {
+                animate().cancel()
+                alpha = 1f
+                visibility = View.VISIBLE
+            }
+            armBarHideTimer()
+        } catch (t: Throwable) {
+            android.util.Log.e("model_viewer", "button bar show failed", t)
+        }
+    }
+
+    private fun armBarHideTimer() {
+        barHandler.removeCallbacks(hideBarRunnable)
+        barHandler.postDelayed(hideBarRunnable, 5000)
+    }
+
+    private fun hideButtonBar() {
+        barView?.animate()?.alpha(0f)?.setDuration(400)?.withEndAction {
+            barView?.visibility = View.GONE
+        }?.start()
+    }
+
+    private fun refreshBarLabels() {
+        try {
+            modeButton?.text = nativeGetModeLabel()
+            val anim = nativeGetAnimLabel()
+            animButton?.visibility = if (anim.isEmpty()) View.GONE else View.VISIBLE
+            if (anim.isNotEmpty()) animButton?.text = anim
+        } catch (_: Throwable) {
+        }
+    }
+
+    // Mode/anim state changes land asynchronously on the XR thread — refresh
+    // shortly after a click (twice, to catch the mode-changed event).
+    private fun scheduleLabelRefresh() {
+        barHandler.postDelayed({ refreshBarLabels() }, 350)
+        barHandler.postDelayed({ refreshBarLabels() }, 1000)
+    }
+
     // ── Open-model flow (native button bar → SAF picker → native load) ──────
     // Native can't start an Intent, so a light poll consumes its open request
     // (same polling pattern as watchForRuntimeUnavailable).
@@ -306,6 +462,14 @@ class MainActivity : NativeActivity() {
                 .unregisterDisplayListener(displayListener)
         } catch (_: Throwable) {
         }
+        barHandler.removeCallbacks(hideBarRunnable)
+        barView?.let {
+            try {
+                windowManager.removeViewImmediate(it)
+            } catch (_: Throwable) {
+            }
+        }
+        barView = null
         super.onDestroy()
     }
 }

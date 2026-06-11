@@ -115,12 +115,26 @@ bool g_rmode_requestable = false;
 std::atomic<bool> g_cycle_mode_request{false};
 char g_rmode_names[8][64] = {};  // mode names for the Mode button label
 
-// ── On-screen button bar (window-space layer) ───────────────────────────────
-// Tap anywhere → the top button bar appears ([Open] [Mode] [Anim], the same
-// chrome as the Windows leg); it fades out after 5 s without any touch. The
-// bar is one full-width XrCompositionLayerWindowSpaceEXT — the first use of
-// window-space layers on the Android OOP path.
+// ── On-screen button bar ─────────────────────────────────────────────────────
+// Tap anywhere → a top button bar appears ([Open] [Mode] [Anim], the same
+// chrome as the Windows leg); it fades out after 5 s without any touch.
+//
+// TWO implementations:
+// 1. DEFAULT (interim): Android-widget bar in MainActivity.kt — a separate
+//    WindowManager window added ABOVE the runtime's MonadoView weave window.
+//    Kotlin drives show/fade/clicks and calls the nativeCycleMode /
+//    nativeAnimAction / label JNI below; native services the requests on the
+//    android_main thread.
+// 2. XrCompositionLayerWindowSpaceEXT bar (hud_bar.{h,cpp}) — the proper
+//    cross-platform path, currently REJECTED by the runtime on Android OOP
+//    sessions (runtime#506). Kept behind `adb shell setprop debug.dxr.mv.ws_ui 1`
+//    as the ready-made #506 test client; flip the default once #506 lands.
 HudBar g_hud_bar;
+bool g_use_ws_ui = false;  // debug.dxr.mv.ws_ui=1 → window-space bar (#506 test)
+// Cached labels for the Kotlin bar (written on the android_main thread, read
+// from the UI thread via JNI — the renderer itself is not thread-safe to poll).
+std::mutex g_ui_label_mutex;
+std::string g_ui_anim_label;  // clip name / "Paused"; empty = no animations
 std::atomic<bool> g_ui_visible{false};
 std::atomic<int64_t> g_ui_last_touch_ms{0};
 // Set when the runtime rejects the window-space layer (XR_ERROR_LAYER_INVALID
@@ -1341,8 +1355,9 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    enumerate_rendering_modes() &&
 			    gs_init() &&
 			    load_model_index(app, 0);
-			if (ok) {
-				// Non-fatal: without it the app simply has no button UI.
+			if (ok && g_use_ws_ui) {
+				// #506 test path only (debug.dxr.mv.ws_ui=1); the default
+				// button UI is the Kotlin bar in MainActivity. Non-fatal.
 				hud_bar_init(g_hud_bar, g_session, g_vk_phys_device, g_vk_device,
 				             g_vk_queue, g_vk_queue_family, g_swapchain_format,
 				             kBarTexW, kBarTexH);
@@ -1486,6 +1501,55 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeConsumeOpenRequ
 	                                                                        : JNI_FALSE;
 }
 
+// ── Kotlin widget-bar JNI (the default UI while runtime#506 is open) ────────
+
+// Which bar implementation this run uses (debug.dxr.mv.ws_ui).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeUseWindowSpaceUi(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	return g_use_ws_ui ? JNI_TRUE : JNI_FALSE;
+}
+
+// Mode button: request the next display rendering mode (serviced on the
+// android_main thread; the label updates via the mode-changed event).
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeCycleMode(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	g_cycle_mode_request.store(true, std::memory_order_relaxed);
+}
+
+// Animation button: next clip / play-pause toggle (serviced on android_main).
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeAnimAction(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	g_anim_cycle_request.store(true, std::memory_order_relaxed);
+}
+
+// "Mode: <name>" — names are written once at enumerate, index via the
+// mode-changed event; safe to read from the UI thread.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeGetModeLabel(
+    JNIEnv *env, jobject /*thiz*/)
+{
+	char label[80];
+	const uint32_t cur = g_rmode_current.load(std::memory_order_relaxed);
+	std::snprintf(label, sizeof(label), "Mode: %s",
+	              (cur < 8 && g_rmode_names[cur][0] != '\0') ? g_rmode_names[cur] : "n/a");
+	return env->NewStringUTF(label);
+}
+
+// Clip name / "Paused"; empty string = model has no animations (hide button).
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeGetAnimLabel(
+    JNIEnv *env, jobject /*thiz*/)
+{
+	std::lock_guard<std::mutex> lock(g_ui_label_mutex);
+	return env->NewStringUTF(g_ui_anim_label.c_str());
+}
+
 // A picked document, already copied by Kotlin into app-private storage (the
 // glTF loader needs a filesystem path). Loaded on the android_main thread.
 extern "C" JNIEXPORT void JNICALL
@@ -1507,6 +1571,15 @@ extern "C" void
 android_main(struct android_app *app)
 {
 	LOGI("model_viewer_vk_android: android_main entered");
+	{
+		// debug.dxr.mv.ws_ui=1 → use the XrCompositionLayerWindowSpaceEXT bar
+		// instead of the Kotlin widget bar (the runtime#506 test client).
+		char prop[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.mv.ws_ui", prop) > 0 && prop[0] == '1') {
+			g_use_ws_ui = true;
+		}
+		LOGI("button UI: %s", g_use_ws_ui ? "window-space layer (#506 test)" : "Kotlin widget bar");
+	}
 	app->onAppCmd = handle_cmd;
 	// Touch is NOT consumed via app->onInputEvent: the runtime's MonadoView
 	// overlay covers our window, so a NativeActivity never sees native input.
@@ -1578,7 +1651,37 @@ android_main(struct android_app *app)
 				g_pfnReqMode(g_session, next);
 			}
 			if (g_anim_cycle_request.exchange(false, std::memory_order_relaxed)) {
-				g_model.cycleAnimation();
+				// Multiple clips → next clip (the Windows 'N' semantics);
+				// single clip → toggle play/pause so the button still does
+				// something visible.
+				if (g_model.animationCount() > 1) {
+					g_model.cycleAnimation();
+				} else if (g_model.hasAnimations()) {
+					std::string nm;
+					int ai = 0, ac = 0;
+					float t = 0, d = 0;
+					bool playing = false;
+					g_model.getPlaybackInfo(nm, ai, ac, t, d, playing);
+					g_model.setPaused(playing);
+				}
+			}
+			// Refresh the Kotlin bar's animation label cache (renderer state is
+			// only safe to read on this thread).
+			if (g_scene_loaded.load(std::memory_order_relaxed)) {
+				std::string label;
+				if (g_model.hasAnimations()) {
+					std::string nm;
+					int ai = 0, ac = 0;
+					float t = 0, d = 0;
+					bool playing = false;
+					if (g_model.getPlaybackInfo(nm, ai, ac, t, d, playing)) {
+						label = playing ? nm : "Paused";
+					}
+				}
+				std::lock_guard<std::mutex> lock(g_ui_label_mutex);
+				if (g_ui_anim_label != label) {
+					g_ui_anim_label = label;
+				}
 			}
 			// A model picked via SAF (Kotlin copies it to app storage first).
 			if (g_picked_pending.exchange(false, std::memory_order_relaxed)) {
