@@ -20,6 +20,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_display_info.h>  // display rendering-mode enumerate/request
+#include <openxr/XR_EXT_view_rig.h>      // runtime-owned Kooima views (#396 W7)
 
 #include <atomic>
 #include <vector>
@@ -105,6 +106,16 @@ uint32_t g_rmode_count = 0;
 uint32_t g_rmode_current = 0;
 bool g_rmode_requestable = false;
 std::atomic<bool> g_cycle_mode_request{false};
+
+// ── XR_EXT_view_rig (#396 W7) ───────────────────────────────────────────────
+// When the runtime advertises XR_EXT_view_rig, chain an XrDisplayRigEXT on
+// xrLocateViews and consume the render-ready off-axis XrView{pose,fov} the
+// runtime computes (server-side Kooima over IPC on Android, #510/#513). The
+// rig pose stays IDENTITY: this app orbits the MODEL (build_splat_model), not
+// the camera, so the virtual display plane sits at the world origin and the
+// model frames AT screen depth (no forward push — see load_model_index).
+bool g_has_view_rig = false;
+float g_rig_vh = 1.33f;  // virtual display height (app units); refit per model
 
 constexpr uint32_t kViewCount = 2;
 
@@ -200,9 +211,29 @@ view_matrix_from_pose(const XrPosef &pose)
 	return v;
 }
 
-// Asymmetric perspective from OpenXR FOV. NOTE: unlike the cube app, we do
-// NOT flip Y here — ModelRenderer::updateUniforms negates the projection Y row
-// itself (its world is Y-mirrored), so a Y-flip here would double-cancel.
+// Display-local eye distance for the ZDP-anchored clip: z of (rigPose^-1 *
+// eyeWorld). Degenerates to pose.position.z at identity rig pose. Mirrors
+// rig_local_eye_z in cube_handle_vk_android / RigLocalEyeZ in the desktop legs
+// (per-platform helper duplication is the accepted W7 pattern).
+float
+rig_local_eye_z(const XrPosef &rig, const XrVector3f &eye_world)
+{
+	const float dx = eye_world.x - rig.position.x;
+	const float dy = eye_world.y - rig.position.y;
+	const float dz = eye_world.z - rig.position.z;
+	const float qx = -rig.orientation.x, qy = -rig.orientation.y;
+	const float qz = -rig.orientation.z, qw = rig.orientation.w;
+	const float cx = qy * dz - qz * dy + qw * dx;
+	const float cy = qz * dx - qx * dz + qw * dy;
+	return dz + 2.0f * (qx * cy - qy * cx);
+}
+
+// Asymmetric perspective from OpenXR FOV, direct [0,1] clip depth. NO Y
+// negation here: ModelRenderer (W7, #396) consumes a clean +Y-up view +
+// off-axis projection and flips Vulkan Y at the RASTER stage via a
+// negative-height viewport in renderEye. aspect_w_over_h > 0 forces a
+// SYMMETRIC frustum (legacy no-rig fallback only) — under XR_EXT_view_rig
+// pass -1: the rig FOV is render-ready off-axis and must pass through.
 Mat4
 projection_matrix_from_fov(const XrFovf &fov, float aspect_w_over_h, float near_z, float far_z)
 {
@@ -320,11 +351,38 @@ bool
 create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
-	const char *extensions[] = {
+
+	// XR_EXT_view_rig is enabled only when advertised (#396 W7); without it
+	// the app keeps the legacy raw-locate + fixed-clip path.
+	g_has_view_rig = false;
+	{
+		uint32_t n = 0;
+		if (xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr) == XR_SUCCESS && n > 0) {
+			std::vector<XrExtensionProperties> props(n);
+			for (auto &p : props) {
+				p.type = XR_TYPE_EXTENSION_PROPERTIES;
+				p.next = nullptr;
+			}
+			if (xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data()) == XR_SUCCESS) {
+				for (uint32_t i = 0; i < n; ++i) {
+					if (std::strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+						g_has_view_rig = true;
+					}
+				}
+			}
+		}
+		LOGI("XR_EXT_view_rig advertised: %s", g_has_view_rig ? "yes" : "no");
+	}
+
+	const char *extensions[4] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
 	    XR_EXT_DISPLAY_INFO_EXTENSION_NAME,  // display rendering-mode switching
 	};
+	uint32_t extension_count = 3;
+	if (g_has_view_rig) {
+		extensions[extension_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+	}
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
 	android_info.applicationVM = app->activity->vm;
@@ -340,7 +398,7 @@ create_instance(struct android_app *app)
 	             XR_MAX_ENGINE_NAME_SIZE - 1);
 	create_info.applicationInfo.engineVersion = 1;
 	create_info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	create_info.enabledExtensionCount = sizeof(extensions) / sizeof(extensions[0]);
+	create_info.enabledExtensionCount = extension_count;
 	create_info.enabledExtensionNames = extensions;
 
 	XrResult res = XR_ERROR_RUNTIME_UNAVAILABLE;
@@ -800,14 +858,21 @@ load_model_index(struct android_app *app, int idx)
 		if (ext[2] > maxe) {
 			maxe = ext[2];
 		}
-		// Normalize to kTargetSize metres, then push back a fixed comfortable
-		// distance (model is now ~0.22 m, well within the 0.01–100 clip range).
+		// Normalize to kTargetSize metres. Framing depends on the locate path
+		// (#396 W7): under XR_EXT_view_rig the world is display-anchored — the
+		// virtual display plane sits at the identity rig pose (origin), so the
+		// model frames AT screen depth with NO forward push, and the rig's
+		// virtual display height fits the scaled model (extent_y * 1.4, the
+		// desktop auto-fit factor — model fills ~71% of screen height).
+		// Without the rig keep the legacy fixed push (raw views, 0.01/100 clips).
 		g_fit_scale = (maxe > 1e-4f) ? kTargetSize / maxe : 1.0f;
 		g_scene_scale.store(g_fit_scale, std::memory_order_relaxed);
-		g_scene_push.store(0.45f, std::memory_order_relaxed);
-		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) push=%.2f",
+		g_scene_push.store(g_has_view_rig ? 0.0f : 0.45f, std::memory_order_relaxed);
+		const float vh = ext[1] * g_fit_scale * 1.4f;
+		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize * 1.4f;
+		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) push=%.2f rig_vh=%.2f",
 		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
-		     ext[0], ext[1], ext[2], g_scene_push.load(std::memory_order_relaxed));
+		     ext[0], ext[1], ext[2], g_scene_push.load(std::memory_order_relaxed), g_rig_vh);
 	}
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	return true;
@@ -892,6 +957,7 @@ render_frame()
 
 	XrCompositionLayerProjectionView projection_views[kViewCount] = {};
 	bool rendered = false;
+	uint32_t submitted_view_count = kViewCount;
 	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed)) {
 		XrViewState view_state = {};
 		view_state.type = XR_TYPE_VIEW_STATE;
@@ -901,14 +967,46 @@ render_frame()
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
+		// W7 (#396): chain the display rig so the runtime returns render-ready
+		// off-axis views (server-side Kooima over IPC on Android, #510/#513).
+		// Identity rig pose — this app orbits the model, not the camera. The
+		// raw channel reports the DP's display-space eyes + tracking state.
+		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
+		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		const XrPosef rig_pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		const float rig_vh = g_rig_vh;
+		if (g_has_view_rig) {
+			display_rig.pose = rig_pose;
+			display_rig.virtualDisplayHeight = rig_vh;  // pinch zoom scales the model, not vH
+			display_rig.ipdFactor = 1.0f;
+			display_rig.parallaxFactor = 1.0f;
+			display_rig.perspectiveFactor = 1.0f;
+			locate_info.next = &display_rig;
+			view_state.next = &view_raw;
+		}
+
 		XrView views[kViewCount] = {};
 		for (uint32_t i = 0; i < kViewCount; ++i) {
 			views[i].type = XR_TYPE_VIEW;
 		}
 		uint32_t located = 0;
 		res = xrLocateViews(g_session, &locate_info, &view_state, kViewCount, &located, views);
-		if (res == XR_SUCCESS && located == kViewCount) {
+		// A runtime-initiated 2D mode locates 1 view (the server collapses to a
+		// centered eye) — render whatever count came back, not a fixed 2.
+		const uint32_t view_count = located < kViewCount ? located : kViewCount;
+		if (res == XR_SUCCESS && view_count >= 1) {
 			DXR_HW_DBG_ONCE("first xrLocateViews success");
+			submitted_view_count = view_count;
+			if (g_has_view_rig) {
+				static bool rig_logged = false;
+				if (!rig_logged) {
+					rig_logged = true;
+					LOGI("view_rig: located=%u raw_eyes=%u tracking=%d canvas=%dx%dpx %.3fx%.3fm",
+					     located, view_raw.eyeCountOutput, (int)view_raw.isTracking,
+					     view_raw.canvasRectPx.extent.width, view_raw.canvasRectPx.extent.height,
+					     view_raw.canvasSizeMeters.width, view_raw.canvasSizeMeters.height);
+				}
+			}
 			// Splat model (recenter + flip + spin + push) — same for both eyes.
 			const float yaw = g_user_rotated.load(std::memory_order_relaxed)
 			                      ? g_user_yaw.load(std::memory_order_relaxed)
@@ -916,7 +1014,7 @@ render_frame()
 			const Mat4 splat_model = build_splat_model(yaw);
 			// Advance glTF animation (bind pose if the model has none). ~60 fps dt.
 			g_model.updateAnimation(1.0f / 60.0f);
-			for (uint32_t i = 0; i < kViewCount; ++i) {
+			for (uint32_t i = 0; i < view_count; ++i) {
 				XrSwapchainImageAcquireInfo acq = {};
 				acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
 				uint32_t img_idx = 0;
@@ -934,10 +1032,22 @@ render_frame()
 					break;
 				}
 
-				const float aspect = (float)g_views[i].width / (float)g_views[i].height;
 				Mat4 viewM = view_matrix_from_pose(views[i].pose);
 				Mat4 evM = mat4_mul(viewM, splat_model);  // apply splat model
-				Mat4 projM = projection_matrix_from_fov(views[i].fov, aspect, 0.01f, 100.0f);
+				Mat4 projM;
+				if (g_has_view_rig) {
+					// Render-ready off-axis FOV from the rig — pass it through
+					// (aspect -1: the symmetric override would destroy the
+					// off-axis skew). ZDP-anchored clips about the virtual
+					// display plane: near = ez - vH, far = ez + 1000·vH.
+					const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
+					const float near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
+					const float far_z = ez + 1000.0f * rig_vh;
+					projM = projection_matrix_from_fov(views[i].fov, -1.0f, near_z, far_z);
+				} else {
+					const float aspect = (float)g_views[i].width / (float)g_views[i].height;
+					projM = projection_matrix_from_fov(views[i].fov, aspect, 0.01f, 100.0f);
+				}
 				g_model.renderEye(
 				    g_views[i].images[img_idx].image, g_swapchain_format,
 				    g_views[i].width, g_views[i].height,
@@ -970,7 +1080,7 @@ render_frame()
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
 	projection_layer.space = g_app_space;
-	projection_layer.viewCount = kViewCount;
+	projection_layer.viewCount = submitted_view_count;
 	projection_layer.views = projection_views;
 	const XrCompositionLayerBaseHeader *layers[1] = {
 	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer)};
