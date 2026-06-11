@@ -114,6 +114,23 @@ std::atomic<uint32_t> g_rmode_current{0};
 bool g_rmode_requestable = false;
 std::atomic<bool> g_cycle_mode_request{false};
 char g_rmode_names[8][64] = {};  // mode names for the Mode button label
+// Per-mode tiling (multiview-tiling invariant): ONE atlas swapchain created once
+// at init, sized worst-case over all modes × both orientations. Per frame the app
+// renders the ACTIVE mode's tiles (display × view_scale) into the atlas at the
+// mode's tile-layout offsets, and submits each projection view's subImage.imageRect
+// = its tile rect (the compositor maps eye→destination tile by index). 2D = 1 tile
+// (1x1, scale 1.0), 3D = 2 tiles (2x1, scale 0.75). Indexed by modeIndex.
+float g_rmode_scale_x[8] = {};
+float g_rmode_scale_y[8] = {};
+uint32_t g_rmode_vc[8] = {};   // view count per mode (2D=1, LeiaSR=2)
+uint32_t g_rmode_cols[8] = {}; // tile columns (2D=1, LeiaSR=2)
+uint32_t g_rmode_rows[8] = {}; // tile rows (1)
+// Worst-case ATLAS dims = max over modes × orientations of (cols×tile, rows×tile)
+// where tile = max(viewWidthPixels, viewHeightPixels). For a 2560×1600 panel:
+// 3D 2x1 → 3840×1920, 2D 1x1 → 2560×2560 ⇒ atlas 3840×2560. The single atlas
+// swapchain is sized to this and never reallocated on a mode switch / rotation.
+uint32_t g_atlas_w = 0;
+uint32_t g_atlas_h = 0;
 
 // ── On-screen button bar ─────────────────────────────────────────────────────
 // Tap anywhere → a top button bar appears ([Open] [Mode] [Anim], the same
@@ -736,6 +753,20 @@ enumerate_rendering_modes()
 		if (m.modeIndex < 8) {
 			std::strncpy(g_rmode_names[m.modeIndex], m.modeName,
 			             sizeof(g_rmode_names[0]) - 1);
+			g_rmode_scale_x[m.modeIndex] = m.viewScaleX > 0.0f ? m.viewScaleX : 1.0f;
+			g_rmode_scale_y[m.modeIndex] = m.viewScaleY > 0.0f ? m.viewScaleY : 1.0f;
+			g_rmode_vc[m.modeIndex] = m.viewCount > 0 ? m.viewCount : 1;
+			const uint32_t cols = m.tileColumns > 0 ? m.tileColumns : 1;
+			const uint32_t rows = m.tileRows > 0 ? m.tileRows : 1;
+			g_rmode_cols[m.modeIndex] = cols;
+			g_rmode_rows[m.modeIndex] = rows;
+			// Worst-case ATLAS over modes × orientations: a tile is at most
+			// max(W,H) on a side in either orientation, so cols×edge × rows×edge
+			// bounds this mode's atlas; take the per-axis max across modes.
+			const uint32_t edge =
+			    m.viewWidthPixels > m.viewHeightPixels ? m.viewWidthPixels : m.viewHeightPixels;
+			if (cols * edge > g_atlas_w) g_atlas_w = cols * edge;
+			if (rows * edge > g_atlas_h) g_atlas_h = rows * edge;
 		}
 		if (m.isActive) {
 			g_rmode_current.store(m.modeIndex, std::memory_order_relaxed);
@@ -807,49 +838,57 @@ create_swapchains()
 	}
 	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
 
-	for (uint32_t i = 0; i < kViewCount; ++i) {
-		g_views[i].width = view_configs[i].recommendedImageRectWidth;
-		g_views[i].height = view_configs[i].recommendedImageRectHeight;
-
-		XrSwapchainCreateInfo ci = {};
-		ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
-		ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-		                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-		ci.format = g_swapchain_format;
-		ci.sampleCount = view_configs[i].recommendedSwapchainSampleCount;
-		ci.width = g_views[i].width;
-		ci.height = g_views[i].height;
-		ci.faceCount = 1;
-		ci.arraySize = 1;
-		ci.mipCount = 1;
-		res = xrCreateSwapchain(g_session, &ci, &g_views[i].swapchain);
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrCreateSwapchain", res);
-			return false;
-		}
-		uint32_t img_count = 0;
-		res = xrEnumerateSwapchainImages(g_views[i].swapchain, 0, &img_count, nullptr);
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrEnumerateSwapchainImages(count)", res);
-			return false;
-		}
-		if (img_count > 8) {
-			img_count = 8;
-		}
-		for (uint32_t j = 0; j < img_count; ++j) {
-			g_views[i].images[j].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
-		}
-		res = xrEnumerateSwapchainImages(
-		    g_views[i].swapchain, img_count, &img_count,
-		    reinterpret_cast<XrSwapchainImageBaseHeader *>(g_views[i].images));
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrEnumerateSwapchainImages(fill)", res);
-			return false;
-		}
-		g_views[i].image_count = img_count;
-		LOGI("View %u swapchain: %ux%u, %u images", i, g_views[i].width,
-		     g_views[i].height, img_count);
+	// ONE atlas swapchain, sized worst-case over all modes × orientations
+	// (multiview-tiling invariant). Allocated once here and never reallocated on a
+	// mode switch / rotation; each frame the app renders the active mode's tiles
+	// into sub-rects of this atlas (active_tile_dims + the tile-layout offsets) and
+	// submits each projection view's subImage.imageRect = its tile rect. All views
+	// reference this single swapchain (g_views[0]); g_views[1] aliases it.
+	uint32_t aw = g_atlas_w, ah = g_atlas_h;
+	if (aw == 0 || ah == 0) { // no mode info → 2x1 of the recommended rect
+		aw = view_configs[0].recommendedImageRectWidth * 2;
+		ah = view_configs[0].recommendedImageRectHeight;
 	}
+	g_views[0].width = aw;
+	g_views[0].height = ah;
+
+	XrSwapchainCreateInfo ci = {};
+	ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	ci.format = g_swapchain_format;
+	ci.sampleCount = view_configs[0].recommendedSwapchainSampleCount;
+	ci.width = aw;
+	ci.height = ah;
+	ci.faceCount = 1;
+	ci.arraySize = 1;
+	ci.mipCount = 1;
+	res = xrCreateSwapchain(g_session, &ci, &g_views[0].swapchain);
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrCreateSwapchain", res);
+		return false;
+	}
+	uint32_t img_count = 0;
+	res = xrEnumerateSwapchainImages(g_views[0].swapchain, 0, &img_count, nullptr);
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrEnumerateSwapchainImages(count)", res);
+		return false;
+	}
+	if (img_count > 8) {
+		img_count = 8;
+	}
+	for (uint32_t j = 0; j < img_count; ++j) {
+		g_views[0].images[j].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+	}
+	res = xrEnumerateSwapchainImages(
+	    g_views[0].swapchain, img_count, &img_count,
+	    reinterpret_cast<XrSwapchainImageBaseHeader *>(g_views[0].images));
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrEnumerateSwapchainImages(fill)", res);
+		return false;
+	}
+	g_views[0].image_count = img_count;
+	g_views[1] = g_views[0]; // alias: all projection views share the one atlas swapchain
+	LOGI("Atlas swapchain: %ux%u, %u images", aw, ah, img_count);
 	return true;
 }
 
@@ -1086,13 +1125,18 @@ render_frame()
 		}
 		uint32_t located = 0;
 		res = xrLocateViews(g_session, &locate_info, &view_state, kViewCount, &located, views);
-		// In 2D the runtime collapses to a centered eye but still fills the stereo
-		// view-config (located=2, both views identical/cyclopean); we submit both —
-		// the DP weaves two identical views with no disparity = flat 2D, and the
-		// runtime z-fix (displayxr-runtime#538) keeps the eye distance correct.
-		// (Submitting just 1 view routed 2D through a mono-blit path that bypassed
-		// the DP weave and broke the 2D→3D switch back; #533.)
-		const uint32_t view_count = located < kViewCount ? located : kViewCount;
+		// Multiview-tiling invariant: submit the ACTIVE mode's view count — 2D = 1
+		// tile (1x1), 3D = 2 tiles (2x1). Each tile is rendered at the active tile
+		// size (display × view_scale; computed below once g_win_px is fresh) into a
+		// sub-rect of the worst-case swapchain, and submitted as subImage.imageRect.
+		// The runtime z-fix (displayxr-runtime#538) keeps the 2D eye distance right.
+		uint32_t view_count = located < kViewCount ? located : kViewCount;
+		{
+			const uint32_t mode = g_rmode_current.load(std::memory_order_relaxed);
+			const uint32_t mvc = (mode < 8 && g_rmode_vc[mode] > 0) ? g_rmode_vc[mode] : view_count;
+			if (mvc < view_count)
+				view_count = mvc;
+		}
 		if (res == XR_SUCCESS && view_count >= 1) {
 			DXR_HW_DBG_ONCE("first xrLocateViews success");
 			submitted_view_count = view_count;
@@ -1114,6 +1158,33 @@ render_frame()
 					                 std::memory_order_relaxed);
 				}
 			}
+			// Active-mode tile size = display (held orientation, via the live canvas
+			// px) × the mode's view_scale; tiles are laid out per the mode's grid
+			// (cols×rows) inside the one worst-case atlas. tile_w/h drive both the
+			// per-tile render viewport and each view's submitted subImage.imageRect.
+			uint32_t tile_w = 0, tile_h = 0, cols = 1, rows = 1;
+			{
+				const uint32_t mode = g_rmode_current.load(std::memory_order_relaxed);
+				cols = (mode < 8 && g_rmode_cols[mode] > 0) ? g_rmode_cols[mode] : 1;
+				rows = (mode < 8 && g_rmode_rows[mode] > 0) ? g_rmode_rows[mode] : 1;
+				uint32_t dw = g_win_px_w.load(std::memory_order_relaxed);
+				uint32_t dh = g_win_px_h.load(std::memory_order_relaxed);
+				if (dw == 0 || dh == 0) {
+					dw = g_views[0].width / cols;
+					dh = g_views[0].height / rows;
+				}
+				const float sx = (mode < 8 && g_rmode_scale_x[mode] > 0.0f) ? g_rmode_scale_x[mode] : 1.0f;
+				const float sy = (mode < 8 && g_rmode_scale_y[mode] > 0.0f) ? g_rmode_scale_y[mode] : 1.0f;
+				tile_w = (uint32_t)((float)dw * sx);
+				tile_h = (uint32_t)((float)dh * sy);
+				if (tile_w == 0) tile_w = dw;
+				if (tile_h == 0) tile_h = dh;
+				// Tiles must not overflow the atlas (cols×tile_w ≤ atlas_w, etc).
+				const uint32_t max_tw = g_views[0].width / cols;
+				const uint32_t max_th = g_views[0].height / rows;
+				if (tile_w > max_tw) tile_w = max_tw;
+				if (tile_h > max_th) tile_h = max_th;
+			}
 			// Splat model (recenter + flip + spin + push) — same for both eyes.
 			const float yaw =
 			    g_user_rotated.load(std::memory_order_relaxed)
@@ -1123,62 +1194,63 @@ render_frame()
 			const Mat4 splat_model = build_splat_model(yaw);
 			// Advance glTF animation (bind pose if the model has none). ~60 fps dt.
 			g_model.updateAnimation(1.0f / 60.0f);
-			for (uint32_t i = 0; i < view_count; ++i) {
-				XrSwapchainImageAcquireInfo acq = {};
-				acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
-				uint32_t img_idx = 0;
-				res = xrAcquireSwapchainImage(g_views[i].swapchain, &acq, &img_idx);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrAcquireSwapchainImage", res);
-					break;
-				}
+
+			// ONE atlas swapchain (multiview-tiling invariant): acquire once, render
+			// each tile into its (cols×rows) layout offset, release once. All views
+			// reference g_views[0]; each signals its tile via subImage.imageRect and
+			// the compositor maps eye→destination tile by index. renderEye preserves
+			// earlier tiles when viewportX!=0 (first tile clears with UNDEFINED).
+			XrSwapchainImageAcquireInfo acq = {};
+			acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+			uint32_t img_idx = 0;
+			res = xrAcquireSwapchainImage(g_views[0].swapchain, &acq, &img_idx);
+			if (res == XR_SUCCESS) {
 				XrSwapchainImageWaitInfo wait_img = {};
 				wait_img.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
 				wait_img.timeout = XR_INFINITE_DURATION;
-				res = xrWaitSwapchainImage(g_views[i].swapchain, &wait_img);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrWaitSwapchainImage", res);
-					break;
-				}
+				res = xrWaitSwapchainImage(g_views[0].swapchain, &wait_img);
+			}
+			if (res == XR_SUCCESS) {
+				for (uint32_t i = 0; i < view_count; ++i) {
+					const uint32_t tile_x = (i % cols) * tile_w;
+					const uint32_t tile_y = (i / cols) * tile_h;
 
-				Mat4 viewM = view_matrix_from_pose(views[i].pose);
-				Mat4 evM = mat4_mul(viewM, splat_model);  // apply splat model
-				Mat4 projM;
-				if (g_has_view_rig) {
-					// Render-ready off-axis FOV from the rig — pass it through
-					// (aspect -1: the symmetric override would destroy the
-					// off-axis skew). ZDP-anchored clips about the virtual
-					// display plane: near = ez - vH, far = ez + 1000·vH.
-					const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
-					const float near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
-					const float far_z = ez + 1000.0f * rig_vh;
-					projM = projection_matrix_from_fov(views[i].fov, -1.0f, near_z, far_z);
-				} else {
-					const float aspect = (float)g_views[i].width / (float)g_views[i].height;
-					projM = projection_matrix_from_fov(views[i].fov, aspect, 0.01f, 100.0f);
-				}
-				g_model.renderEye(
-				    g_views[i].images[img_idx].image, g_swapchain_format,
-				    g_views[i].width, g_views[i].height,
-				    0, 0, g_views[i].width, g_views[i].height,
-				    evM.m, projM.m);
+					Mat4 viewM = view_matrix_from_pose(views[i].pose);
+					Mat4 evM = mat4_mul(viewM, splat_model);  // apply splat model
+					Mat4 projM;
+					if (g_has_view_rig) {
+						// Render-ready off-axis FOV from the rig — pass it through
+						// (aspect -1: the symmetric override would destroy the
+						// off-axis skew). ZDP-anchored clips about the virtual
+						// display plane: near = ez - vH, far = ez + 1000·vH.
+						const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
+						const float near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
+						const float far_z = ez + 1000.0f * rig_vh;
+						projM = projection_matrix_from_fov(views[i].fov, -1.0f, near_z, far_z);
+					} else {
+						const float aspect = (float)tile_w / (float)tile_h;
+						projM = projection_matrix_from_fov(views[i].fov, aspect, 0.01f, 100.0f);
+					}
+					// Render tile i into its (tile_x,tile_y) sub-rect of the atlas.
+					g_model.renderEye(
+					    g_views[0].images[img_idx].image, g_swapchain_format,
+					    g_views[0].width, g_views[0].height,
+					    tile_x, tile_y, tile_w, tile_h,
+					    evM.m, projM.m);
 
+					projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+					projection_views[i].pose = views[i].pose;
+					projection_views[i].fov = views[i].fov;
+					projection_views[i].subImage.swapchain = g_views[0].swapchain;
+					projection_views[i].subImage.imageRect.offset = {(int32_t)tile_x, (int32_t)tile_y};
+					projection_views[i].subImage.imageRect.extent = {(int32_t)tile_w, (int32_t)tile_h};
+					projection_views[i].subImage.imageArrayIndex = 0;
+				}
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-				res = xrReleaseSwapchainImage(g_views[i].swapchain, &rel);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrReleaseSwapchainImage", res);
-					break;
-				}
-
-				projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-				projection_views[i].pose = views[i].pose;
-				projection_views[i].fov = views[i].fov;
-				projection_views[i].subImage.swapchain = g_views[i].swapchain;
-				projection_views[i].subImage.imageRect.offset = {0, 0};
-				projection_views[i].subImage.imageRect.extent = {
-				    (int32_t)g_views[i].width, (int32_t)g_views[i].height};
-				projection_views[i].subImage.imageArrayIndex = 0;
+				res = xrReleaseSwapchainImage(g_views[0].swapchain, &rel);
+			} else {
+				log_xr_result("xrAcquire/WaitSwapchainImage", res);
 			}
 			rendered = (res == XR_SUCCESS);
 		} else {
@@ -1357,9 +1429,12 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    pick_physical_device() &&
 			    create_vulkan_device() &&
 			    create_session() &&
+			    // Enumerate modes BEFORE create_swapchains so the worst-case tile
+			    // (g_worst_tile_edge) + per-mode scales are known when the (never-
+			    // reallocated) swapchain is sized. (multiview-tiling invariant.)
+			    enumerate_rendering_modes() &&
 			    create_swapchains() &&
 			    create_reference_space() &&
-			    enumerate_rendering_modes() &&
 			    gs_init() &&
 			    load_model_index(app, 0);
 			if (ok && g_use_ws_ui) {
