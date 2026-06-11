@@ -130,7 +130,10 @@ char g_rmode_names[8][64] = {};  // mode names for the Mode button label
 //    sessions (runtime#506). Kept behind `adb shell setprop debug.dxr.mv.ws_ui 1`
 //    as the ready-made #506 test client; flip the default once #506 lands.
 HudBar g_hud_bar;
-bool g_use_ws_ui = false;  // debug.dxr.mv.ws_ui=1 → window-space bar (#506 test)
+// Default to the XrCompositionLayerWindowSpaceEXT bar now that the runtime
+// supports window-space layers on Android OOP (#506/#529 landed). Override with
+// `setprop debug.dxr.mv.ws_ui 0` to fall back to the interim Kotlin widget bar.
+bool g_use_ws_ui = true;
 // Cached labels for the Kotlin bar (written on the android_main thread, read
 // from the UI thread via JNI — the renderer itself is not thread-safe to poll).
 std::mutex g_ui_label_mutex;
@@ -1083,8 +1086,12 @@ render_frame()
 		}
 		uint32_t located = 0;
 		res = xrLocateViews(g_session, &locate_info, &view_state, kViewCount, &located, views);
-		// A runtime-initiated 2D mode locates 1 view (the server collapses to a
-		// centered eye) — render whatever count came back, not a fixed 2.
+		// In 2D the runtime collapses to a centered eye but still fills the stereo
+		// view-config (located=2, both views identical/cyclopean); we submit both —
+		// the DP weaves two identical views with no disparity = flat 2D, and the
+		// runtime z-fix (displayxr-runtime#538) keeps the eye distance correct.
+		// (Submitting just 1 view routed 2D through a mono-blit path that bypassed
+		// the DP weave and broke the 2D→3D switch back; #533.)
 		const uint32_t view_count = located < kViewCount ? located : kViewCount;
 		if (res == XR_SUCCESS && view_count >= 1) {
 			DXR_HW_DBG_ONCE("first xrLocateViews success");
@@ -1572,11 +1579,12 @@ android_main(struct android_app *app)
 {
 	LOGI("model_viewer_vk_android: android_main entered");
 	{
-		// debug.dxr.mv.ws_ui=1 → use the XrCompositionLayerWindowSpaceEXT bar
-		// instead of the Kotlin widget bar (the runtime#506 test client).
+		// Window-space bar is the default now (#506/#529 landed). Allow an
+		// explicit override either way: `setprop debug.dxr.mv.ws_ui 0` forces the
+		// interim Kotlin widget bar, `=1` forces the window-space bar.
 		char prop[PROP_VALUE_MAX] = {};
-		if (__system_property_get("debug.dxr.mv.ws_ui", prop) > 0 && prop[0] == '1') {
-			g_use_ws_ui = true;
+		if (__system_property_get("debug.dxr.mv.ws_ui", prop) > 0 && (prop[0] == '0' || prop[0] == '1')) {
+			g_use_ws_ui = (prop[0] == '1');
 		}
 		LOGI("button UI: %s", g_use_ws_ui ? "window-space layer (#506 test)" : "Kotlin widget bar");
 	}
@@ -1649,6 +1657,22 @@ android_main(struct android_app *app)
 				    (g_rmode_current.load(std::memory_order_relaxed) + 1) % g_rmode_count;
 				LOGI("UI: requesting rendering mode %u", next);
 				g_pfnReqMode(g_session, next);
+			}
+			// #533 test hook: absolute mode select via adb (the UI button bar is
+			// dormant pending the window-space layer). `setprop debug.dxr.mode N` →
+			// request mode N (0=2D, 1=3D). Re-request only on change.
+			{
+				static int last_prop_mode = -1;
+				char prop[PROP_VALUE_MAX] = {0};
+				if (__system_property_get("debug.dxr.mode", prop) > 0) {
+					int want = atoi(prop);
+					if (want >= 0 && want != last_prop_mode && g_pfnReqMode != nullptr &&
+					    (uint32_t)want < g_rmode_count) {
+						last_prop_mode = want;
+						LOGI("debug.dxr.mode=%d -> requesting rendering mode", want);
+						g_pfnReqMode(g_session, (uint32_t)want);
+					}
+				}
 			}
 			if (g_anim_cycle_request.exchange(false, std::memory_order_relaxed)) {
 				// Multiple clips → next clip (the Windows 'N' semantics);
