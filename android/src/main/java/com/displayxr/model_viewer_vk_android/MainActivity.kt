@@ -65,8 +65,9 @@ class MainActivity : NativeActivity() {
         action: Int, count: Int, x0: Float, y0: Float, x1: Float, y1: Float,
     )
 
-    // Double-tap re-frames / cycles the bundled model.
-    private external fun nativeCycleModel()
+    // Double-tap resets the viewpoint to the initial framing (instant; no
+    // model reload — model switching moves to the planned button UI).
+    private external fun nativeResetView()
 
     // First installed runtime package, preferring out_of_process. Null if none.
     private val installedRuntime: String? by lazy {
@@ -86,7 +87,7 @@ class MainActivity : NativeActivity() {
             object : GestureDetector.SimpleOnGestureListener() {
                 override fun onDoubleTap(e: MotionEvent): Boolean {
                     try {
-                        nativeCycleModel()
+                        nativeResetView()
                     } catch (_: Throwable) {
                     }
                     return true

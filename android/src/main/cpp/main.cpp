@@ -149,6 +149,11 @@ const char *const kModels[] = {
 constexpr int kModelCount = (int)(sizeof(kModels) / sizeof(kModels[0]));
 std::atomic<int> g_model_index{0};    // which model is loaded
 std::atomic<int> g_load_request{-1};  // a switch request from Java (-1 = none)
+// Double-tap = reset the viewpoint to the initial framing (pitch 0, fit zoom,
+// turntable restarting from yaw 0). Lightweight — no model reload. Model
+// switching moves to the (future) on-tap button UI.
+std::atomic<bool> g_reset_view_request{false};
+std::atomic<uint64_t> g_spin_base{0};  // frame the turntable phase restarts from
 
 // Scene framing: the .spz is centered near the world origin, which is also
 // where the head/reference space sits — so by default the splat is right on
@@ -1008,9 +1013,11 @@ render_frame()
 				}
 			}
 			// Splat model (recenter + flip + spin + push) — same for both eyes.
-			const float yaw = g_user_rotated.load(std::memory_order_relaxed)
-			                      ? g_user_yaw.load(std::memory_order_relaxed)
-			                      : (float)g_frame_count * g_spin_speed;
+			const float yaw =
+			    g_user_rotated.load(std::memory_order_relaxed)
+			        ? g_user_yaw.load(std::memory_order_relaxed)
+			        : (float)(g_frame_count - g_spin_base.load(std::memory_order_relaxed)) *
+			              g_spin_speed;
 			const Mat4 splat_model = build_splat_model(yaw);
 			// Advance glTF animation (bind pose if the model has none). ~60 fps dt.
 			g_model.updateAnimation(1.0f / 60.0f);
@@ -1245,8 +1252,10 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
 		drag_valid = true;
 		// Seed user yaw from the turntable angle so the first drag doesn't snap.
 		if (!g_user_rotated.load(std::memory_order_relaxed)) {
-			g_user_yaw.store((float)g_frame_count * g_spin_speed,
-			                 std::memory_order_relaxed);
+			g_user_yaw.store(
+			    (float)(g_frame_count - g_spin_base.load(std::memory_order_relaxed)) *
+			        g_spin_speed,
+			    std::memory_order_relaxed);
 		}
 	} else if (action == kMove && drag_valid) {
 		const float dx = x0 - drag_x, dy = y0 - drag_y;
@@ -1264,15 +1273,16 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
 	}
 }
 
-// Double-tap (from Java's GestureDetector) cycles to the next bundled model.
-// The actual load runs on the android_main thread (see the loop) since it
-// touches Vulkan; here we just record the request.
+// Double-tap (from Java's GestureDetector) resets the viewpoint to the
+// initial framing. Just records the request; the reset runs on the
+// android_main thread (see the loop). Model switching is no longer on
+// double-tap — it moves to the planned on-tap button UI (g_load_request
+// stays as its hook).
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeCycleModel(
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeResetView(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
-	const int next = (g_model_index.load(std::memory_order_relaxed) + 1) % kModelCount;
-	g_load_request.store(next, std::memory_order_relaxed);
+	g_reset_view_request.store(true, std::memory_order_relaxed);
 }
 
 extern "C" void
@@ -1307,14 +1317,25 @@ android_main(struct android_app *app)
 				destroy_all();
 				return;
 			}
-			// Service a pending model switch (double-tap) on this thread, where
-			// the Vulkan device is valid. load_model_index waits for GPU idle.
+			// Double-tap: reset the viewpoint to the initial framing. Pure
+			// atomic stores — instant, no Vulkan work, no reload.
+			if (g_reset_view_request.exchange(false, std::memory_order_relaxed)) {
+				g_user_rotated.store(false, std::memory_order_relaxed);
+				g_user_yaw.store(0.0f, std::memory_order_relaxed);
+				g_user_pitch.store(0.0f, std::memory_order_relaxed);
+				g_scene_scale.store(g_fit_scale, std::memory_order_relaxed);
+				g_spin_base.store(g_frame_count, std::memory_order_relaxed);
+			}
+			// Service a pending model switch (future button UI) on this thread,
+			// where the Vulkan device is valid. load_model_index waits for GPU
+			// idle.
 			const int req = g_load_request.exchange(-1, std::memory_order_relaxed);
 			if (req >= 0) {
 				// Reset orientation/zoom so the new model auto-frames cleanly.
 				g_user_rotated.store(false, std::memory_order_relaxed);
 				g_user_yaw.store(0.0f, std::memory_order_relaxed);
 				g_user_pitch.store(0.0f, std::memory_order_relaxed);
+				g_spin_base.store(g_frame_count, std::memory_order_relaxed);
 				load_model_index(app, req);
 			}
 			// Drive frames from READY (not SYNCHRONIZED+): a CTS-compliant
