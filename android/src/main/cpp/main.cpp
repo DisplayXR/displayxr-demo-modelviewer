@@ -21,6 +21,10 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_display_info.h>  // display rendering-mode enumerate/request
 #include <openxr/XR_EXT_view_rig.h>      // runtime-owned Kooima views (#396 W7)
+// XrCompositionLayerWindowSpaceEXT — the shared window-space layer struct is
+// declared (ifndef-guarded) in the window-binding headers; the cocoa one is
+// plain C with no platform deps, so it serves as the decl source on Android.
+#include <openxr/XR_EXT_cocoa_window_binding.h>
 
 #include <atomic>
 #include <vector>
@@ -29,11 +33,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <jni.h>
+#include <mutex>
 #include <string>
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include "hud_bar.h"
 #include "model_renderer.h"
 
 #define LOG_TAG "model_viewer_vk_android"
@@ -103,9 +110,56 @@ XrSpace g_app_space = XR_NULL_HANDLE;
 PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
 PFN_xrRequestDisplayRenderingModeEXT g_pfnReqMode = nullptr;
 uint32_t g_rmode_count = 0;
-uint32_t g_rmode_current = 0;
+std::atomic<uint32_t> g_rmode_current{0};
 bool g_rmode_requestable = false;
 std::atomic<bool> g_cycle_mode_request{false};
+char g_rmode_names[8][64] = {};  // mode names for the Mode button label
+
+// ── On-screen button bar (window-space layer) ───────────────────────────────
+// Tap anywhere → the top button bar appears ([Open] [Mode] [Anim], the same
+// chrome as the Windows leg); it fades out after 5 s without any touch. The
+// bar is one full-width XrCompositionLayerWindowSpaceEXT — the first use of
+// window-space layers on the Android OOP path.
+HudBar g_hud_bar;
+std::atomic<bool> g_ui_visible{false};
+std::atomic<int64_t> g_ui_last_touch_ms{0};
+// Set when the runtime rejects the window-space layer (XR_ERROR_LAYER_INVALID
+// — the Android OOP session doesn't pass oxr's verify_window_space_layer gate
+// yet); the whole button UI then stays off for the session. Auto-heals on a
+// runtime that accepts the layer: nothing to change app-side.
+std::atomic<bool> g_ws_layer_unsupported{false};
+std::atomic<bool> g_ui_tap_pending{false};
+std::atomic<float> g_ui_tap_x{0.0f};
+std::atomic<float> g_ui_tap_y{0.0f};
+std::atomic<bool> g_anim_cycle_request{false};
+std::atomic<bool> g_open_picker_request{false};  // native → Kotlin (polled)
+std::mutex g_picked_path_mutex;
+std::string g_picked_path;
+std::atomic<bool> g_picked_pending{false};
+// Live window pixel size (from the rig raw channel) for tap → fraction mapping.
+std::atomic<uint32_t> g_win_px_w{0};
+std::atomic<uint32_t> g_win_px_h{0};
+
+constexpr int64_t kUiHideMs = 5000;  // idle time before the bar starts fading
+constexpr int64_t kUiFadeMs = 400;   // fade-out duration
+
+// Bar geometry — mirrors the Windows leg's top button bar (windows/main.cpp):
+// absolute window fractions used both for hit-testing and pill placement (the
+// bar layer spans the full window width, so window-x == bar-texture-x).
+constexpr float kBarYFrac = 0.008f;
+constexpr float kOpenBtnX = 0.010f, kOpenBtnW = 0.080f;
+constexpr float kModeBtnX = 0.100f, kModeBtnW = 0.160f;
+constexpr float kAnimBtnW = 0.160f, kAnimBtnMargin = 0.010f;
+constexpr uint32_t kBarTexW = 1920;
+constexpr uint32_t kBarTexH = 112;  // thicker than Windows' 56 px — finger targets
+
+int64_t
+now_ms()
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 // ── XR_EXT_view_rig (#396 W7) ───────────────────────────────────────────────
 // When the runtime advertises XR_EXT_view_rig, chain an XrDisplayRigEXT on
@@ -662,8 +716,12 @@ enumerate_rendering_modes()
 	g_rmode_count = count;
 	for (uint32_t i = 0; i < count; ++i) {
 		const auto &m = modes[i];
+		if (m.modeIndex < 8) {
+			std::strncpy(g_rmode_names[m.modeIndex], m.modeName,
+			             sizeof(g_rmode_names[0]) - 1);
+		}
 		if (m.isActive) {
-			g_rmode_current = m.modeIndex;
+			g_rmode_current.store(m.modeIndex, std::memory_order_relaxed);
 			g_rmode_requestable = m.isRequestable;
 		}
 		LOGI("RMODE[%u] idx=%u \"%s\" views=%u scale=(%.3f,%.3f) hw3D=%d tiles=%ux%u "
@@ -673,7 +731,8 @@ enumerate_rendering_modes()
 		     m.viewHeightPixels, (int)m.isActive, (int)m.isRequestable);
 	}
 	LOGI("Display rendering modes: %u total, current=%u, requestable=%d",
-	     g_rmode_count, g_rmode_current, (int)g_rmode_requestable);
+	     g_rmode_count, g_rmode_current.load(std::memory_order_relaxed),
+	     (int)g_rmode_requestable);
 	return true;
 }
 
@@ -809,51 +868,23 @@ gs_init()
 	return true;
 }
 
-// Copy kModels[idx] out of the APK assets into app-private storage (the glTF
-// loader takes a filesystem path), then load it into the renderer + auto-frame.
-// Safe to call between frames on the android_main thread (same thread that
-// renders) — loadModel waits for device idle before rebuilding its buffers.
+// Load a glTF from a filesystem path into the renderer + auto-frame. Safe to
+// call between frames on the android_main thread (same thread that renders) —
+// it waits for device idle before rebuilding the renderer's buffers.
 bool
-load_model_index(struct android_app *app, int idx)
+load_model_path(const char *path)
 {
 	if (!g_model_ready) {
-		return false;
-	}
-	if (idx < 0 || idx >= kModelCount) {
-		idx = 0;
-	}
-	const char *name = kModels[idx];
-	AAssetManager *mgr = app->activity->assetManager;
-	AAsset *asset = AAssetManager_open(mgr, name, AASSET_MODE_BUFFER);
-	if (asset == nullptr) {
-		LOGE("%s not found in assets", name);
-		return false;
-	}
-	const void *buf = AAsset_getBuffer(asset);
-	const off_t len = AAsset_getLength(asset);
-	std::string path = std::string(app->activity->internalDataPath) + "/" + name;
-	bool ok = false;
-	if (buf != nullptr && len > 0) {
-		FILE *f = std::fopen(path.c_str(), "wb");
-		if (f != nullptr) {
-			ok = std::fwrite(buf, 1, (size_t)len, f) == (size_t)len;
-			std::fclose(f);
-		}
-	}
-	AAsset_close(asset);
-	if (!ok) {
-		LOGE("failed to stage %s to %s", name, path.c_str());
 		return false;
 	}
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);  // no GPU work touching the old model
 	}
-	if (!g_model.loadModel(path.c_str())) {
-		LOGE("ModelRenderer::loadModel failed for %s", path.c_str());
+	if (!g_model.loadModel(path)) {
+		LOGE("ModelRenderer::loadModel failed for %s", path);
 		return false;
 	}
-	g_model_index.store(idx, std::memory_order_relaxed);
-	LOGI("Loaded model [%d/%d]: %s", idx + 1, kModelCount, name);
+	LOGI("Loaded model: %s", path);
 
 	// Auto-frame: recenter on the robust scene centroid and pick a push-back
 	// distance from the scene extent so it starts at a comfortable size.
@@ -880,6 +911,44 @@ load_model_index(struct android_app *app, int idx)
 		     ext[0], ext[1], ext[2], g_scene_push.load(std::memory_order_relaxed), g_rig_vh);
 	}
 	g_scene_loaded.store(true, std::memory_order_relaxed);
+	return true;
+}
+
+// Copy kModels[idx] out of the APK assets into app-private storage (the glTF
+// loader takes a filesystem path), then load it via load_model_path.
+bool
+load_model_index(struct android_app *app, int idx)
+{
+	if (idx < 0 || idx >= kModelCount) {
+		idx = 0;
+	}
+	const char *name = kModels[idx];
+	AAssetManager *mgr = app->activity->assetManager;
+	AAsset *asset = AAssetManager_open(mgr, name, AASSET_MODE_BUFFER);
+	if (asset == nullptr) {
+		LOGE("%s not found in assets", name);
+		return false;
+	}
+	const void *buf = AAsset_getBuffer(asset);
+	const off_t len = AAsset_getLength(asset);
+	std::string path = std::string(app->activity->internalDataPath) + "/" + name;
+	bool ok = false;
+	if (buf != nullptr && len > 0) {
+		FILE *f = std::fopen(path.c_str(), "wb");
+		if (f != nullptr) {
+			ok = std::fwrite(buf, 1, (size_t)len, f) == (size_t)len;
+			std::fclose(f);
+		}
+	}
+	AAsset_close(asset);
+	if (!ok) {
+		LOGE("failed to stage %s to %s", name, path.c_str());
+		return false;
+	}
+	if (!load_model_path(path.c_str())) {
+		return false;
+	}
+	g_model_index.store(idx, std::memory_order_relaxed);
 	return true;
 }
 
@@ -934,6 +1003,10 @@ poll_xr_events()
 				LOGI("session state -> %d", (int)e->state);
 				handle_session_state(e->state);
 			}
+		} else if (ev.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
+			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedEXT *>(&ev);
+			LOGI("rendering mode changed: %u -> %u", e->previousModeIndex, e->currentModeIndex);
+			g_rmode_current.store(e->currentModeIndex, std::memory_order_relaxed);
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			g_exit_requested = true;
 		}
@@ -1011,6 +1084,14 @@ render_frame()
 					     view_raw.canvasRectPx.extent.width, view_raw.canvasRectPx.extent.height,
 					     view_raw.canvasSizeMeters.width, view_raw.canvasSizeMeters.height);
 				}
+				// Live window px for the button bar (tap → fraction mapping
+				// and bar aspect) — tracks rotation via the raw channel.
+				if (view_raw.canvasRectPx.extent.width > 0 && view_raw.canvasRectPx.extent.height > 0) {
+					g_win_px_w.store((uint32_t)view_raw.canvasRectPx.extent.width,
+					                 std::memory_order_relaxed);
+					g_win_px_h.store((uint32_t)view_raw.canvasRectPx.extent.height,
+					                 std::memory_order_relaxed);
+				}
 			}
 			// Splat model (recenter + flip + spin + push) — same for both eyes.
 			const float yaw =
@@ -1084,21 +1165,107 @@ render_frame()
 		}
 	}
 
+	// ── Button bar (window-space layer): shown on tap, fades after 5 s idle ──
+	float ui_alpha = 0.0f;
+	if (g_ui_visible.load(std::memory_order_relaxed)) {
+		const int64_t idle = now_ms() - g_ui_last_touch_ms.load(std::memory_order_relaxed);
+		if (idle < kUiHideMs) {
+			ui_alpha = 1.0f;
+		} else if (idle < kUiHideMs + kUiFadeMs) {
+			ui_alpha = 1.0f - (float)(idle - kUiHideMs) / (float)kUiFadeMs;
+		} else {
+			g_ui_visible.store(false, std::memory_order_relaxed);
+		}
+	}
+	XrCompositionLayerWindowSpaceEXT bar_layer = {};
+	bool bar_active = false;
+	if (ui_alpha > 0.0f && g_hud_bar.ready && rendered &&
+	    !g_ws_layer_unsupported.load(std::memory_order_relaxed)) {
+		char mode_label[80];
+		const uint32_t cur = g_rmode_current.load(std::memory_order_relaxed);
+		std::snprintf(mode_label, sizeof(mode_label), "Mode: %s",
+		              (cur < 8 && g_rmode_names[cur][0] != '\0') ? g_rmode_names[cur] : "n/a");
+		const bool anim_enabled = g_model.hasAnimations();
+		std::string anim_label;
+		if (anim_enabled) {
+			std::string nm;
+			int ai = 0, ac = 0;
+			float t = 0, d = 0;
+			bool playing = false;
+			if (g_model.getPlaybackInfo(nm, ai, ac, t, d, playing)) {
+				anim_label = playing ? nm : "Paused";
+			}
+		}
+		static std::string s_last_mode, s_last_anim;
+		static bool s_last_anim_en = false;
+		static float s_last_alpha = -1.0f;
+		const bool content_changed = s_last_mode != mode_label || s_last_anim != anim_label ||
+		                             s_last_anim_en != anim_enabled;
+		if (content_changed) {
+			const HudBarButton btns[3] = {
+			    {kOpenBtnX, kOpenBtnW, "Open", true},
+			    {kModeBtnX, kModeBtnW, mode_label, true},
+			    {1.0f - kAnimBtnW - kAnimBtnMargin, kAnimBtnW, anim_label, anim_enabled},
+			};
+			hud_bar_render(g_hud_bar, btns, 3);
+			s_last_mode = mode_label;
+			s_last_anim = anim_label;
+			s_last_anim_en = anim_enabled;
+		}
+		if (content_changed || ui_alpha != s_last_alpha) {
+			hud_bar_upload(g_hud_bar, ui_alpha);
+			s_last_alpha = ui_alpha;
+		}
+		uint32_t ww = g_win_px_w.load(std::memory_order_relaxed);
+		uint32_t wh = g_win_px_h.load(std::memory_order_relaxed);
+		if (ww == 0 || wh == 0) {
+			ww = 2560;
+			wh = 1600;
+		}
+		// Full window width; height preserves the texture aspect (Windows-leg
+		// BtnBarHeightFraction): h_frac = windowAR / texAR.
+		const float bar_h = ((float)ww / (float)wh) / ((float)kBarTexW / (float)kBarTexH);
+		bar_layer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+		bar_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+		bar_layer.subImage.swapchain = g_hud_bar.swapchain;
+		bar_layer.subImage.imageRect.offset = {0, 0};
+		bar_layer.subImage.imageRect.extent = {(int32_t)kBarTexW, (int32_t)kBarTexH};
+		bar_layer.subImage.imageArrayIndex = 0;
+		bar_layer.x = 0.0f;
+		bar_layer.y = kBarYFrac;
+		bar_layer.width = 1.0f;
+		bar_layer.height = bar_h;
+		bar_layer.disparity = 0.0f;
+		bar_active = true;
+	}
+
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
 	projection_layer.space = g_app_space;
 	projection_layer.viewCount = submitted_view_count;
 	projection_layer.views = projection_views;
-	const XrCompositionLayerBaseHeader *layers[1] = {
-	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer)};
+	const XrCompositionLayerBaseHeader *layers[2] = {
+	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection_layer),
+	    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&bar_layer)};
 
 	XrFrameEndInfo end_info = {};
 	end_info.type = XR_TYPE_FRAME_END_INFO;
 	end_info.displayTime = frame_state.predictedDisplayTime;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	end_info.layerCount = rendered ? 1 : 0;
+	end_info.layerCount = rendered ? (bar_active ? 2 : 1) : 0;
 	end_info.layers = rendered ? layers : nullptr;
 	res = xrEndFrame(g_session, &end_info);
+	if (res == XR_ERROR_LAYER_INVALID && bar_active) {
+		// The runtime's window-space gate doesn't accept this session (Android
+		// OOP — see the runtime issue on verify_window_space_layer). Disable
+		// the button UI for this run and resubmit the frame without the bar so
+		// frame discipline is preserved.
+		g_ws_layer_unsupported.store(true, std::memory_order_relaxed);
+		g_ui_visible.store(false, std::memory_order_relaxed);
+		LOGW("window-space layer rejected by the runtime — button UI disabled this session");
+		end_info.layerCount = 1;
+		res = xrEndFrame(g_session, &end_info);
+	}
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEndFrame", res);
 		return false;
@@ -1126,6 +1293,7 @@ destroy_all()
 		g_model.cleanup();
 		g_model_ready = false;
 	}
+	hud_bar_destroy(g_hud_bar);
 	if (g_session != XR_NULL_HANDLE) {
 		xrDestroySession(g_session);
 		g_session = XR_NULL_HANDLE;
@@ -1173,6 +1341,12 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    enumerate_rendering_modes() &&
 			    gs_init() &&
 			    load_model_index(app, 0);
+			if (ok) {
+				// Non-fatal: without it the app simply has no button UI.
+				hud_bar_init(g_hud_bar, g_session, g_vk_phys_device, g_vk_device,
+				             g_vk_queue, g_vk_queue_family, g_swapchain_format,
+				             kBarTexW, kBarTexH);
+			}
 			LOGI(ok ? "Bring-up complete." : "Bring-up failed; see logs.");
 		}
 		break;
@@ -1226,6 +1400,11 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
 	static bool drag_valid = false;  // a clean single-finger gesture is in progress
 	// AMOTION_EVENT_ACTION_* values match MotionEvent.ACTION_* (0=DOWN,1=UP,2=MOVE,…).
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
+
+	// Any touch while the button bar is visible re-arms its 5 s idle timer.
+	if (g_ui_visible.load(std::memory_order_relaxed)) {
+		g_ui_last_touch_ms.store(now_ms(), std::memory_order_relaxed);
+	}
 
 	if (count >= 2) {
 		// ── two fingers: pinch-to-zoom (scale around the auto-fit size) ──
@@ -1285,6 +1464,45 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeResetView(
 	g_reset_view_request.store(true, std::memory_order_relaxed);
 }
 
+// Single tap (GestureDetector onSingleTapConfirmed — fires only when it's NOT
+// part of a double-tap). Coords are view pixels; hit-testing runs on the
+// android_main thread.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTap(
+    JNIEnv * /*env*/, jobject /*thiz*/, jfloat x, jfloat y)
+{
+	g_ui_tap_x.store((float)x, std::memory_order_relaxed);
+	g_ui_tap_y.store((float)y, std::memory_order_relaxed);
+	g_ui_tap_pending.store(true, std::memory_order_relaxed);
+}
+
+// Kotlin polls this; true means the native Open button was tapped and the
+// SAF document picker should be launched (native code can't start an Intent).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeConsumeOpenRequest(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	return g_open_picker_request.exchange(false, std::memory_order_relaxed) ? JNI_TRUE
+	                                                                        : JNI_FALSE;
+}
+
+// A picked document, already copied by Kotlin into app-private storage (the
+// glTF loader needs a filesystem path). Loaded on the android_main thread.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOpenModelPath(
+    JNIEnv *env, jobject /*thiz*/, jstring jpath)
+{
+	const char *chars = env->GetStringUTFChars(jpath, nullptr);
+	if (chars != nullptr) {
+		{
+			std::lock_guard<std::mutex> lock(g_picked_path_mutex);
+			g_picked_path = chars;
+		}
+		env->ReleaseStringUTFChars(jpath, chars);
+		g_picked_pending.store(true, std::memory_order_relaxed);
+	}
+}
+
 extern "C" void
 android_main(struct android_app *app)
 {
@@ -1316,6 +1534,66 @@ android_main(struct android_app *app)
 			if (g_exit_requested) {
 				destroy_all();
 				return;
+			}
+			// Single tap: first tap shows the button bar; while visible, taps
+			// hit-test the buttons (window fractions, mirroring the Windows
+			// hit-test). All servicing on this thread.
+			if (g_ui_tap_pending.exchange(false, std::memory_order_relaxed) &&
+			    !g_ws_layer_unsupported.load(std::memory_order_relaxed)) {
+				if (!g_ui_visible.load(std::memory_order_relaxed)) {
+					g_ui_visible.store(true, std::memory_order_relaxed);
+					LOGI("UI: bar shown");
+				} else {
+					uint32_t ww = g_win_px_w.load(std::memory_order_relaxed);
+					uint32_t wh = g_win_px_h.load(std::memory_order_relaxed);
+					if (ww == 0 || wh == 0) {
+						ww = 2560;
+						wh = 1600;
+					}
+					const float fx = g_ui_tap_x.load(std::memory_order_relaxed) / (float)ww;
+					const float fy = g_ui_tap_y.load(std::memory_order_relaxed) / (float)wh;
+					const float bar_h =
+					    ((float)ww / (float)wh) / ((float)kBarTexW / (float)kBarTexH);
+					if (fy >= kBarYFrac && fy <= kBarYFrac + bar_h) {
+						if (fx >= kOpenBtnX && fx <= kOpenBtnX + kOpenBtnW) {
+							LOGI("UI: Open tapped");
+							g_open_picker_request.store(true, std::memory_order_relaxed);
+						} else if (fx >= kModeBtnX && fx <= kModeBtnX + kModeBtnW) {
+							LOGI("UI: Mode tapped");
+							g_cycle_mode_request.store(true, std::memory_order_relaxed);
+						} else if (fx >= 1.0f - kAnimBtnW - kAnimBtnMargin &&
+						           fx <= 1.0f - kAnimBtnMargin && g_model.hasAnimations()) {
+							LOGI("UI: Animation tapped");
+							g_anim_cycle_request.store(true, std::memory_order_relaxed);
+						}
+					}
+				}
+				g_ui_last_touch_ms.store(now_ms(), std::memory_order_relaxed);
+			}
+			if (g_cycle_mode_request.exchange(false, std::memory_order_relaxed) &&
+			    g_pfnReqMode != nullptr && g_rmode_count > 1) {
+				const uint32_t next =
+				    (g_rmode_current.load(std::memory_order_relaxed) + 1) % g_rmode_count;
+				LOGI("UI: requesting rendering mode %u", next);
+				g_pfnReqMode(g_session, next);
+			}
+			if (g_anim_cycle_request.exchange(false, std::memory_order_relaxed)) {
+				g_model.cycleAnimation();
+			}
+			// A model picked via SAF (Kotlin copies it to app storage first).
+			if (g_picked_pending.exchange(false, std::memory_order_relaxed)) {
+				std::string path;
+				{
+					std::lock_guard<std::mutex> lock(g_picked_path_mutex);
+					path = g_picked_path;
+				}
+				if (!path.empty()) {
+					g_user_rotated.store(false, std::memory_order_relaxed);
+					g_user_yaw.store(0.0f, std::memory_order_relaxed);
+					g_user_pitch.store(0.0f, std::memory_order_relaxed);
+					g_spin_base.store(g_frame_count, std::memory_order_relaxed);
+					load_model_path(path.c_str());
+				}
 			}
 			// Double-tap: reset the viewpoint to the initial framing. Pure
 			// atomic stores — instant, no Vulkan work, no reload.

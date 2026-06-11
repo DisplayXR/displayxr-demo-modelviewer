@@ -8,3 +8,8 @@
 // by tinygltf (FetchContent) on the include path.
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+
+// stb_truetype for the button-bar glyph bake (hud_bar.cpp). The header comes
+// from the stb FetchContent in CMakeLists.txt.
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"

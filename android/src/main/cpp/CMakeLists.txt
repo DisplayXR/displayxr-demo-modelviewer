@@ -39,6 +39,13 @@ FetchContent_Declare(glm
     GIT_TAG        1.0.1)
 FetchContent_MakeAvailable(glm)
 
+# ── stb (stb_truetype.h for the button-bar glyph bake; header-only, no
+# CMakeLists so MakeAvailable just populates the source dir) ───────────────
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master)
+FetchContent_MakeAvailable(stb)
+
 # ── PBR/IBL shaders → SPIR-V header arrays ────────────────────────────────
 # Compiled from the SHARED model_common/shaders. var name = <name>_<stage>_data,
 # header = <name>.<stage>.h (matches the #includes in model_renderer.cpp).
@@ -74,6 +81,7 @@ find_package(OpenXR REQUIRED CONFIG)
 
 add_library(model_viewer_vk_android SHARED
     main.cpp
+    hud_bar.cpp
     stb_impl.cpp
     # ── SHARED renderer (model_common/), gltf-only subset ──
     ${MODEL_COMMON}/model_renderer.cpp
@@ -89,6 +97,7 @@ target_include_directories(model_viewer_vk_android PRIVATE
     ${MODEL_COMMON}                             # model_renderer.h, model_loader.h, ...
     ${tinygltf_SOURCE_DIR}                      # tiny_gltf.h + json.hpp + stb_image.h
     ${glm_SOURCE_DIR}                           # glm/ (header-only)
+    ${stb_SOURCE_DIR}                           # stb_truetype.h (button bar)
     ${REPO_ROOT}/openxr_includes)               # DisplayXR XR_EXT_* headers
 
 set_target_properties(model_viewer_vk_android PROPERTIES

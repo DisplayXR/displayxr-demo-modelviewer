@@ -48,6 +48,8 @@ class MainActivity : NativeActivity() {
             "org.freedesktop.monado.openxr_runtime.out_of_process",
             "org.freedesktop.monado.openxr_runtime.in_process",
         )
+
+        private const val REQUEST_PICK_MODEL = 1001
     }
 
     // Implemented in main.cpp. rotation = Surface.ROTATION_0/90/180/270 → 0/1/2/3.
@@ -69,6 +71,17 @@ class MainActivity : NativeActivity() {
     // model reload — model switching moves to the planned button UI).
     private external fun nativeResetView()
 
+    // Single tap (not part of a double-tap): shows / interacts with the native
+    // window-space button bar. Coords in view pixels.
+    private external fun nativeOnTap(x: Float, y: Float)
+
+    // Polled: true once when the native Open button was tapped → launch the
+    // SAF document picker (native code can't start an Intent itself).
+    private external fun nativeConsumeOpenRequest(): Boolean
+
+    // Hand a picked model (already copied into app-private storage) to native.
+    private external fun nativeOpenModelPath(path: String)
+
     // First installed runtime package, preferring out_of_process. Null if none.
     private val installedRuntime: String? by lazy {
         RUNTIME_PACKAGES.firstOrNull {
@@ -88,6 +101,14 @@ class MainActivity : NativeActivity() {
                 override fun onDoubleTap(e: MotionEvent): Boolean {
                     try {
                         nativeResetView()
+                    } catch (_: Throwable) {
+                    }
+                    return true
+                }
+
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                    try {
+                        nativeOnTap(e.x, e.y)
                     } catch (_: Throwable) {
                     }
                     return true
@@ -194,7 +215,65 @@ class MainActivity : NativeActivity() {
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
             .registerDisplayListener(displayListener, null)
         watchForRuntimeUnavailable()
+        watchForOpenRequest()
         showControlsHint()
+    }
+
+    // ── Open-model flow (native button bar → SAF picker → native load) ──────
+    // Native can't start an Intent, so a light poll consumes its open request
+    // (same polling pattern as watchForRuntimeUnavailable).
+    private fun watchForOpenRequest() {
+        val handler = Handler(Looper.getMainLooper())
+        handler.postDelayed(
+            object : Runnable {
+                override fun run() {
+                    if (isFinishing) return
+                    val requested = try { nativeConsumeOpenRequest() } catch (_: Throwable) { false }
+                    if (requested) launchModelPicker()
+                    handler.postDelayed(this, 250)
+                }
+            },
+            2000,
+        )
+    }
+
+    private fun launchModelPicker() {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                // .glb/.gltf usually surface as octet-stream; let everything
+                // through and let the native loader reject non-glTF.
+                type = "*/*"
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivityForResult(intent, REQUEST_PICK_MODEL)
+        } catch (t: Throwable) {
+            android.util.Log.e("model_viewer", "model picker launch failed", t)
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_PICK_MODEL || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        // Copy to app-private storage off the UI thread (the glTF loader needs
+        // a filesystem path; SAF only hands out a content URI).
+        Thread {
+            try {
+                val name = (uri.lastPathSegment ?: "picked.glb").substringAfterLast('/')
+                val ext = if (name.endsWith(".gltf", true)) ".gltf" else ".glb"
+                val dst = java.io.File(filesDir, "picked$ext")
+                contentResolver.openInputStream(uri)?.use { input ->
+                    dst.outputStream().use { output -> input.copyTo(output) }
+                } ?: return@Thread
+                android.util.Log.i("model_viewer", "picked model staged to ${dst.absolutePath}")
+                nativeOpenModelPath(dst.absolutePath)
+            } catch (t: Throwable) {
+                android.util.Log.e("model_viewer", "picked model staging failed", t)
+            }
+        }.start()
     }
 
     // Brief on-screen legend of the touch controls (gesture-driven, no on-screen
@@ -204,7 +283,7 @@ class MainActivity : NativeActivity() {
             if (!isFinishing) {
                 Toast.makeText(
                     this,
-                    "Drag: rotate   ·   Pinch: zoom   ·   Double-tap: re-frame",
+                    "Drag: rotate · Pinch: zoom · Tap: menu · Double-tap: re-frame",
                     Toast.LENGTH_LONG,
                 ).show()
             }
