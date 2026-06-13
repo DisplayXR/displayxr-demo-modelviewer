@@ -7,8 +7,10 @@ Guidance for Claude Code (claude.ai/code) working on this repo.
 DisplayXR Demo — **3D Model Viewer**. Real-time PBR model viewer for
 glasses-free 3D displays, on the DisplayXR OpenXR runtime via Vulkan (Windows)
 and MoltenVK (macOS). Loads glTF 2.0 (`.glb`/`.gltf`), STL, OBJ, FBX, and USD
-(`.usdz`/`.usd`/`.usda`/`.usdc`), renders with asymmetric per-eye
-Kooima projection. Standalone repo, independent release cadence; `common/` +
+(`.usdz`/`.usd`/`.usda`/`.usdc`), renders with asymmetric per-eye Kooima
+projection — **runtime-owned via `XR_EXT_view_rig`** on all platforms (app-side
+Kooima survives only as the no-extension fallback). Standalone repo, independent
+release cadence; `common/` +
 `openxr_includes/` were seeded from the runtime and are maintained here.
 
 **Status: shipped & working on Windows + macOS.** The renderer is fully
@@ -48,7 +50,8 @@ model_common/                     — the renderer (vendor-neutral, analog of
   shaders/                        — pbr.{vert,frag}; skybox.frag; IBL gen:
                                     fullscreen.vert, brdf_lut/irradiance/
                                     prefilter.frag, sky.glsl + ibl_common.glsl
-common/                           — Kooima view math (display3d_view.*),
+common/                           — fallback Kooima view math (display3d_view.*,
+                                    used only when XR_EXT_view_rig is absent),
                                     camera3d_view (unused), input, HUD, stb
 openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 ```
@@ -57,7 +60,16 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 - **Internal target sized to the swapchain** (not per-eye); recreated only on
   swapchain-size change. `renderEye` sets viewport/scissor to the per-eye tile
   and blits `[0,0..vp]` into the swapchain at `(vpX,vpY)`. Mirrors gs_renderer.
-- **ZDP-relative clip planes.** `display3d_compute_view/_views` take
+- **Runtime-owned Kooima via `XR_EXT_view_rig` (primary path, all platforms).**
+  Since #396 W7 the app chains the display rig by passing `XrViewDisplayRawEXT`
+  on the `xrLocateViews` call, and the **runtime owns the off-axis Kooima
+  projection + window resolve**, returning render-ready `XrView{pose, fov}` that
+  the app renders directly. This is the **recommended method on Windows, macOS,
+  and Android** — gated on `useRig = g_hasViewRigExt && displayWidthM > 0`
+  (`windows/main.cpp`). Under the rig, `rawViews[]` carries the render-ready
+  per-eye pose/FOV and `XrViewDisplayRawEXT.rawEyes[]` feeds the HUD eye readout.
+- **App-side Kooima (fallback only, when `XR_EXT_view_rig` is absent).**
+  `display3d_compute_view/_views` (in `common/display3d_view.*`) take
   `(near_offset, far_offset)` — **absolute** offsets in virtual-display-height
   (`vH`) units, NOT fractions — and compute per-eye `near = ez − near_offset`,
   `far = ez + far_offset` from each eye's perpendicular distance to the
@@ -65,7 +77,8 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   `far_offset = 1000·vH`; **transparent mode passes `far_offset = 0`** (far at
   the ZDP → foreground only). Anchored to `vH` so the band no longer scales with
   `ez` (large scenes don't clip). macOS has no transparent mode → `far_offset =
-  1000·vH` there.
+  1000·vH` there. This whole path is dormant whenever the runtime supplies the
+  rig (the common case); it survives as the no-extension fallback.
 - **IBL** is generated once at init from a procedural analytic sky (`sky.glsl`):
   BRDF LUT + irradiance cube + roughness-mipped prefiltered cube; split-sum in
   `pbr.frag`. The **skybox** samples the prefiltered cube at a high mip
