@@ -66,6 +66,19 @@ set(TINYUSDZ_WITH_AUDIO         OFF CACHE INTERNAL "" FORCE)
 set(TINYUSDZ_WITH_EXR           OFF CACHE INTERNAL "" FORCE)
 FetchContent_MakeAvailable(tinyusdz)
 
+# tinyusdz v0.9.4 builds with -Werror; newer Apple clang (Command Line Tools
+# 26.x) promotes -Wthread-safety-negative inside its logger.hh, which breaks
+# the build. We don't control upstream's warning flags, so demote that one
+# diagnostic on the imported targets. Clang/GCC only — MSVC rejects -W flags.
+if(NOT MSVC)
+    foreach(_tu tinyusdz_static tinyusdz)
+        if(TARGET ${_tu})
+            target_compile_options(${_tu} PRIVATE
+                -Wno-error=thread-safety-negative -Wno-thread-safety-negative)
+        endif()
+    endforeach()
+endif()
+
 # ── SPIR-V shader compilation ─────────────────────────────────────────────
 find_program(GLSLANGVALIDATOR_COMMAND glslangValidator)
 if(NOT GLSLANGVALIDATOR_COMMAND)
