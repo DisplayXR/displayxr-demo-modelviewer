@@ -114,6 +114,17 @@ already in a VS dev environment and will fail otherwise. Output:
 `build\windows\model_viewer_handle_vk_win.exe` (+ bundled openxr_loader.dll +
 sample.glb copied next to it). `model_common` FetchContents tinygltf + glm.
 
+**Dev-build dependency rule (don't regress).** The Windows + macOS dev scripts
+**auto-provision the OpenXR loader**, pinned to the same spec rev as the vendored
+`openxr_includes/` headers (`XR_CURRENT_API_VERSION`, currently 1.1.51) — never
+hardcode an SDK path (`C:/dev/openxr_sdk`, `C:/VulkanSDK/<ver>`); Vulkan comes
+from the `VULKAN_SDK` env. A fresh clone must build with only VS 2022 + Ninja +
+the Vulkan SDK. Keep all three pins equal: CI (`build-windows.yml`) == dev script
+== header rev. This is a **dev clone-and-build** concern only — the released
+installer always provisioned the loader via CI and bundles `openxr_loader.dll`
+next to the exe, so it was never affected. (This repo is the bootstrap template
+new demos are cloned from, so this script is the one to keep clean.)
+
 ### macOS (local dev)
 `./scripts/build_macos.sh` (builds the OpenXR loader from source, pulls
 Vulkan/MoltenVK via brew). Run via **`./scripts/run_macos_dev.sh`**, not the
