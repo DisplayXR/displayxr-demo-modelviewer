@@ -11,3 +11,7 @@ local.properties
 android/build/
 android/.cxx/
 *.iml
+
+# Android signing keystores — never commit (CI uses GitHub secrets)
+*.jks
+*.keystore
