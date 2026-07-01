@@ -115,4 +115,6 @@ gallery. The renderer draws on techniques from the MIT-licensed
 
 ## License
 
-BSL-1.0 — see `LICENSE`. Bundled demo models carry their own licenses.
+Apache-2.0 — see `LICENSE`. Bundled demo models carry their own licenses.
+(Vendored OpenXR extension headers under `openxr_includes/` remain BSL-1.0 —
+see their SPDX headers.)
