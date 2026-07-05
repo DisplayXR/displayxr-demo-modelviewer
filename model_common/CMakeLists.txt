@@ -69,12 +69,25 @@ FetchContent_MakeAvailable(tinyusdz)
 # tinyusdz v0.9.4 builds with -Werror; newer Apple clang (Command Line Tools
 # 26.x) promotes -Wthread-safety-negative inside its logger.hh, which breaks
 # the build. We don't control upstream's warning flags, so demote that one
-# diagnostic on the imported targets. Clang/GCC only — MSVC rejects -W flags.
-if(NOT MSVC)
+# diagnostic on the imported targets. -Wthread-safety-negative is a CLANG-ONLY
+# flag: GCC (the Linux toolchain) errors out with "no option
+# '-Wthread-safety-negative'", so gate it on Clang. On GCC the diagnostic
+# doesn't exist, so no demotion is needed.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     foreach(_tu tinyusdz_static tinyusdz)
         if(TARGET ${_tu})
             target_compile_options(${_tu} PRIVATE
                 -Wno-error=thread-safety-negative -Wno-thread-safety-negative)
+        endif()
+    endforeach()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC (Linux): tinyusdz v0.9.4's upstream -Werror trips on GCC-specific
+    # warnings that don't fire under the Clang toolchain the dep targets. We
+    # don't control upstream's flags, so demote -Werror to warnings on these
+    # imported targets (appended after upstream's -Werror, so it wins).
+    foreach(_tu tinyusdz_static tinyusdz)
+        if(TARGET ${_tu})
+            target_compile_options(${_tu} PRIVATE -Wno-error)
         endif()
     endforeach()
 endif()
