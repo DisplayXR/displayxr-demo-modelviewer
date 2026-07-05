@@ -131,6 +131,20 @@ Vulkan/MoltenVK via brew). Run via **`./scripts/run_macos_dev.sh`**, not the
 bare binary (the dev launcher aligns the app + runtime on one Vulkan loader).
 `./scripts/build_macos.sh --installer` builds the `.pkg`.
 
+### Linux (local dev — build-green only)
+`./scripts/build_linux.sh` builds `build/linux/model_viewer_handle_vk_linux`
+(system Vulkan via `libvulkan-dev`, OpenXR loader built from source pinned to
+release **1.1.43** — do NOT bump). The Linux entry point (`linux/main.cpp`) is
+**hosted-NULL**: it passes no window binding, so the runtime self-creates the
+presentation window (the faithful `XR_EXT_xlib_window_binding` arm is
+Phase-3b/hardware-gated — see the TODO in `linux/main.cpp` + `PORTING.md`). This
+is **build-green only** (compile on CI; the app is not run — no GPU/display).
+`linux/stb_image_impl_linux.cpp` supplies the single `STB_IMAGE_IMPLEMENTATION`
+TU (displayxr::common only ships it for Win/macOS). Dev run (needs a Linux
+runtime + GPU + X server): `build/linux/run_modelviewer_linux.sh`. CI:
+`.github/workflows/build-linux.yml` (dispatch + `linux*` branches only —
+non-required until reliably green).
+
 ### CI (`.github/workflows/`)
 `build-windows.yml` + `build-macos.yml` run on **`pull_request` + push to main**
 (build-validation — they compile the app + installer/.pkg, nothing publishes)
