@@ -1,0 +1,72 @@
+name: Build Linux
+
+# modelviewer Linux build-green dev loop (issue #40; recipe: the runtime repo's
+# docs/guides/linux-demo-port.md; golden reference: displayxr-demo-mediaplayer).
+#
+# DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
+# only on manual dispatch and `linux*` branches — so it can't gate unrelated
+# work while the port is in progress. Promote to a PR-triggered required check
+# (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
+# only once it passes reliably.
+#
+# Build-green scope: compile model_viewer_handle_vk_linux on ubuntu-latest.
+# CI has no display/GPU, so the app is never run here; on-screen validation is
+# a separate pass gated on the runtime's Linux present + hardware.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - 'linux'
+      - 'linux-**'
+      - 'feature/linux-**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Base playbook deps + the GLX-flip pair: once GL/EGL headers are present,
+      # OpenXR-SDK-Source flips on GLX platform support — the loader includes
+      # <xcb/glx.h> and its openxr-gfxwrapper test helper links Xxf86vm, so
+      # libxcb-glx0-dev + libxxf86vm-dev must be installed. The X11/Wayland/ALSA
+      # headers keep the loader's from-source build happy. modelviewer itself
+      # needs no app-specific dev pkgs (no FFmpeg / SDL — it's a plain model
+      # viewer); glslang-tools supplies glslangValidator for the PBR shaders.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libxxf86vm-dev libxcb-glx0-dev
+
+      # Fail loudly if the required libs are missing rather than silently
+      # compiling a hollow binary.
+      - name: Assert required dev libraries are present
+        run: |
+          pkg-config --exists vulkan && echo "vulkan: $(pkg-config --modversion vulkan)" \
+            || { echo "::error::vulkan not found via pkg-config"; exit 1; }
+          command -v glslangValidator >/dev/null \
+            || { echo "::error::glslangValidator missing (glslang-tools) — PBR shaders won't compile"; exit 1; }
+
+      - name: Build (build-green; app is not run — no display on CI)
+        run: ./scripts/build_linux.sh
+
+      # Guard against a hollow green: the OpenXR loader must have resolved (the
+      # linux CMake arm find_package/find_library's it; a miss is FATAL_ERROR,
+      # but assert the binary + loader landed regardless).
+      - name: Assert build artifacts
+        run: |
+          test -x build/linux/model_viewer_handle_vk_linux \
+            || { echo "::error::model_viewer_handle_vk_linux was not built"; exit 1; }
+          test -f /tmp/openxr-install/lib/libopenxr_loader.so \
+            || { echo "::error::OpenXR loader was not built"; exit 1; }
