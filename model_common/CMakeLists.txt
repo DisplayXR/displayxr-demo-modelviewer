@@ -89,11 +89,12 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # -Wno-error=<diag> form overrides a blanket -Werror regardless of
     # position, so demote each offending diagnostic explicitly:
     # GCC 15 (Ubuntu 26.04) flags tinyusdz's TypedTimeSamples<T>::Sample
-    # with -Wmaybe-uninitialized.
+    # with -Wmaybe-uninitialized ("may be used") and, for the bool
+    # specialization, its sibling -Wuninitialized ("is used").
     foreach(_tu tinyusdz_static tinyusdz)
         if(TARGET ${_tu})
             target_compile_options(${_tu} PRIVATE
-                -Wno-error -Wno-error=maybe-uninitialized)
+                -Wno-error -Wno-error=maybe-uninitialized -Wno-error=uninitialized)
         endif()
     endforeach()
 endif()
