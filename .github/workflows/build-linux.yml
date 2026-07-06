@@ -3,15 +3,18 @@ name: Build Linux
 # modelviewer Linux build-green dev loop (issue #40; recipe: the runtime repo's
 # docs/guides/linux-demo-port.md; golden reference: displayxr-demo-mediaplayer).
 #
-# DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
-# only on manual dispatch and `linux*` branches — so it can't gate unrelated
-# work while the port is in progress. Promote to a PR-triggered required check
-# (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
-# only once it passes reliably.
+# TRI-LTS MATRIX: the deployment target is Ubuntu 26.04 + Intel iGPU, but we also
+# keep 22.04 (where render can be validated on hand today) and 24.04 green — so
+# "build-green" means "builds on every supported toolchain (GCC 11 / 13 / 15,
+# ffmpeg 4.4 / 6 / 7)", not just whatever ubuntu-latest happens to be. 22.04/24.04
+# use hosted runners; 26.04 runs in a container (no hosted 26.04 runner yet).
 #
-# Build-green scope: compile model_viewer_handle_vk_linux on ubuntu-latest.
-# CI has no display/GPU, so the app is never run here; on-screen validation is
-# a separate pass gated on the runtime's Linux present + hardware.
+# DELIBERATELY NOT a required check. Runs only on manual dispatch + `linux*`
+# branches so it can't gate unrelated work while the port is in progress.
+#
+# Build-green scope only: CI has no display/GPU, so the app is never run here;
+# on-screen validation is a separate pass gated on the runtime's Linux present +
+# hardware (26.04/Intel primary; 22.04/NVIDIA is the interim render check).
 
 on:
   workflow_dispatch: {}
@@ -27,43 +30,58 @@ concurrency:
 
 jobs:
   Build:
-    runs-on: ubuntu-latest
+    name: Build (Ubuntu ${{ matrix.lts }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lts: "22.04"
+            runner: ubuntu-22.04
+          - lts: "24.04"
+            runner: ubuntu-24.04
+          - lts: "26.04"
+            runner: ubuntu-latest
+            container: ubuntu:26.04
     steps:
+      # In the 26.04 container we start as root with a bare image — install git
+      # BEFORE checkout (which shells out to git). No-op on the hosted runners.
+      - name: Bootstrap container (git for checkout)
+        run: |
+          if [ "$(id -u)" = "0" ] && ! command -v git >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          fi
+
       - uses: actions/checkout@v5
 
-      # Base playbook deps + the GLX-flip pair: once GL/EGL headers are present,
-      # OpenXR-SDK-Source flips on GLX platform support — the loader includes
-      # <xcb/glx.h> and its openxr-gfxwrapper test helper links Xxf86vm, so
-      # libxcb-glx0-dev + libxxf86vm-dev must be installed. The X11/Wayland/ALSA
-      # headers keep the loader's from-source build happy. modelviewer itself
-      # needs no app-specific dev pkgs (no FFmpeg / SDL — it's a plain model
-      # viewer); glslang-tools supplies glslangValidator for the PBR shaders.
+      # Base playbook deps + the GLX-flip pair (libxcb-glx0-dev + libxxf86vm-dev:
+      # once GL/EGL headers are present the OpenXR-SDK-Source build flips on GLX).
+      # SUDO shim so the same step works on hosted runners (non-root, has sudo)
+      # and in the container (root, no sudo). Vendor-neutral libegl-dev/libgl-dev
+      # so the names resolve across 22.04/24.04/26.04.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
+          $SUDO apt-get update
+          $SUDO apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ca-certificates curl \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev
 
-      # Fail loudly if the required libs are missing rather than silently
-      # compiling a hollow binary.
       - name: Assert required dev libraries are present
         run: |
           pkg-config --exists vulkan && echo "vulkan: $(pkg-config --modversion vulkan)" \
             || { echo "::error::vulkan not found via pkg-config"; exit 1; }
           command -v glslangValidator >/dev/null \
-            || { echo "::error::glslangValidator missing (glslang-tools) — PBR shaders won't compile"; exit 1; }
+            || { echo "::error::glslangValidator missing (glslang-tools)"; exit 1; }
 
       - name: Build (build-green; app is not run — no display on CI)
         run: ./scripts/build_linux.sh
 
-      # Guard against a hollow green: the OpenXR loader must have resolved (the
-      # linux CMake arm find_package/find_library's it; a miss is FATAL_ERROR,
-      # but assert the binary + loader landed regardless).
       - name: Assert build artifacts
         run: |
           test -x build/linux/model_viewer_handle_vk_linux \
