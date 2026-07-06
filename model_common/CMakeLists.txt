@@ -82,12 +82,18 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     endforeach()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # GCC (Linux): tinyusdz v0.9.4's upstream -Werror trips on GCC-specific
-    # warnings that don't fire under the Clang toolchain the dep targets. We
-    # don't control upstream's flags, so demote -Werror to warnings on these
-    # imported targets (appended after upstream's -Werror, so it wins).
+    # warnings that don't fire under the Clang toolchain the dep targets.
+    # Upstream injects "-Wall -Werror" through a property that lands AFTER
+    # this target's COMPILE_OPTIONS on the command line, so a blanket
+    # -Wno-error appended here loses to it. The diagnostic-specific
+    # -Wno-error=<diag> form overrides a blanket -Werror regardless of
+    # position, so demote each offending diagnostic explicitly:
+    # GCC 15 (Ubuntu 26.04) flags tinyusdz's TypedTimeSamples<T>::Sample
+    # with -Wmaybe-uninitialized.
     foreach(_tu tinyusdz_static tinyusdz)
         if(TARGET ${_tu})
-            target_compile_options(${_tu} PRIVATE -Wno-error)
+            target_compile_options(${_tu} PRIVATE
+                -Wno-error -Wno-error=maybe-uninitialized)
         endif()
     endforeach()
 endif()
