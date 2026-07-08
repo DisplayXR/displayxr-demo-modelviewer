@@ -9,8 +9,11 @@ name: Build Linux
 # ffmpeg 4.4 / 6 / 7)", not just whatever ubuntu-latest happens to be. 22.04/24.04
 # use hosted runners; 26.04 runs in a container (no hosted 26.04 runner yet).
 #
-# DELIBERATELY NOT a required check. Runs only on manual dispatch + `linux*`
-# branches so it can't gate unrelated work while the port is in progress.
+# PROMOTED to a PR-triggered required check (runtime issue
+# DisplayXR/displayxr-runtime#722): runs on every PR like the runtime's own
+# build-linux.yml, with a DetectChanges docs_only short-circuit so doc-only PRs
+# report success in seconds without building. Still also runs on manual dispatch
+# + `linux*` branch pushes.
 #
 # Build-green scope only: CI has no display/GPU, so the app is never run here;
 # on-screen validation is a separate pass gated on the runtime's Linux present +
@@ -18,6 +21,7 @@ name: Build Linux
 
 on:
   workflow_dispatch: {}
+  pull_request: {}
   push:
     branches:
       - 'linux'
@@ -25,12 +29,37 @@ on:
       - 'feature/linux-**'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Detected non-PR trigger — docs_only=false"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
+
   Build:
     name: Build (Ubuntu ${{ matrix.lts }})
+    needs: DetectChanges
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     strategy:
@@ -45,15 +74,21 @@ jobs:
             runner: ubuntu-latest
             container: ubuntu:26.04
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
       # In the 26.04 container we start as root with a bare image — install git
       # BEFORE checkout (which shells out to git). No-op on the hosted runners.
       - name: Bootstrap container (git for checkout)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           if [ "$(id -u)" = "0" ] && ! command -v git >/dev/null; then
             apt-get update && apt-get install -y --no-install-recommends git ca-certificates
           fi
 
       - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
 
       # Base playbook deps + the GLX-flip pair (libxcb-glx0-dev + libxxf86vm-dev:
       # once GL/EGL headers are present the OpenXR-SDK-Source build flips on GLX).
@@ -61,6 +96,7 @@ jobs:
       # and in the container (root, no sudo). Vendor-neutral libegl-dev/libgl-dev
       # so the names resolve across 22.04/24.04/26.04.
       - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
           $SUDO apt-get update
@@ -73,6 +109,7 @@ jobs:
             libxxf86vm-dev libxcb-glx0-dev
 
       - name: Assert required dev libraries are present
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           pkg-config --exists vulkan && echo "vulkan: $(pkg-config --modversion vulkan)" \
             || { echo "::error::vulkan not found via pkg-config"; exit 1; }
@@ -80,9 +117,11 @@ jobs:
             || { echo "::error::glslangValidator missing (glslang-tools)"; exit 1; }
 
       - name: Build (build-green; app is not run — no display on CI)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh
 
       - name: Assert build artifacts
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           test -x build/linux/model_viewer_handle_vk_linux \
             || { echo "::error::model_viewer_handle_vk_linux was not built"; exit 1; }
