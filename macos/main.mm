@@ -737,21 +737,31 @@ static void SignalHandler(int sig) {
     g_running = false;
 }
 
-static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
+static bool CreateMacOSWindow(uint32_t width, uint32_t height,
+                              int32_t screenLeft, int32_t screenTop) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
     AppDelegate *delegate = [[AppDelegate alloc] init];
     [NSApp setDelegate:delegate];
 
+    // INV-1.3: open on the 3D panel. (screenLeft, screenTop) is the panel
+    // top-left in top-down global coordinates (origin = primary top-left,
+    // XrDisplayDesktopPositionEXT, runtime#715); flip into AppKit's bottom-up
+    // space. (0,0) = primary — the titled window is auto-constrained below
+    // the menu bar, so it is always a safe create position.
     NSRect frame = NSMakeRect(100, 100, width, height);
+    NSScreen *primary = [NSScreen screens].firstObject;
+    if (primary != nil) {
+        CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
+        frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
+    }
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                        NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     g_window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
     [g_window setTitle:@"DisplayXR 3D Model Viewer"];
     [g_window setDelegate:delegate];
-    [g_window center];
 
     g_metalView = [[MetalView alloc] initWithFrame:frame];
     [g_window setContentView:g_metalView];
@@ -935,6 +945,10 @@ struct AppXrSession {
     float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0.5f;
     float recommendedViewScaleX = 0.5f, recommendedViewScaleY = 1.0f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
+    // INV-1.3 (v16, runtime#715): 3D panel top-left in top-down virtual-desktop
+    // pixels (XrDisplayDesktopPositionEXT). (0,0) = primary/unknown — the safe
+    // default, which zero-init also yields on pre-v16 runtimes.
+    int32_t displayScreenLeft = 0, displayScreenTop = 0;
 
     // Eye tracking
     float eyePositions[8][3] = {};  // [view][x,y,z] — raw per-eye positions in display space
@@ -1149,7 +1163,12 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
         XrEyeTrackingModeCapabilitiesEXT ec = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
-        di.next = &ec; sp.next = &di;
+        // INV-1.3 (v16, runtime#715): panel desktop position, so the window
+        // opens on the 3D panel instead of the primary monitor.
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        desktopPos.next = &ec;
+        di.next = &desktopPos; sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
             xr.recommendedViewScaleX = di.recommendedViewScaleX;
             xr.recommendedViewScaleY = di.recommendedViewScaleY;
@@ -1161,6 +1180,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.displayPixelWidth = di.displayPixelWidth;
             xr.displayPixelHeight = di.displayPixelHeight;
             xr.supportedEyeTrackingModes = (uint32_t)ec.supportedModes;
+            xr.displayScreenLeft = desktopPos.left;
+            xr.displayScreenTop = desktopPos.top;
+            LOG_INFO("Display desktop position: (%d, %d)",
+                xr.displayScreenLeft, xr.displayScreenTop);
         }
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
         if (xr.supportedEyeTrackingModes != 0)
@@ -2026,10 +2049,19 @@ int main() {
         }
     }
 
-    // Step 1: Create macOS window
+    // Step 1: Initialize OpenXR — BEFORE the window, so it can be created
+    // directly on the 3D panel (INV-1.3, XrDisplayDesktopPositionEXT,
+    // runtime#715). Nothing in the OpenXR / Vulkan init needs the NSWindow
+    // until CreateSession (same ordering as cube_handle_metal_macos).
+    AppXrSession xr = {};
+    if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
+
+    // Step 2: Create macOS window at the panel's desktop position
     g_windowW = 1280; g_windowH = 720;
-    if (!CreateMacOSWindow(g_windowW, g_windowH)) {
+    if (!CreateMacOSWindow(g_windowW, g_windowH,
+                           xr.displayScreenLeft, xr.displayScreenTop)) {
         LOG_ERROR("Failed to create macOS window");
+        CleanupOpenXR(xr);
         return 1;
     }
 
@@ -2038,10 +2070,6 @@ int main() {
       g_windowW = (uint32_t)(cs.width * bs);
       g_windowH = (uint32_t)(cs.height * bs);
       LOG_INFO("Window drawable: %ux%u", g_windowW, g_windowH); }
-
-    // Step 2: Initialize OpenXR
-    AppXrSession xr = {};
-    if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
 
     // Try to find sim_display_set_output_mode
     { void *rtHandle = NULL;

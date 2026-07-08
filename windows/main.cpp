@@ -640,8 +640,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
-    LOG_INFO("Creating application window (%dx%d)", width, height);
+static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int x, int y) {
+    LOG_INFO("Creating application window (%dx%d) at (%d,%d)", width, height, x, y);
 
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
@@ -667,9 +667,12 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     RECT rect = { 0, 0, width, height };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
+    // INV-1.3 (runtime#715): (x, y) is the 3D panel top-left in virtual-screen
+    // pixels (XrDisplayDesktopPositionEXT) — open the window on the panel, not
+    // the primary monitor. (0,0) = primary/unknown, a safe create position.
     HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP, WINDOW_CLASS, WINDOW_TITLE,
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT,
+        x, y,
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, hInstance, nullptr);
 
@@ -1799,13 +1802,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) ===");
 
-    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
-    if (!hwnd) {
-        LOG_ERROR("Failed to create window");
-        ShutdownLogging();
-        return 1;
-    }
-
     // Add DisplayXR to DLL search path
     {
         HKEY hKey;
@@ -1820,11 +1816,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Initialize OpenXR
+    // Initialize OpenXR BEFORE creating the window, so the window can be
+    // created directly at the 3D panel's desktop position (INV-1.3,
+    // XrDisplayDesktopPositionEXT, runtime#715). Nothing in the OpenXR /
+    // Vulkan init below needs the HWND until CreateSession.
     XrSessionManager xr = {};
     g_xr = &xr;
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
+        g_xr = nullptr;
+        ShutdownLogging();
+        return 1;
+    }
+
+    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight,
+        g_displayDesktopLeft, g_displayDesktopTop);
+    if (!hwnd) {
+        LOG_ERROR("Failed to create window");
+        CleanupOpenXR(xr);
         g_xr = nullptr;
         ShutdownLogging();
         return 1;
