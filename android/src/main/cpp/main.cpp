@@ -19,12 +19,12 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_display_info.h>  // display rendering-mode enumerate/request
-#include <openxr/XR_EXT_view_rig.h>      // runtime-owned Kooima views (#396 W7)
+#include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
+#include <openxr/XR_DXR_view_rig.h>      // runtime-owned Kooima views (#396 W7)
 // XrCompositionLayerWindowSpaceEXT — the shared window-space layer struct is
 // declared (ifndef-guarded) in the window-binding headers; the cocoa one is
 // plain C with no platform deps, so it serves as the decl source on Android.
-#include <openxr/XR_EXT_cocoa_window_binding.h>
+#include <openxr/XR_DXR_cocoa_window_binding.h>
 
 #include <atomic>
 #include <vector>
@@ -103,7 +103,7 @@ bool g_session_running = false;
 bool g_exit_requested = false;
 XrSpace g_app_space = XR_NULL_HANDLE;
 
-// ── Display rendering-mode switching (XR_EXT_display_info) ─────────────────
+// ── Display rendering-mode switching (XR_DXR_display_info) ─────────────────
 // The runtime advertises a set of display rendering modes (e.g. 3D-stereo,
 // 2D-mono); double-tap-with-two-fingers cycles them. Mode requests are async —
 // the runtime applies them and (if view count changes) the next frame adapts.
@@ -195,8 +195,8 @@ now_ms()
 	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-// ── XR_EXT_view_rig (#396 W7) ───────────────────────────────────────────────
-// When the runtime advertises XR_EXT_view_rig, chain an XrDisplayRigEXT on
+// ── XR_DXR_view_rig (#396 W7) ───────────────────────────────────────────────
+// When the runtime advertises XR_DXR_view_rig, chain an XrDisplayRigEXT on
 // xrLocateViews and consume the render-ready off-axis XrView{pose,fov} the
 // runtime computes (server-side Kooima over IPC on Android, #510/#513). The
 // rig pose stays IDENTITY: this app orbits the MODEL (build_splat_model), not
@@ -325,7 +325,7 @@ rig_local_eye_z(const XrPosef &rig, const XrVector3f &eye_world)
 // negation here: ModelRenderer (W7, #396) consumes a clean +Y-up view +
 // off-axis projection and flips Vulkan Y at the RASTER stage via a
 // negative-height viewport in renderEye. aspect_w_over_h > 0 forces a
-// SYMMETRIC frustum (legacy no-rig fallback only) — under XR_EXT_view_rig
+// SYMMETRIC frustum (legacy no-rig fallback only) — under XR_DXR_view_rig
 // pass -1: the rig FOV is render-ready off-axis and must pass through.
 Mat4
 projection_matrix_from_fov(const XrFovf &fov, float aspect_w_over_h, float near_z, float far_z)
@@ -445,7 +445,7 @@ create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 
-	// XR_EXT_view_rig is enabled only when advertised (#396 W7); without it
+	// XR_DXR_view_rig is enabled only when advertised (#396 W7); without it
 	// the app keeps the legacy raw-locate + fixed-clip path.
 	g_has_view_rig = false;
 	{
@@ -458,23 +458,23 @@ create_instance(struct android_app *app)
 			}
 			if (xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data()) == XR_SUCCESS) {
 				for (uint32_t i = 0; i < n; ++i) {
-					if (std::strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+					if (std::strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 						g_has_view_rig = true;
 					}
 				}
 			}
 		}
-		LOGI("XR_EXT_view_rig advertised: %s", g_has_view_rig ? "yes" : "no");
+		LOGI("XR_DXR_view_rig advertised: %s", g_has_view_rig ? "yes" : "no");
 	}
 
 	const char *extensions[4] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
-	    XR_EXT_DISPLAY_INFO_EXTENSION_NAME,  // display rendering-mode switching
+	    XR_DXR_DISPLAY_INFO_EXTENSION_NAME,  // display rendering-mode switching
 	};
 	uint32_t extension_count = 3;
 	if (g_has_view_rig) {
-		extensions[extension_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+		extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 	}
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
@@ -951,7 +951,7 @@ load_model_path(const char *path)
 			maxe = ext[2];
 		}
 		// Normalize to kTargetSize metres. Framing depends on the locate path
-		// (#396 W7): under XR_EXT_view_rig the world is display-anchored — the
+		// (#396 W7): under XR_DXR_view_rig the world is display-anchored — the
 		// virtual display plane sits at the identity rig pose (origin), so the
 		// model frames AT screen depth with NO forward push, and the rig's
 		// virtual display height fits the scaled model (extent_y * 1.4, the

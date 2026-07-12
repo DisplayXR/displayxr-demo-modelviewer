@@ -12,7 +12,7 @@
 # ModelRenderer, in HOSTED-NULL windowing mode — the runtime self-creates the
 # presentation window (no XR_EXT_*_window_binding). This is a BUILD-GREEN
 # target (compiled on CI, not run — CI has no GPU/display). The faithful
-# XR_EXT_xlib_window_binding arm is Phase-3b/hardware-gated; see
+# XR_DXR_xlib_window_binding arm is Phase-3b/hardware-gated; see
 # ../PORTING.md and the runtime's docs/guides/linux-demo-port.md.
 
 cmake_minimum_required(VERSION 3.21)

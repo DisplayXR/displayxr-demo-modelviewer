@@ -9,9 +9,9 @@
  * the model_common/ModelRenderer PBR pipeline.  Features a "Load…" button overlay.
  *
  * Features:
- * - App creates and owns the NSWindow (XR_EXT_cocoa_window_binding)
+ * - App creates and owns the NSWindow (XR_DXR_cocoa_window_binding)
  * - Mouse drag camera, WASD/QE movement, scroll zoom
- * - XR_EXT_display_info: Kooima projection, display metrics
+ * - XR_DXR_display_info: Kooima projection, display metrics
  * - V key cycles rendering modes via xrRequestDisplayRenderingModeEXT
  * - 0-3 keys select rendering mode directly
  * - L key or button click: NSOpenPanel to load .glb/.gltf models
@@ -27,11 +27,11 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_cocoa_window_binding.h>
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_atlas_capture.h>
-#include <openxr/XR_EXT_view_rig.h>
-#include <openxr/XR_EXT_mcp_tools.h>
+#include <openxr/XR_DXR_cocoa_window_binding.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_atlas_capture.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_mcp_tools.h>
 
 #include <cmath>
 #include <csignal>
@@ -938,7 +938,7 @@ struct AppXrSession {
     // Swapchain
     struct { XrSwapchain swapchain; uint32_t width, height, imageCount; int64_t format; } swapchain = {};
 
-    // Display info from XR_EXT_display_info
+    // Display info from XR_DXR_display_info
     bool hasDisplayInfoExt = false;
     bool hasCocoaWindowBinding = false;
     float displayWidthM = 0, displayHeightM = 0;
@@ -963,15 +963,15 @@ struct AppXrSession {
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
-    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I' key capture.
+    // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I' key capture.
     bool hasAtlasCaptureExt = false;
     PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
 
-    // XR_EXT_view_rig (W7 of #396): runtime owns the off-axis Kooima and returns
+    // XR_DXR_view_rig (W7 of #396): runtime owns the off-axis Kooima and returns
     // render-ready XrView{pose, fov}; the app deletes its own.
     bool hasViewRigExt = false;
 
-    // XR_EXT_mcp_tools (#22): app-defined agent tools on the runtime-hosted
+    // XR_DXR_mcp_tools (#22): app-defined agent tools on the runtime-hosted
     // per-process MCP server. The whole path is inert when the extension or
     // the MCP capability gate is absent — never load-bearing.
     bool hasMcpToolsExt = false;
@@ -1033,7 +1033,7 @@ static void UpdateAnimButton() {
     }
 }
 
-// ★ XR_EXT_mcp_tools late registration (#22): the animation tools exist only
+// ★ XR_DXR_mcp_tools late registration (#22): the animation tools exist only
 // while a model with clips is loaded; they are unregistered when the model is
 // replaced by one without. Each transition makes the runtime broadcast the MCP
 // tools/list_changed notification, so agents connected BEFORE a load see the
@@ -1078,14 +1078,14 @@ static void UpdateMcpAnimationTools() {
         XrResult r3 = xr->pfnRegisterMCPTool(xr->session, &stopTool);
 
         xr->mcpAnimToolsRegistered = XR_SUCCEEDED(r1) || XR_SUCCEEDED(r2) || XR_SUCCEEDED(r3);
-        LOG_INFO("XR_EXT_mcp_tools: animation tools registered (%d clip(s)) [%d %d %d]",
+        LOG_INFO("XR_DXR_mcp_tools: animation tools registered (%d clip(s)) [%d %d %d]",
                  g_modelRenderer.animationCount(), r1, r2, r3);
     } else {
         xr->pfnUnregisterMCPTool(xr->session, "list_animations");
         xr->pfnUnregisterMCPTool(xr->session, "play_animation");
         xr->pfnUnregisterMCPTool(xr->session, "stop_animation");
         xr->mcpAnimToolsRegistered = false;
-        LOG_INFO("XR_EXT_mcp_tools: animation tools unregistered (model has no clips)");
+        LOG_INFO("XR_DXR_mcp_tools: animation tools unregistered (model has no clips)");
     }
 }
 
@@ -1124,23 +1124,23 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     for (const auto& ext : exts) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
-        if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasCocoaWindowBinding = true;
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
-        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
-        if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
-        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasCocoaWindowBinding = true;
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
 
     std::vector<const char*> enabled;
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
-    if (xr.hasCocoaWindowBinding) enabled.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
-    if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
-    if (xr.hasAtlasCaptureExt) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
-    if (xr.hasMcpToolsExt) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
-    if (xr.hasViewRigExt) enabled.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
-    LOG_INFO("XR_EXT_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    if (xr.hasCocoaWindowBinding) enabled.push_back(XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME);
+    if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+    if (xr.hasAtlasCaptureExt) enabled.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
+    if (xr.hasMcpToolsExt) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
+    if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -1194,13 +1194,13 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT", (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
-    // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+    // XR_DXR_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
     if (xr.hasAtlasCaptureExt) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT", (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
         LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
-    // XR_EXT_mcp_tools (#22): resolve the agent-tool entry points. Tools are
+    // XR_DXR_mcp_tools (#22): resolve the agent-tool entry points. Tools are
     // registered after session create (CreateSession) and dispatched from
     // PollEvents.
     if (xr.hasMcpToolsExt) {
@@ -1211,9 +1211,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultEXT", (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResult);
         const bool resolved = xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool &&
             xr.pfnUnregisterMCPTool && xr.pfnGetMCPToolCallArgs && xr.pfnSubmitMCPToolResult;
-        LOG_INFO("XR_EXT_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
+        LOG_INFO("XR_DXR_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
     } else {
-        LOG_INFO("XR_EXT_mcp_tools: not advertised by runtime");
+        LOG_INFO("XR_DXR_mcp_tools: not advertised by runtime");
     }
 
     LOG_INFO("OpenXR initialized: %s", xr.systemName);
@@ -1337,14 +1337,14 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     macBinding.viewHandle = (__bridge void*)g_metalView;
     if (xr.hasCocoaWindowBinding && g_metalView) {
         vkBinding.next = &macBinding;
-        LOG_INFO("Using XR_EXT_cocoa_window_binding");
+        LOG_INFO("Using XR_DXR_cocoa_window_binding");
     }
 
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
     si.next = &vkBinding; si.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
 
-    // XR_EXT_mcp_tools (#22): declare identity + register the base agent
+    // XR_DXR_mcp_tools (#22): declare identity + register the base agent
     // tools. The appId MUST match `id` in
     // displayxr/model_viewer_handle_vk_macos.displayxr.json (INV-10.1).
     // Failure is non-fatal by design — the MCP capability gate may simply be
@@ -1409,10 +1409,10 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
             XrResult t4 = xr.pfnRegisterMCPTool(xr.session, &frameTool);
 
             xr.mcpToolsReady = true;
-            LOG_INFO("XR_EXT_mcp_tools: appId=modelviewer load_model=%d get_status=%d "
+            LOG_INFO("XR_DXR_mcp_tools: appId=modelviewer load_model=%d get_status=%d "
                      "set_orbit=%d frame_model=%d", t1, t2, t3, t4);
         } else {
-            LOG_INFO("XR_EXT_mcp_tools: appId not accepted (%d) — no agent surface", ar);
+            LOG_INFO("XR_DXR_mcp_tools: appId not accepted (%d) — no agent surface", ar);
         }
     }
 
@@ -1530,7 +1530,7 @@ static bool CreateSwapchains(AppXrSession& xr) {
 }
 
 // ============================================================================
-// XR_EXT_mcp_tools dispatch (#22)
+// XR_DXR_mcp_tools dispatch (#22)
 // ============================================================================
 // Minimal JSON helpers — hand-rolled on purpose, matching the runtime
 // reference adopter (cube_handle_metal_macos): tool args are tiny one-level
@@ -1847,7 +1847,7 @@ static void PollEvents(AppXrSession& xr) {
                     xr.renderingModeNames[rmc->currentModeIndex]);
             }
         } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT) {
-            // An agent invoked one of our XR_EXT_mcp_tools tools (#22).
+            // An agent invoked one of our XR_DXR_mcp_tools tools (#22).
             HandleMcpToolCall(xr, (const XrEventDataMCPToolCallEXT*)&event);
         }
         event.type = XR_TYPE_EVENT_DATA_BUFFER;
@@ -2111,7 +2111,7 @@ int main() {
         CleanupOpenXR(xr); return 1; }
 
     // Model-load paths can now flip the agent animation-tool registration
-    // (XR_EXT_mcp_tools late registration, #22). Set before the bundled-scene
+    // (XR_DXR_mcp_tools late registration, #22). Set before the bundled-scene
     // auto-load below so it too funnels through UpdateMcpAnimationTools.
     g_xrForMcp = &xr;
 
@@ -2295,7 +2295,7 @@ int main() {
                     const float rigVH =
                         g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
-                    // XR_EXT_view_rig (#396 W7): chain the display rig so the runtime
+                    // XR_DXR_view_rig (#396 W7): chain the display rig so the runtime
                     // owns the off-axis Kooima + window resolve, returning render-ready
                     // XrView{pose, fov}. The raw channel carries display-space eyes for HUD.
                     const bool useRig =
@@ -2559,7 +2559,7 @@ int main() {
 
                             // 'I' key: snapshot the multi-view atlas the runtime
                             // composes for this session via xrCaptureAtlasEXT
-                            // (XR_EXT_atlas_capture, W6 of #396). The runtime owns
+                            // (XR_DXR_atlas_capture, W6 of #396). The runtime owns
                             // the readback — no app-side staging texture. Skipped
                             // for mono (1×1). The prefix has no ".png"; the runtime
                             // appends "_atlas.png".
@@ -2597,7 +2597,7 @@ int main() {
                                         LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: XR_EXT_atlas_capture not available");
+                                    LOG_WARN("Capture skipped: XR_DXR_atlas_capture not available");
                                 }
                             }
 

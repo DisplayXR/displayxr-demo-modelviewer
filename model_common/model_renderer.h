@@ -57,7 +57,7 @@ struct ModelRenderer {
     // clips. name = clip name, or "Clip <i>" when the glTF clip is unnamed.
     bool getPlaybackInfo(std::string& name, int& index, int& count,
                          float& time, float& duration, bool& playing) const;
-    // ── Agent-facing read/seek accessors (XR_EXT_mcp_tools adoption). ───────
+    // ── Agent-facing read/seek accessors (XR_DXR_mcp_tools adoption). ───────
     int  animationCount() const { return (int)animations_.size(); }
     int  activeAnimation() const { return activeAnim_; }
     void setPaused(bool p) { paused_ = p; }

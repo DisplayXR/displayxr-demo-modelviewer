@@ -99,7 +99,7 @@ static inline float BtnBarHeightFraction(uint32_t windowW, uint32_t windowH) {
 }
 
 
-// ── XR_EXT_view_rig consume-path math (#396 W7) ──────────────────────────────
+// ── XR_DXR_view_rig consume-path math (#396 W7) ──────────────────────────────
 // View/projection builders for the runtime's render-ready XrView{pose, fov}:
 // GL convention, column-major float[16], matching the macOS main.mm helpers
 // (per-platform duplication is the accepted pattern for these ~20 lines).
@@ -400,7 +400,7 @@ static bool IsClickOnAnimButton(int mouseX, int mouseY, int windowW, int windowH
         ANIM_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
 }
 
-// Atlas capture is runtime-owned via xrCaptureAtlasEXT (XR_EXT_atlas_capture).
+// Atlas capture is runtime-owned via xrCaptureAtlasEXT (XR_DXR_atlas_capture).
 // App-side helpers (filename numbering + flash overlay) live in
 // common/atlas_capture* — see dxr_capture::MakeCaptureAtlasPrefix /
 // TriggerCaptureFlash / PostFlashRequest.
@@ -1039,7 +1039,7 @@ static void RenderThreadFunc(
                         const float rigVH = inputSnapshot.viewParams.virtualDisplayHeight
                             / inputSnapshot.viewParams.scaleFactor;
 
-                        // XR_EXT_view_rig (#396 W7): chain the display rig so the runtime
+                        // XR_DXR_view_rig (#396 W7): chain the display rig so the runtime
                         // owns the off-axis Kooima + window resolve, returning render-ready
                         // XrView{pose, fov}. The raw channel carries display-space eyes for HUD.
                         const bool useRig =
@@ -1353,7 +1353,7 @@ static void RenderThreadFunc(
 
                             // 'I' key: snapshot the multi-view atlas the runtime
                             // composes for this session via xrCaptureAtlasEXT
-                            // (XR_EXT_atlas_capture, W6 of #396). The runtime owns
+                            // (XR_DXR_atlas_capture, W6 of #396). The runtime owns
                             // the readback — no app-side staging texture. Works for
                             // any multi-view layout the runtime advertises; skipped
                             // for mono (1×1). Filename auto-increments. The prefix
@@ -1391,7 +1391,7 @@ static void RenderThreadFunc(
                                         LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: XR_EXT_atlas_capture not available");
+                                    LOG_WARN("Capture skipped: XR_DXR_atlas_capture not available");
                                 }
                             }
 
@@ -1437,8 +1437,8 @@ static void RenderThreadFunc(
                                 sessionText += L"\nSession: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
                                 std::wstring modeText = xr->hasWin32WindowBindingExt ?
-                                    L"XR_EXT_win32_window_binding: ACTIVE (Vulkan + glTF)" :
-                                    L"XR_EXT_win32_window_binding: NOT AVAILABLE";
+                                    L"XR_DXR_win32_window_binding: ACTIVE (Vulkan + glTF)" :
+                                    L"XR_DXR_win32_window_binding: NOT AVAILABLE";
 
                                 // Scene info
                                 std::wstring sceneText = L"\n--- Model ---";

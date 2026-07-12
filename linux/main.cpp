@@ -11,18 +11,18 @@
  *
  * WINDOWING — hosted-NULL (issue #40, M8 Linux epic runtime#699). Unlike the
  * macOS/Windows entries, which own an OS window and pass its handle via
- * XR_EXT_cocoa_window_binding / XR_EXT_win32_window_binding, this entry passes
+ * XR_DXR_cocoa_window_binding / XR_DXR_win32_window_binding, this entry passes
  * NO window binding: the runtime self-creates a native-resolution window
  * (hosted-NULL). This is the valid interim path per the Linux demo-port
  * playbook (docs/guides/linux-demo-port.md) while the faithful
- * XR_EXT_xlib_window_binding arm is Phase-3b/hardware-gated. It is deliberately
+ * XR_DXR_xlib_window_binding arm is Phase-3b/hardware-gated. It is deliberately
  * headless of any input/HUD/file-dialog stack — this is a BUILD-GREEN target
  * (compiled on CI, not run: CI has no GPU/display). On-screen validation is a
  * separate pass gated on the runtime's Linux present + a GPU + an X server.
  *
  * The frame loop drives ModelRenderer with a fixed framed camera (no live
  * input) so a Linux runtime with a display can present the bundled sample
- * model; it consumes XR_EXT_view_rig render-ready views when the runtime
+ * model; it consumes XR_DXR_view_rig render-ready views when the runtime
  * offers them, matching the macOS render path.
  */
 
@@ -31,8 +31,8 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_view_rig.h>
 
 #include <array>
 #include <chrono>
@@ -201,18 +201,18 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     for (const auto& e : exts) {
         if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
-        if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
-        if (strcmp(e.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
+        if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
     }
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
 
     std::vector<const char*> enabled;
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
-    if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
-    if (xr.hasViewRigExt) enabled.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
-    LOG_INFO("XR_EXT_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+    if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     // NOTE: no XR_EXT_*_window_binding — hosted-NULL (runtime self-creates the
-    // window). Swap for XR_EXT_xlib_window_binding when the Phase-3 windowing
+    // window). Swap for XR_DXR_xlib_window_binding when the Phase-3 windowing
     // arm lands (see file header).
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -692,7 +692,7 @@ int main() {
                 uint32_t renderW = (uint32_t)((double)g_windowW * scaleX); if (renderW == 0) renderW = 1;
                 uint32_t renderH = (uint32_t)((double)g_windowH * scaleY); if (renderH == 0) renderH = 1;
 
-                // Consume the runtime's render-ready rig views (XR_EXT_view_rig).
+                // Consume the runtime's render-ready rig views (XR_DXR_view_rig).
                 std::vector<Display3DView> eyeViews((size_t)eyeCount);
                 bool hasKooima = useRig;
                 if (useRig) {
