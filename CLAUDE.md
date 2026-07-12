@@ -61,13 +61,13 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   swapchain-size change. `renderEye` sets viewport/scissor to the per-eye tile
   and blits `[0,0..vp]` into the swapchain at `(vpX,vpY)`. Mirrors gs_renderer.
 - **Runtime-owned Kooima via `XR_DXR_view_rig` (primary path, all platforms).**
-  Since #396 W7 the app chains the display rig by passing `XrViewDisplayRawEXT`
+  Since #396 W7 the app chains the display rig by passing `XrViewDisplayRawDXR`
   on the `xrLocateViews` call, and the **runtime owns the off-axis Kooima
   projection + window resolve**, returning render-ready `XrView{pose, fov}` that
   the app renders directly. This is the **recommended method on Windows, macOS,
   and Android** — gated on `useRig = g_hasViewRigExt && displayWidthM > 0`
   (`windows/main.cpp`). Under the rig, `rawViews[]` carries the render-ready
-  per-eye pose/FOV and `XrViewDisplayRawEXT.rawEyes[]` feeds the HUD eye readout.
+  per-eye pose/FOV and `XrViewDisplayRawDXR.rawEyes[]` feeds the HUD eye readout.
 - **App-side Kooima (fallback only, when `XR_DXR_view_rig` is absent).**
   `display3d_compute_view/_views` (in `common/display3d_view.*`) take
   `(near_offset, far_offset)` — **absolute** offsets in virtual-display-height

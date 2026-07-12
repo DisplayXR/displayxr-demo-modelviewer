@@ -12,7 +12,7 @@
 bool g_hasViewRigExt = false;
 
 // INV-1.3 (XR_DXR_display_info v16, runtime#715): 3D panel top-left in
-// Windows virtual-screen pixels, captured from XrDisplayDesktopPositionEXT
+// Windows virtual-screen pixels, captured from XrDisplayDesktopPositionDXR
 // during InitializeOpenXR. (0,0) = primary monitor / unknown — the safe
 // default, which zero-init also yields on pre-v16 runtimes that ignore the
 // unknown chain entry. App-owned globals like g_hasViewRigExt above
@@ -131,13 +131,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         // INV-1.3 (v16, runtime#715): panel desktop position, so the app
         // window opens on the 3D panel instead of the primary monitor.
         // Zero-init → (0,0) = primary/unknown on pre-v16 runtimes.
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         desktopPos.next = &eyeCaps;
         displayInfo.next = &desktopPos;
         sysProps.next = &displayInfo;
@@ -167,20 +167,20 @@ bool InitializeOpenXR(XrSessionManager& xr) {
                 xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
         }
 
-        // Load xrRequestDisplayModeEXT function pointer
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
+        // Load xrRequestDisplayModeDXR function pointer
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
 
-        // Load xrRequestEyeTrackingModeEXT function pointer
+        // Load xrRequestEyeTrackingModeDXR function pointer
         if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
 
         // Load unified rendering mode function pointers (v7)
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
@@ -188,17 +188,17 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     // when the extension is enabled. Resolution failure is non-fatal: we
     // just fall through to the Win32 GetOpenFileNameA path at call time.
     if (xr.hasFileDialogExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestFilePickerEXT);
-        LOG_INFO("xrRequestFilePickerEXT: %s",
+        LOG_INFO("xrRequestFilePickerDXR: %s",
             xr.pfnRequestFilePickerEXT ? "resolved" : "NULL");
     }
 
     // XR_DXR_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
     if (xr.hasAtlasCaptureExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
             (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
-        LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
     uint32_t viewCount = 0;
@@ -485,7 +485,7 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
     vkBinding.queueFamilyIndex = queueFamilyIndex;
     vkBinding.queueIndex = queueIndex;
 
-    XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrWin32WindowBindingCreateInfoDXR sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
     sessionTarget.windowHandle = hwnd;
     // Always-on transparent-window support. The runtime wires DComp + the
     // KMT-shared-texture bridge based on these fields at xrCreateSession;
@@ -513,9 +513,9 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());

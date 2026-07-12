@@ -14,7 +14,7 @@
  *
  * The extension is workspace-scoped: an instance must enable
  * XR_DXR_spatial_workspace and the session must be the active workspace
- * (xrActivateSpatialWorkspaceEXT) before any of these functions return
+ * (xrActivateSpatialWorkspaceDXR) before any of these functions return
  * XR_SUCCESS. Without a workspace they return XR_ERROR_FEATURE_UNSUPPORTED.
  */
 #ifndef XR_EXT_APP_LAUNCHER_H

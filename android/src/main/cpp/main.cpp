@@ -21,7 +21,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>  // display rendering-mode enumerate/request
 #include <openxr/XR_DXR_view_rig.h>      // runtime-owned Kooima views (#396 W7)
-// XrCompositionLayerWindowSpaceEXT — the shared window-space layer struct is
+// XrCompositionLayerWindowSpaceDXR — the shared window-space layer struct is
 // declared (ifndef-guarded) in the window-binding headers; the cocoa one is
 // plain C with no platform deps, so it serves as the decl source on Android.
 #include <openxr/XR_DXR_cocoa_window_binding.h>
@@ -107,8 +107,8 @@ XrSpace g_app_space = XR_NULL_HANDLE;
 // The runtime advertises a set of display rendering modes (e.g. 3D-stereo,
 // 2D-mono); double-tap-with-two-fingers cycles them. Mode requests are async —
 // the runtime applies them and (if view count changes) the next frame adapts.
-PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
-PFN_xrRequestDisplayRenderingModeEXT g_pfnReqMode = nullptr;
+PFN_xrEnumerateDisplayRenderingModesDXR g_pfnEnumModes = nullptr;
+PFN_xrRequestDisplayRenderingModeDXR g_pfnReqMode = nullptr;
 uint32_t g_rmode_count = 0;
 std::atomic<uint32_t> g_rmode_current{0};
 bool g_rmode_requestable = false;
@@ -142,12 +142,12 @@ uint32_t g_atlas_h = 0;
 //    Kotlin drives show/fade/clicks and calls the nativeCycleMode /
 //    nativeAnimAction / label JNI below; native services the requests on the
 //    android_main thread.
-// 2. XrCompositionLayerWindowSpaceEXT bar (hud_bar.{h,cpp}) — the proper
+// 2. XrCompositionLayerWindowSpaceDXR bar (hud_bar.{h,cpp}) — the proper
 //    cross-platform path, currently REJECTED by the runtime on Android OOP
 //    sessions (runtime#506). Kept behind `adb shell setprop debug.dxr.mv.ws_ui 1`
 //    as the ready-made #506 test client; flip the default once #506 lands.
 HudBar g_hud_bar;
-// Default to the XrCompositionLayerWindowSpaceEXT bar now that the runtime
+// Default to the XrCompositionLayerWindowSpaceDXR bar now that the runtime
 // supports window-space layers on Android OOP (#506/#529 landed). Override with
 // `setprop debug.dxr.mv.ws_ui 0` to fall back to the interim Kotlin widget bar.
 bool g_use_ws_ui = true;
@@ -196,7 +196,7 @@ now_ms()
 }
 
 // ── XR_DXR_view_rig (#396 W7) ───────────────────────────────────────────────
-// When the runtime advertises XR_DXR_view_rig, chain an XrDisplayRigEXT on
+// When the runtime advertises XR_DXR_view_rig, chain an XrDisplayRigDXR on
 // xrLocateViews and consume the render-ready off-axis XrView{pose,fov} the
 // runtime computes (server-side Kooima over IPC on Android, #510/#513). The
 // rig pose stays IDENTITY: this app orbits the MODEL (build_splat_model), not
@@ -723,9 +723,9 @@ create_session()
 bool
 enumerate_rendering_modes()
 {
-	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesEXT",
+	xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesDXR",
 	                      (PFN_xrVoidFunction *)&g_pfnEnumModes);
-	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeEXT",
+	xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeDXR",
 	                      (PFN_xrVoidFunction *)&g_pfnReqMode);
 	if (g_pfnEnumModes == nullptr || g_pfnReqMode == nullptr) {
 		LOGI("Display rendering-mode ext entry points not resolved — mode switch disabled");
@@ -734,17 +734,17 @@ enumerate_rendering_modes()
 	uint32_t count = 0;
 	XrResult res = g_pfnEnumModes(g_session, 0, &count, nullptr);
 	if (res != XR_SUCCESS || count == 0) {
-		LOGI("xrEnumerateDisplayRenderingModesEXT: count=%u res=%d", count, (int)res);
+		LOGI("xrEnumerateDisplayRenderingModesDXR: count=%u res=%d", count, (int)res);
 		return true;
 	}
-	std::vector<XrDisplayRenderingModeInfoEXT> modes(count);
+	std::vector<XrDisplayRenderingModeInfoDXR> modes(count);
 	for (auto &m : modes) {
-		m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 		m.next = nullptr;
 	}
 	res = g_pfnEnumModes(g_session, count, &count, modes.data());
 	if (res != XR_SUCCESS) {
-		LOGI("xrEnumerateDisplayRenderingModesEXT (fill) res=%d", (int)res);
+		LOGI("xrEnumerateDisplayRenderingModesDXR (fill) res=%d", (int)res);
 		return true;
 	}
 	g_rmode_count = count;
@@ -1059,8 +1059,8 @@ poll_xr_events()
 				LOGI("session state -> %d", (int)e->state);
 				handle_session_state(e->state);
 			}
-		} else if (ev.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
-			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedEXT *>(&ev);
+		} else if (ev.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
+			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
 			LOGI("rendering mode changed: %u -> %u", e->previousModeIndex, e->currentModeIndex);
 			g_rmode_current.store(e->currentModeIndex, std::memory_order_relaxed);
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
@@ -1105,8 +1105,8 @@ render_frame()
 		// off-axis views (server-side Kooima over IPC on Android, #510/#513).
 		// Identity rig pose — this app orbits the model, not the camera. The
 		// raw channel reports the DP's display-space eyes + tracking state.
-		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
-		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
+		XrViewDisplayRawDXR view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 		const XrPosef rig_pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 		const float rig_vh = g_rig_vh;
 		if (g_has_view_rig) {
@@ -1270,7 +1270,7 @@ render_frame()
 			g_ui_visible.store(false, std::memory_order_relaxed);
 		}
 	}
-	XrCompositionLayerWindowSpaceEXT bar_layer = {};
+	XrCompositionLayerWindowSpaceDXR bar_layer = {};
 	bool bar_active = false;
 	if (ui_alpha > 0.0f && g_hud_bar.ready && rendered &&
 	    !g_ws_layer_unsupported.load(std::memory_order_relaxed)) {
@@ -1318,7 +1318,7 @@ render_frame()
 		// Full window width; height preserves the texture aspect (Windows-leg
 		// BtnBarHeightFraction): h_frac = windowAR / texAR.
 		const float bar_h = ((float)ww / (float)wh) / ((float)kBarTexW / (float)kBarTexH);
-		bar_layer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+		bar_layer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
 		bar_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 		bar_layer.subImage.swapchain = g_hud_bar.swapchain;
 		bar_layer.subImage.imageRect.offset = {0, 0};

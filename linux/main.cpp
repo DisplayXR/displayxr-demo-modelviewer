@@ -177,8 +177,8 @@ struct AppXrSession {
     float nominalViewerZ = 0.5f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
 
-    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
     uint32_t renderingModeCount = 0;
     uint32_t renderingModeViewCounts[8] = {};
@@ -235,7 +235,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+        XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
         sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
             xr.displayWidthM = di.displaySizeMeters.width;
@@ -244,9 +244,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.displayPixelWidth = di.displayPixelWidth;
             xr.displayPixelHeight = di.displayPixelHeight;
         }
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
                               (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
                               (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
     LOG_INFO("OpenXR initialized: %s", xr.systemName);
@@ -371,9 +371,9 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         uint32_t modeCount = 0;
         if (XR_SUCCEEDED(xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr))
             && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT; modes[i].next = nullptr;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR; modes[i].next = nullptr;
             }
             if (XR_SUCCEEDED(xr.pfnEnumerateDisplayRenderingModesEXT(
                     xr.session, modeCount, &modeCount, modes.data()))) {
@@ -654,7 +654,7 @@ int main() {
             const float rigVH = g_viewParams.virtualDisplayHeight / g_viewParams.scaleFactor;
 
             const bool useRig = xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
-            XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+            XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
             if (useRig) {
                 displayRig.pose = cameraPose;
                 displayRig.virtualDisplayHeight = rigVH;
