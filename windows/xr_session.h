@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  OpenXR session management for Vulkan with XR_EXT_win32_window_binding
+ * @brief  OpenXR session management for Vulkan with XR_DXR_win32_window_binding
  */
 
 #pragma once
@@ -11,15 +11,15 @@
 #include <vulkan/vulkan.h>
 #define XR_USE_GRAPHICS_API_VULKAN
 #include "xr_session_common.h"
-#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_DXR_view_rig.h>
 
-// XR_EXT_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
+// XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
 // returns render-ready XrView{pose, fov}; the app deletes its own. App-owned
 // flag (displayxr::common's XrSessionManager carries no app-named fields,
 // #396 W4); set by InitializeOpenXR.
 extern bool g_hasViewRigExt;
 
-// INV-1.3 (XR_EXT_display_info v16, runtime#715): 3D panel top-left in
+// INV-1.3 (XR_DXR_display_info v16, runtime#715): 3D panel top-left in
 // Windows virtual-screen pixels (XrDisplayDesktopPositionEXT). (0,0) =
 // primary monitor / unknown — safe default, incl. on pre-v16 runtimes.
 // Set by InitializeOpenXR; the app creates its window at this position.

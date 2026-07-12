@@ -8,7 +8,7 @@ DisplayXR Demo — **3D Model Viewer**. Real-time PBR model viewer for
 glasses-free 3D displays, on the DisplayXR OpenXR runtime via Vulkan (Windows)
 and MoltenVK (macOS). Loads glTF 2.0 (`.glb`/`.gltf`), STL, OBJ, FBX, and USD
 (`.usdz`/`.usd`/`.usda`/`.usdc`), renders with asymmetric per-eye Kooima
-projection — **runtime-owned via `XR_EXT_view_rig`** on all platforms (app-side
+projection — **runtime-owned via `XR_DXR_view_rig`** on all platforms (app-side
 Kooima survives only as the no-extension fallback). Standalone repo, independent
 release cadence; `common/` +
 `openxr_includes/` were seeded from the runtime and are maintained here.
@@ -51,7 +51,7 @@ model_common/                     — the renderer (vendor-neutral, analog of
                                     fullscreen.vert, brdf_lut/irradiance/
                                     prefilter.frag, sky.glsl + ibl_common.glsl
 common/                           — fallback Kooima view math (display3d_view.*,
-                                    used only when XR_EXT_view_rig is absent),
+                                    used only when XR_DXR_view_rig is absent),
                                     camera3d_view (unused), input, HUD, stb
 openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 ```
@@ -60,7 +60,7 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 - **Internal target sized to the swapchain** (not per-eye); recreated only on
   swapchain-size change. `renderEye` sets viewport/scissor to the per-eye tile
   and blits `[0,0..vp]` into the swapchain at `(vpX,vpY)`. Mirrors gs_renderer.
-- **Runtime-owned Kooima via `XR_EXT_view_rig` (primary path, all platforms).**
+- **Runtime-owned Kooima via `XR_DXR_view_rig` (primary path, all platforms).**
   Since #396 W7 the app chains the display rig by passing `XrViewDisplayRawEXT`
   on the `xrLocateViews` call, and the **runtime owns the off-axis Kooima
   projection + window resolve**, returning render-ready `XrView{pose, fov}` that
@@ -68,7 +68,7 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   and Android** — gated on `useRig = g_hasViewRigExt && displayWidthM > 0`
   (`windows/main.cpp`). Under the rig, `rawViews[]` carries the render-ready
   per-eye pose/FOV and `XrViewDisplayRawEXT.rawEyes[]` feeds the HUD eye readout.
-- **App-side Kooima (fallback only, when `XR_EXT_view_rig` is absent).**
+- **App-side Kooima (fallback only, when `XR_DXR_view_rig` is absent).**
   `display3d_compute_view/_views` (in `common/display3d_view.*`) take
   `(near_offset, far_offset)` — **absolute** offsets in virtual-display-height
   (`vH`) units, NOT fractions — and compute per-eye `near = ez − near_offset`,
@@ -136,7 +136,7 @@ bare binary (the dev launcher aligns the app + runtime on one Vulkan loader).
 (system Vulkan via `libvulkan-dev`, OpenXR loader built from source pinned to
 release **1.1.43** — do NOT bump). The Linux entry point (`linux/main.cpp`) is
 **hosted-NULL**: it passes no window binding, so the runtime self-creates the
-presentation window (the faithful `XR_EXT_xlib_window_binding` arm is
+presentation window (the faithful `XR_DXR_xlib_window_binding` arm is
 Phase-3b/hardware-gated — see the TODO in `linux/main.cpp` + `PORTING.md`). This
 is **build-green only** (compile on CI; the app is not run — no GPU/display).
 `linux/stb_image_impl_linux.cpp` supplies the single `STB_IMAGE_IMPLEMENTATION`

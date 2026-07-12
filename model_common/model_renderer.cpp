@@ -973,7 +973,7 @@ float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const
 void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                                    float clipFar) {
     // W7 (#396): consume a plain clean +Y-up-world view matrix (the render-ready
-    // XR_EXT_view_rig XrView pose). Vulkan Y-down is handled at the RASTER stage
+    // XR_DXR_view_rig XrView pose). Vulkan Y-down is handled at the RASTER stage
     // via a negative-height viewport in renderEye — NOT by reflecting the view
     // matrix. A view reflection renders correctly but flips rotational handedness
     // (inverting mouse pitch); the viewport flip does not, and keeps the off-axis
