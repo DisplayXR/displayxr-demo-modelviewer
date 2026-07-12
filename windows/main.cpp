@@ -400,7 +400,7 @@ static bool IsClickOnAnimButton(int mouseX, int mouseY, int windowW, int windowH
         ANIM_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
 }
 
-// Atlas capture is runtime-owned via xrCaptureAtlasEXT (XR_DXR_atlas_capture).
+// Atlas capture is runtime-owned via xrCaptureAtlasDXR (XR_DXR_atlas_capture).
 // App-side helpers (filename numbering + flash overlay) live in
 // common/atlas_capture* — see dxr_capture::MakeCaptureAtlasPrefix /
 // TriggerCaptureFlash / PostFlashRequest.
@@ -464,14 +464,14 @@ static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
 // Open a file dialog and load a .ply or .spz scene (called from main thread).
 //
 // Path A — workspace + Tier 1 picker available:
-//     xrRequestFilePickerEXT fires async. The completion event is drained
+//     xrRequestFilePickerDXR fires async. The completion event is drained
 //     by PollEvents (common/xr_session_common.cpp) into xr.filePickerLast*;
 //     the main loop dispatches to QueueSceneLoad on result arrival.
 //
 // Path B — workspace mode but no controller / no Tier 1 picker, OR running
 // outside a workspace (standalone window), OR running on a non-DisplayXR
-// OpenXR runtime: xrRequestFilePickerEXT either returns
-// XR_FILE_PICKER_FALLBACK_TIER0_EXT (workspace fallback) or the PFN is
+// OpenXR runtime: xrRequestFilePickerDXR either returns
+// XR_FILE_PICKER_FALLBACK_TIER0_DXR (workspace fallback) or the PFN is
 // null (extension absent). Either way fall through to GetOpenFileNameA
 // and keep the existing standalone UX.
 static void OpenLoadDialog(HWND hwnd) {
@@ -487,8 +487,8 @@ static void OpenLoadDialog(HWND hwnd) {
     // Path A: spatial picker, when available + not already in flight.
     if (g_xr != nullptr && g_xr->pfnRequestFilePickerEXT != nullptr &&
         !g_xr->filePickerInFlight) {
-        XrFilePickerInfoEXT info = {XR_TYPE_FILE_PICKER_INFO_EXT};
-        info.mode = XR_FILE_PICKER_MODE_OPEN_EXT;
+        XrFilePickerInfoDXR info = {XR_TYPE_FILE_PICKER_INFO_DXR};
+        info.mode = XR_FILE_PICKER_MODE_OPEN_DXR;
         strncpy(info.title, "Load 3D Model",
                 sizeof(info.title) - 1);
         info.filterCount = 3;
@@ -505,17 +505,17 @@ static void OpenLoadDialog(HWND hwnd) {
         strncpy(info.filters[2].extensions, "*.gltf",
                 sizeof(info.filters[2].extensions) - 1);
 
-        XrAsyncRequestIdEXT rid = 0;
+        XrAsyncRequestIdDXR rid = 0;
         XrResult r = g_xr->pfnRequestFilePickerEXT(g_xr->session, &info, &rid);
         if (r == XR_SUCCESS) {
             g_xr->filePickerInFlight = true;
             g_xr->filePickerRequestId = rid;
-            LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x requestId=%llu",
+            LOG_INFO("[#228] xrRequestFilePickerDXR -> rc=0x%x requestId=%llu",
                 r, (unsigned long long)rid);
             return; // wait for completion event in the main loop
         }
-        // r == XR_FILE_PICKER_FALLBACK_TIER0_EXT or an error → fall through.
-        LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x (falling back to Win32)", r);
+        // r == XR_FILE_PICKER_FALLBACK_TIER0_DXR or an error → fall through.
+        LOG_INFO("[#228] xrRequestFilePickerDXR -> rc=0x%x (falling back to Win32)", r);
     }
 
     // Path B: existing Win32 file dialog (unchanged behavior).
@@ -668,7 +668,7 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int x, i
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
     // INV-1.3 (runtime#715): (x, y) is the 3D panel top-left in virtual-screen
-    // pixels (XrDisplayDesktopPositionEXT) — open the window on the panel, not
+    // pixels (XrDisplayDesktopPositionDXR) — open the window on the panel, not
     // the primary monitor. (0,0) = primary/unknown, a safe create position.
     HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP, WINDOW_CLASS, WINDOW_TITLE,
         WS_OVERLAPPEDWINDOW,
@@ -879,7 +879,7 @@ static void RenderThreadFunc(
 
         // Rendering mode requests (V/mode-button=cycle, 0-8=absolute) through the
         // shared ModeSwitch sequencer: eases viewParams.ipdFactor around the switch
-        // and fires xrRequestDisplayRenderingModeEXT on the right frame. Ramped ipd
+        // and fires xrRequestDisplayRenderingModeDXR on the right frame. Ramped ipd
         // lands on inputSnapshot.viewParams.ipdFactor (what the render path reads).
         // Runtime owns current mode via xr->currentModeIndex.
         XrSessionUpdateModeSwitch(*xr, inputSnapshot, perfStats.deltaTime);
@@ -887,11 +887,11 @@ static void RenderThreadFunc(
         // Handle eye tracking mode toggle (T key)
         if (inputSnapshot.eyeTrackingModeToggleRequested) {
             if (xr->pfnRequestEyeTrackingModeEXT && xr->session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrEyeTrackingModeDXR newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
                 XrResult etResult = xr->pfnRequestEyeTrackingModeEXT(xr->session, newMode);
                 LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
         }
@@ -960,10 +960,10 @@ static void RenderThreadFunc(
         // queued path up via g_pendingLoadPath.
         if (xr->filePickerHasResult) {
             xr->filePickerHasResult = false;
-            if (xr->filePickerLastResult == XR_FILE_PICKER_RESULT_SUCCESS_EXT &&
+            if (xr->filePickerLastResult == XR_FILE_PICKER_RESULT_SUCCESS_DXR &&
                 xr->filePickerLastPath[0] != '\0') {
                 QueueSceneLoad(hwnd, std::string(xr->filePickerLastPath));
-            } else if (xr->filePickerLastResult == XR_FILE_PICKER_RESULT_CANCELLED_EXT) {
+            } else if (xr->filePickerLastResult == XR_FILE_PICKER_RESULT_CANCELLED_DXR) {
                 LOG_INFO("[#228] User cancelled spatial picker — no scene load");
             } else {
                 // PICKER_FAILED / INVALID_PATH — log and silently drop.
@@ -1044,8 +1044,8 @@ static void RenderThreadFunc(
                         // XrView{pose, fov}. The raw channel carries display-space eyes for HUD.
                         const bool useRig =
                             g_hasViewRigExt && xr->displayWidthM > 0 && xr->displayHeightM > 0;
-                        XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
-                        XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                        XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                        XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                         if (useRig) {
                             displayRig.pose = cameraPose;
                             displayRig.virtualDisplayHeight = rigVH;
@@ -1066,7 +1066,7 @@ static void RenderThreadFunc(
 
                         // HUD eye readout. Under the rig, rawViews[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
-                        // (XrViewDisplayRawEXT); without the rig, the fill from the common
+                        // (XrViewDisplayRawDXR); without the rig, the fill from the common
                         // LocateViews call above stands.
                         if (useRig && viewRigRaw.eyeCountOutput > 0) {
                             for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
@@ -1352,7 +1352,7 @@ static void RenderThreadFunc(
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime
-                            // composes for this session via xrCaptureAtlasEXT
+                            // composes for this session via xrCaptureAtlasDXR
                             // (XR_DXR_atlas_capture, W6 of #396). The runtime owns
                             // the readback — no app-side staging texture. Works for
                             // any multi-view layout the runtime advertises; skipped
@@ -1378,9 +1378,9 @@ static void RenderThreadFunc(
                                     if (stem.empty()) stem = "scene";
                                     std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                         stem, cols, rows);
-                                    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                    XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                                     info.next = nullptr;
-                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                                     strncpy_s(info.pathPrefix, prefix.c_str(), _TRUNCATE);
                                     XrResult cr = xr->pfnCaptureAtlasEXT(xr->session, &info, nullptr);
                                     if (XR_SUCCEEDED(cr)) {
@@ -1388,7 +1388,7 @@ static void RenderThreadFunc(
                                                  prefix.c_str());
                                         dxr_capture::PostFlashRequest(hwnd);
                                     } else {
-                                        LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                                        LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                                     }
                                 } else {
                                     LOG_WARN("Capture skipped: XR_DXR_atlas_capture not available");
@@ -1598,7 +1598,7 @@ static void RenderThreadFunc(
                 //    when the model has clips. Reuses the window-space-layer
                 //    machinery (own swapchain / text renderer / staging) widened
                 //    to a bar — see runtime issue #389. ──
-                XrCompositionLayerWindowSpaceEXT barLayer = {};
+                XrCompositionLayerWindowSpaceDXR barLayer = {};
                 bool barLayerReady = false;
                 if (g_animBtnReady && g_hasAnimBtnSwapchain) {
                     const float mxf = (g_windowWidth > 0)
@@ -1704,7 +1704,7 @@ static void RenderThreadFunc(
                         vkFreeCommandBuffers(vkDevice, g_animBtnCmdPool, 1, &cb);
                         ReleaseWindowSpaceImage(g_animBtnSwapchain);
 
-                        barLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+                        barLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
                         barLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                         barLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
                         barLayer.subImage.imageRect.offset = {0, 0};
@@ -1818,7 +1818,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Initialize OpenXR BEFORE creating the window, so the window can be
     // created directly at the 3D panel's desktop position (INV-1.3,
-    // XrDisplayDesktopPositionEXT, runtime#715). Nothing in the OpenXR /
+    // XrDisplayDesktopPositionDXR, runtime#715). Nothing in the OpenXR /
     // Vulkan init below needs the HWND until CreateSession.
     XrSessionManager xr = {};
     g_xr = &xr;
@@ -2116,7 +2116,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_inputState.renderingModeCount = xr.renderingModeCount;
     // Align runtime active rendering mode with app's default (mode 1 = first 3D mode).
     // The main loop's dispatch picks this up on the first frame and calls
-    // xrRequestDisplayRenderingModeEXT(1); the runtime event drives xr.currentModeIndex.
+    // xrRequestDisplayRenderingModeDXR(1); the runtime event drives xr.currentModeIndex.
     g_inputState.absoluteRenderingModeRequested = 1;
     g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
     g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle

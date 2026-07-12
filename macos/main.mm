@@ -12,7 +12,7 @@
  * - App creates and owns the NSWindow (XR_DXR_cocoa_window_binding)
  * - Mouse drag camera, WASD/QE movement, scroll zoom
  * - XR_DXR_display_info: Kooima projection, display metrics
- * - V key cycles rendering modes via xrRequestDisplayRenderingModeEXT
+ * - V key cycles rendering modes via xrRequestDisplayRenderingModeDXR
  * - 0-3 keys select rendering mode directly
  * - L key or button click: NSOpenPanel to load .glb/.gltf models
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
@@ -134,7 +134,7 @@ struct InputState {
 
     // Unified rendering mode (V key cycles, 0-8 keys select directly)
     uint32_t currentRenderingMode = 1;   // Default: mode 1 (first 3D mode)
-    uint32_t renderingModeCount = 0;     // Set from xrEnumerateDisplayRenderingModesEXT
+    uint32_t renderingModeCount = 0;     // Set from xrEnumerateDisplayRenderingModesDXR
     bool renderingModeChangeRequested = false;
 };
 
@@ -747,7 +747,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
 
     // INV-1.3: open on the 3D panel. (screenLeft, screenTop) is the panel
     // top-left in top-down global coordinates (origin = primary top-left,
-    // XrDisplayDesktopPositionEXT, runtime#715); flip into AppKit's bottom-up
+    // XrDisplayDesktopPositionDXR, runtime#715); flip into AppKit's bottom-up
     // space. (0,0) = primary — the titled window is auto-constrained below
     // the menu bar, so it is always a safe create position.
     NSRect frame = NSMakeRect(100, 100, width, height);
@@ -946,7 +946,7 @@ struct AppXrSession {
     float recommendedViewScaleX = 0.5f, recommendedViewScaleY = 1.0f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
     // INV-1.3 (v16, runtime#715): 3D panel top-left in top-down virtual-desktop
-    // pixels (XrDisplayDesktopPositionEXT). (0,0) = primary/unknown — the safe
+    // pixels (XrDisplayDesktopPositionDXR). (0,0) = primary/unknown — the safe
     // default, which zero-init also yields on pre-v16 runtimes.
     int32_t displayScreenLeft = 0, displayScreenTop = 0;
 
@@ -958,14 +958,14 @@ struct AppXrSession {
     uint32_t supportedEyeTrackingModes = 0;
 
     // Function pointers
-    PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
-    PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
-    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT = nullptr;
+    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
     // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I' key capture.
     bool hasAtlasCaptureExt = false;
-    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+    PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
     // XR_DXR_view_rig (W7 of #396): runtime owns the off-axis Kooima and returns
     // render-ready XrView{pose, fov}; the app deletes its own.
@@ -975,11 +975,11 @@ struct AppXrSession {
     // per-process MCP server. The whole path is inert when the extension or
     // the MCP capability gate is absent — never load-bearing.
     bool hasMcpToolsExt = false;
-    PFN_xrSetMCPAppInfoEXT pfnSetMCPAppInfo = nullptr;
-    PFN_xrRegisterMCPToolEXT pfnRegisterMCPTool = nullptr;
-    PFN_xrUnregisterMCPToolEXT pfnUnregisterMCPTool = nullptr;
-    PFN_xrGetMCPToolCallArgsEXT pfnGetMCPToolCallArgs = nullptr;
-    PFN_xrSubmitMCPToolResultEXT pfnSubmitMCPToolResult = nullptr;
+    PFN_xrSetMCPAppInfoDXR pfnSetMCPAppInfo = nullptr;
+    PFN_xrRegisterMCPToolDXR pfnRegisterMCPTool = nullptr;
+    PFN_xrUnregisterMCPToolDXR pfnUnregisterMCPTool = nullptr;
+    PFN_xrGetMCPToolCallArgsDXR pfnGetMCPToolCallArgs = nullptr;
+    PFN_xrSubmitMCPToolResultDXR pfnSubmitMCPToolResult = nullptr;
     bool mcpToolsReady = false;           // appId declared + base tools registered
     bool mcpAnimToolsRegistered = false;  // list/play/stop_animation currently live
 
@@ -1047,7 +1047,7 @@ static void UpdateMcpAnimationTools() {
     if (want == xr->mcpAnimToolsRegistered) return;
 
     if (want) {
-        XrMCPToolInfoEXT listTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+        XrMCPToolInfoDXR listTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
         listTool.name = "list_animations";
         listTool.description =
             "List the loaded model's animation clips: index, name and duration in "
@@ -1056,7 +1056,7 @@ static void UpdateMcpAnimationTools() {
         listTool.inputSchemaJson = "{\"type\":\"object\"}";
         XrResult r1 = xr->pfnRegisterMCPTool(xr->session, &listTool);
 
-        XrMCPToolInfoEXT playTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+        XrMCPToolInfoDXR playTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
         playTool.name = "play_animation";
         playTool.description =
             "Play an animation clip, selected by 'index' or 'name' (see "
@@ -1069,7 +1069,7 @@ static void UpdateMcpAnimationTools() {
             "\"name\":{\"type\":\"string\",\"description\":\"Clip name from list_animations.\"}}}";
         XrResult r2 = xr->pfnRegisterMCPTool(xr->session, &playTool);
 
-        XrMCPToolInfoEXT stopTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+        XrMCPToolInfoDXR stopTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
         stopTool.name = "stop_animation";
         stopTool.description =
             "Pause animation playback, freezing the model at its current pose. "
@@ -1161,12 +1161,12 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrEyeTrackingModeCapabilitiesEXT ec = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR ec = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         // INV-1.3 (v16, runtime#715): panel desktop position, so the window
         // opens on the 3D panel instead of the primary monitor.
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         desktopPos.next = &ec;
         di.next = &desktopPos; sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
@@ -1185,30 +1185,30 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             LOG_INFO("Display desktop position: (%d, %d)",
                 xr.displayScreenLeft, xr.displayScreenTop);
         }
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
         if (xr.supportedEyeTrackingModes != 0)
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
 
         // Load unified rendering mode function pointers (v7)
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT", (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR", (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
     // XR_DXR_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
     if (xr.hasAtlasCaptureExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT", (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
-        LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR", (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
+        LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
     // XR_DXR_mcp_tools (#22): resolve the agent-tool entry points. Tools are
     // registered after session create (CreateSession) and dispatched from
     // PollEvents.
     if (xr.hasMcpToolsExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoEXT", (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfo);
-        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolEXT", (PFN_xrVoidFunction*)&xr.pfnRegisterMCPTool);
-        xrGetInstanceProcAddr(xr.instance, "xrUnregisterMCPToolEXT", (PFN_xrVoidFunction*)&xr.pfnUnregisterMCPTool);
-        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsEXT", (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgs);
-        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultEXT", (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResult);
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR", (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfo);
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolDXR", (PFN_xrVoidFunction*)&xr.pfnRegisterMCPTool);
+        xrGetInstanceProcAddr(xr.instance, "xrUnregisterMCPToolDXR", (PFN_xrVoidFunction*)&xr.pfnUnregisterMCPTool);
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsDXR", (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgs);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultDXR", (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResult);
         const bool resolved = xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool &&
             xr.pfnUnregisterMCPTool && xr.pfnGetMCPToolCallArgs && xr.pfnSubmitMCPToolResult;
         LOG_INFO("XR_DXR_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
@@ -1333,7 +1333,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueFamilyIndex = qfi;
     vkBinding.queueIndex = 0;
 
-    XrCocoaWindowBindingCreateInfoEXT macBinding = {(XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrCocoaWindowBindingCreateInfoDXR macBinding = {(XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR};
     macBinding.viewHandle = (__bridge void*)g_metalView;
     if (xr.hasCocoaWindowBinding && g_metalView) {
         vkBinding.next = &macBinding;
@@ -1352,11 +1352,11 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     // surface. The animation tools are NOT registered here: they appear only
     // once a model with clips loads (UpdateMcpAnimationTools).
     if (xr.hasMcpToolsExt && xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool) {
-        XrMCPAppInfoEXT mcpAppInfo = {XR_TYPE_MCP_APP_INFO_EXT};
+        XrMCPAppInfoDXR mcpAppInfo = {XR_TYPE_MCP_APP_INFO_DXR};
         strncpy(mcpAppInfo.appId, "modelviewer", sizeof(mcpAppInfo.appId) - 1);
         XrResult ar = xr.pfnSetMCPAppInfo(xr.session, &mcpAppInfo);
         if (XR_SUCCEEDED(ar)) {
-            XrMCPToolInfoEXT loadTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR loadTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
             loadTool.name = "load_model";
             loadTool.description =
                 "Load a 3D model file into the viewer, replacing the current model. "
@@ -1372,7 +1372,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                 "\"required\":[\"path\"]}";
             XrResult t1 = xr.pfnRegisterMCPTool(xr.session, &loadTool);
 
-            XrMCPToolInfoEXT statusTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR statusTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
             statusTool.name = "get_status";
             statusTool.description =
                 "Read the viewer's live state: loaded model file and primitive count, "
@@ -1382,7 +1382,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
             statusTool.inputSchemaJson = "{\"type\":\"object\"}";
             XrResult t2 = xr.pfnRegisterMCPTool(xr.session, &statusTool);
 
-            XrMCPToolInfoEXT orbitTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR orbitTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
             orbitTool.name = "set_orbit";
             orbitTool.description =
                 "Orbit the camera around the model. azimuth_deg rotates around the "
@@ -1399,7 +1399,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                 "\"zoom\":{\"type\":\"number\",\"description\":\"View scale factor, 0.1–10; 1 = the auto-fit framing.\"}}}";
             XrResult t3 = xr.pfnRegisterMCPTool(xr.session, &orbitTool);
 
-            XrMCPToolInfoEXT frameTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR frameTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
             frameTool.name = "frame_model";
             frameTool.description =
                 "Reset the camera to the loaded model's auto-fit framed pose (same as "
@@ -1421,9 +1421,9 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
@@ -1636,7 +1636,7 @@ static bool JsonGetNumber(const char* json, const char* key, double& out) {
 // PollEvents), where app state is naturally consistent — no locking. EVERY
 // call is answered — success=XR_FALSE + {"error":…} for bad args — because an
 // unanswered call only fails to the agent after the runtime's ~5 s timeout.
-static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallEXT* call) {
+static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallDXR* call) {
     // Two-call idiom: argsSize from the event is the required capacity incl. NUL.
     std::string args;
     if (xr.pfnGetMCPToolCallArgs && call->argsSize > 0) {
@@ -1835,9 +1835,9 @@ static void PollEvents(AppXrSession& xr) {
             } else if (ssc->state == XR_SESSION_STATE_EXITING) {
                 xr.exitRequested = true;
             }
-        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
             // Runtime (or another client / shell) switched rendering mode on us.
-            auto* rmc = (XrEventDataRenderingModeChangedEXT*)&event;
+            auto* rmc = (XrEventDataRenderingModeChangedDXR*)&event;
             if (rmc->currentModeIndex < xr.renderingModeCount) {
                 g_input.currentRenderingMode = rmc->currentModeIndex;
                 g_msLastMode = rmc->currentModeIndex; // keep the ramp's from-mode in sync
@@ -1846,9 +1846,9 @@ static void PollEvents(AppXrSession& xr) {
                     rmc->previousModeIndex, rmc->currentModeIndex,
                     xr.renderingModeNames[rmc->currentModeIndex]);
             }
-        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT) {
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR) {
             // An agent invoked one of our XR_DXR_mcp_tools tools (#22).
-            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallEXT*)&event);
+            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallDXR*)&event);
         }
         event.type = XR_TYPE_EVENT_DATA_BUFFER;
     }
@@ -2050,7 +2050,7 @@ int main() {
     }
 
     // Step 1: Initialize OpenXR — BEFORE the window, so it can be created
-    // directly on the 3D panel (INV-1.3, XrDisplayDesktopPositionEXT,
+    // directly on the 3D panel (INV-1.3, XrDisplayDesktopPositionDXR,
     // runtime#715). Nothing in the OpenXR / Vulkan init needs the NSWindow
     // until CreateSession (same ordering as cube_handle_metal_macos).
     AppXrSession xr = {};
@@ -2261,8 +2261,8 @@ int main() {
         if (g_input.eyeTrackingModeToggleRequested) {
             g_input.eyeTrackingModeToggleRequested = false;
             if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
                 xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
             }
         }
@@ -2282,8 +2282,8 @@ int main() {
                     locateInfo.space = xr.localSpace;
 
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                    XrViewEyeTrackingStateEXT eyeTrackingState = {};
-                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
+                    XrViewEyeTrackingStateDXR eyeTrackingState = {};
+                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR;
                     viewState.next = &eyeTrackingState;
 
                     // Clean +Y-up world camera pose (no Y negation — the ModelRenderer
@@ -2300,8 +2300,8 @@ int main() {
                     // XrView{pose, fov}. The raw channel carries display-space eyes for HUD.
                     const bool useRig =
                         xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
-                    XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
-                    XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                    XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                     if (useRig) {
                         displayRig.pose = cameraPose;
                         displayRig.virtualDisplayHeight = rigVH;
@@ -2342,7 +2342,7 @@ int main() {
 
                         // HUD eye readout. Under the rig, views[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
-                        // (XrViewDisplayRawEXT); without the rig, fall back to views[].
+                        // (XrViewDisplayRawDXR); without the rig, fall back to views[].
                         if (useRig && viewRigRaw.eyeCountOutput > 0) {
                             for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
                                 xr.eyePositions[v][0] = viewRigRaw.rawEyes[v].x;
@@ -2558,7 +2558,7 @@ int main() {
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime
-                            // composes for this session via xrCaptureAtlasEXT
+                            // composes for this session via xrCaptureAtlasDXR
                             // (XR_DXR_atlas_capture, W6 of #396). The runtime owns
                             // the readback — no app-side staging texture. Skipped
                             // for mono (1×1). The prefix has no ".png"; the runtime
@@ -2582,11 +2582,11 @@ int main() {
                                     if (stem.empty()) stem = "scene";
                                     std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                         stem, cols, rows);
-                                    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                    XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                                     info.next = nullptr;
-                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                                     strncpy(info.pathPrefix, prefix.c_str(),
-                                            XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+                                            XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
                                     XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
                                     if (XR_SUCCEEDED(cr)) {
                                         LOG_INFO("Atlas capture requested -> %s_atlas.png",
@@ -2594,7 +2594,7 @@ int main() {
                                         dxr_capture::TriggerCaptureFlash(
                                             (__bridge void*)g_metalView);
                                     } else {
-                                        LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                                        LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                                     }
                                 } else {
                                     LOG_WARN("Capture skipped: XR_DXR_atlas_capture not available");
