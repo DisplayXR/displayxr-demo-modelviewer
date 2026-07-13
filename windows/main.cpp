@@ -36,6 +36,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>   // snprintf (XR_DXR_mcp_tools JSON formatting, #47)
+#include <cstdlib>  // strtod
+#include <cstring>  // strcmp / strstr / strchr
 #include <mutex>
 #include <string>
 #include <thread>
@@ -272,6 +275,12 @@ static float g_fitVHeight   = kFallbackVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
 static std::atomic<bool> g_fitValid{false};
 
+// XR_DXR_mcp_tools (#47): late (un)registration of the animation tools —
+// list/play/stop_animation exist only while a model with clips is loaded.
+// Called from ApplyAutoFitForLoadedScene_locked (the single choke point every
+// model load funnels through). Defined with the rest of the MCP block below.
+static void UpdateMcpAnimationTools();
+
 // Compute robust scene bounds (5th–95th percentile per axis) and stage
 // new display-rig pose + vHeight on g_inputState. Display orientation is
 // kept identity (forward = world −Z): splats have no canonical front, and
@@ -333,6 +342,462 @@ static void ApplyAutoFitForLoadedScene_locked() {
             high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
         g_inputState.animationActive = false;
     }
+
+    // Sync the agent-facing animation tools to the newly-loaded model: appear
+    // when it has clips, disappear when it doesn't (#47). No-op until the base
+    // tools are registered (MCP capability off / older runtime).
+    UpdateMcpAnimationTools();
+}
+
+// ============================================================================
+// XR_DXR_mcp_tools dispatch (#47) — ported from macos/main.mm
+// ============================================================================
+// The model viewer exposes its controls as agent tools on the per-process MCP
+// server the runtime hosts. appId "modelviewer" matches the `id` field in
+// windows/displayxr/model_viewer_handle_vk_win.displayxr.json (INV-10.1). Tool
+// names, descriptions, and JSON input schemas are copied verbatim from the
+// macOS build so agents behave identically across platforms. The whole path is
+// inert when McpToolsResolved() is false (older runtime / MCP capability off).
+//
+// All handlers below run on the render thread (dispatched from
+// PollEventsModelViewer), the same thread that owns g_modelRenderer and drives
+// per-frame rendering — so model loads are safe here, exactly like the queued-
+// load drain. g_inputState is shared with the window-message thread and so is
+// guarded by g_inputMutex; g_loadedFileName / scene state by g_sceneMutex.
+
+// appId declared + base tools registered. Set by RegisterModelViewerMcpTools.
+static bool g_mcpToolsReady = false;
+// list/play/stop_animation currently live (late-registered on model load).
+static bool g_mcpAnimToolsRegistered = false;
+
+// Minimal JSON helpers — hand-rolled on purpose (matching macos/main.mm): tool
+// args are tiny one-level objects, so a JSON dependency isn't warranted.
+static std::string McpJsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char b[8];
+                    snprintf(b, sizeof(b), "\\u%04x", (unsigned char)c);
+                    out += b;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Extract "key":"value" (string) with backslash-escape handling incl. a basic
+// \uXXXX → UTF-8 decode (no surrogate pairs — file paths don't need them).
+// False when the key is absent or its value is not a string.
+static bool McpJsonGetString(const char* json, const char* key, std::string& out) {
+    std::string pat = "\"" + std::string(key) + "\"";
+    const char* k = strstr(json, pat.c_str());
+    if (!k) return false;
+    const char* c = strchr(k + pat.size(), ':');
+    if (!c) return false;
+    c++;
+    while (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r') c++;
+    if (*c != '"') return false;
+    c++;
+    out.clear();
+    while (*c && *c != '"') {
+        if (*c == '\\' && c[1]) {
+            c++;
+            switch (*c) {
+                case 'n': out += '\n'; break;
+                case 't': out += '\t'; break;
+                case 'r': out += '\r'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'u': {
+                    unsigned cp = 0;
+                    int ndig = 0;
+                    while (ndig < 4 && c[1]) {
+                        char h = c[1];
+                        unsigned v;
+                        if (h >= '0' && h <= '9') v = (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') v = (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') v = (unsigned)(h - 'A' + 10);
+                        else break;
+                        cp = (cp << 4) | v;
+                        c++;
+                        ndig++;
+                    }
+                    if (cp < 0x80) out += (char)cp;
+                    else if (cp < 0x800) {
+                        out += (char)(0xC0 | (cp >> 6));
+                        out += (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out += (char)(0xE0 | (cp >> 12));
+                        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out += (char)(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default: out += *c; break;  // \" \\ \/
+            }
+        } else {
+            out += *c;
+        }
+        c++;
+    }
+    return *c == '"';
+}
+
+// Extract "key": <number>. False when absent or not numeric (strtod refuses a
+// leading quote, so string values correctly fail).
+static bool McpJsonGetNumber(const char* json, const char* key, double& out) {
+    std::string pat = "\"" + std::string(key) + "\"";
+    const char* k = strstr(json, pat.c_str());
+    if (!k) return false;
+    const char* c = strchr(k + pat.size(), ':');
+    if (!c) return false;
+    char* end = nullptr;
+    double v = strtod(c + 1, &end);
+    if (end == c + 1) return false;
+    out = v;
+    return true;
+}
+
+// Late (un)registration of the animation tools. They exist only while a model
+// with clips is loaded, so each transition makes the runtime broadcast the MCP
+// tool-list change to connected agents. Called from
+// ApplyAutoFitForLoadedScene_locked (every load funnels through it) — always on
+// the render thread once setup is complete.
+static void UpdateMcpAnimationTools() {
+    if (!g_mcpToolsReady || !g_pfnRegisterMcpTool || !g_pfnUnregisterMcpTool)
+        return;
+    const bool want = g_modelRenderer.hasAnimations();
+    if (want == g_mcpAnimToolsRegistered) return;
+
+    if (want) {
+        XrMCPToolInfoDXR listTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+        listTool.name = "list_animations";
+        listTool.description =
+            "List the loaded model's animation clips: index, name and duration in "
+            "seconds, plus the active clip index and whether playback is running. "
+            "Only available while a model with animation clips is loaded.";
+        listTool.inputSchemaJson = "{\"type\":\"object\"}";
+        XrResult r1 = g_pfnRegisterMcpTool(g_xr->session, &listTool);
+
+        XrMCPToolInfoDXR playTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+        playTool.name = "play_animation";
+        playTool.description =
+            "Play an animation clip, selected by 'index' or 'name' (see "
+            "list_animations). Omit both to resume the active clip. Selecting a "
+            "different clip restarts it from t=0. Returns the now-playing clip; "
+            "verify visually with capture_frame.";
+        playTool.inputSchemaJson =
+            "{\"type\":\"object\",\"properties\":{"
+            "\"index\":{\"type\":\"integer\",\"description\":\"Clip index from list_animations.\"},"
+            "\"name\":{\"type\":\"string\",\"description\":\"Clip name from list_animations.\"}}}";
+        XrResult r2 = g_pfnRegisterMcpTool(g_xr->session, &playTool);
+
+        XrMCPToolInfoDXR stopTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+        stopTool.name = "stop_animation";
+        stopTool.description =
+            "Pause animation playback, freezing the model at its current pose. "
+            "Resume with play_animation.";
+        stopTool.inputSchemaJson = "{\"type\":\"object\"}";
+        XrResult r3 = g_pfnRegisterMcpTool(g_xr->session, &stopTool);
+
+        g_mcpAnimToolsRegistered = XR_SUCCEEDED(r1) || XR_SUCCEEDED(r2) || XR_SUCCEEDED(r3);
+        LOG_INFO("XR_DXR_mcp_tools: animation tools registered (%d clip(s)) [%d %d %d]",
+                 g_modelRenderer.animationCount(), r1, r2, r3);
+    } else {
+        g_pfnUnregisterMcpTool(g_xr->session, "list_animations");
+        g_pfnUnregisterMcpTool(g_xr->session, "play_animation");
+        g_pfnUnregisterMcpTool(g_xr->session, "stop_animation");
+        g_mcpAnimToolsRegistered = false;
+        LOG_INFO("XR_DXR_mcp_tools: animation tools unregistered (model has no clips)");
+    }
+}
+
+// Dispatch one agent tool call to the Windows app state. Runs on the render
+// thread (from PollEventsModelViewer). Answers EVERY call — success=false +
+// {"error":…} on bad args — because an unanswered call only fails to the agent
+// after the runtime's ~5 s timeout. Installed via SetMcpToolCallHandler.
+static std::string McpDispatchToolCall(const char* toolName, const char* a, bool& ok) {
+    ok = true;
+    std::string result;
+    char buf[1024];
+
+    if (strcmp(toolName, "load_model") == 0) {
+        std::string path;
+        if (!McpJsonGetString(a, "path", path) || path.empty()) {
+            ok = false;
+            result = "{\"error\":\"missing required string argument 'path'\"}";
+        } else if (!model_validate_file(path)) {
+            ok = false;
+            result = "{\"error\":\"not a readable supported model file: " +
+                     McpJsonEscape(path) + "\"}";
+        } else {
+            std::lock_guard<std::mutex> lock(g_sceneMutex);
+            if (!g_modelRenderer.loadModel(path.c_str())) {
+                ok = false;
+                result = "{\"error\":\"failed to load (corrupt or unsupported): " +
+                         McpJsonEscape(path) + "\"}";
+            } else {
+                g_loadedFileName = model_basename(path);
+                LOG_INFO("Model loaded via MCP: %s (%s)", g_loadedFileName.c_str(),
+                         model_filesize_str(path).c_str());
+                // Re-frames the camera and registers/unregisters the agent
+                // animation tools for the new model.
+                ApplyAutoFitForLoadedScene_locked();
+                snprintf(buf, sizeof(buf),
+                         "{\"file\":\"%s\",\"primitives\":%u,\"animation_count\":%d}",
+                         McpJsonEscape(g_loadedFileName).c_str(),
+                         g_modelRenderer.primitiveCount(),
+                         g_modelRenderer.animationCount());
+                result = buf;
+            }
+        }
+    } else if (strcmp(toolName, "get_status") == 0) {
+        std::string clip; int ci = -1, cn = 0; float ct = 0, cd = 0; bool playing = false;
+        const bool hasClip = g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing);
+        // Snapshot the shared camera/scene state under their locks.
+        float yaw, pitch, px, py, pz, zoom;
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            yaw = g_inputState.yaw;
+            pitch = g_inputState.pitch;
+            px = g_inputState.cameraPosX;
+            py = g_inputState.cameraPosY;
+            pz = g_inputState.cameraPosZ;
+            zoom = g_inputState.viewParams.scaleFactor;
+        }
+        std::string file;
+        {
+            std::lock_guard<std::mutex> lock(g_sceneMutex);
+            file = g_loadedFileName;
+        }
+        const float azDeg = fmodf(yaw * 57.29578f, 360.0f);
+        const float elDeg = pitch * 57.29578f;
+        std::string clipJson = hasClip ? "\"" + McpJsonEscape(clip) + "\"" : "null";
+        snprintf(buf, sizeof(buf),
+                 "{\"file\":\"%s\",\"loaded\":%s,\"primitives\":%u,"
+                 "\"animation_count\":%d,\"active_animation\":%d,"
+                 "\"active_animation_name\":%s,\"animation_playing\":%s,"
+                 "\"camera\":{\"azimuth_deg\":%.1f,\"elevation_deg\":%.1f,"
+                 "\"position\":[%.3f,%.3f,%.3f],\"zoom\":%.2f},"
+                 "\"rendering_mode\":%u,\"session_running\":%s}",
+                 McpJsonEscape(file).c_str(),
+                 g_modelRenderer.hasModel() ? "true" : "false",
+                 g_modelRenderer.primitiveCount(),
+                 g_modelRenderer.animationCount(),
+                 hasClip ? ci : -1, clipJson.c_str(),
+                 (hasClip && playing) ? "true" : "false",
+                 azDeg, elDeg, px, py, pz, zoom,
+                 g_xr ? g_xr->currentModeIndex : 0u,
+                 (g_xr && g_xr->sessionRunning) ? "true" : "false");
+        result = buf;
+    } else if (strcmp(toolName, "set_orbit") == 0) {
+        double az, el, zm;
+        bool any = false;
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        if (McpJsonGetNumber(a, "azimuth_deg", az)) {
+            g_inputState.yaw = (float)(az * 0.0174532925);
+            any = true;
+        }
+        if (McpJsonGetNumber(a, "elevation_deg", el)) {
+            if (el > 85.0) el = 85.0;
+            if (el < -85.0) el = -85.0;
+            g_inputState.pitch = (float)(el * 0.0174532925);
+            any = true;
+        }
+        if (McpJsonGetNumber(a, "zoom", zm)) {
+            if (zm < 0.1) zm = 0.1;
+            if (zm > 10.0) zm = 10.0;
+            g_inputState.viewParams.scaleFactor = (float)zm;
+            any = true;
+        }
+        if (!any) {
+            ok = false;
+            result = "{\"error\":\"provide at least one of azimuth_deg, elevation_deg, zoom\"}";
+        } else {
+            // Agent input is input: reset the auto-orbit idle timer (mirrors the
+            // shared MarkUserInput, which is private to the input handler).
+            using namespace std::chrono;
+            g_inputState.lastInputTimeSec = (double)duration_cast<microseconds>(
+                high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
+            g_inputState.animationActive = false;
+            snprintf(buf, sizeof(buf),
+                     "{\"azimuth_deg\":%.1f,\"elevation_deg\":%.1f,\"zoom\":%.2f}",
+                     g_inputState.yaw * 57.29578f, g_inputState.pitch * 57.29578f,
+                     g_inputState.viewParams.scaleFactor);
+            result = buf;
+        }
+    } else if (strcmp(toolName, "frame_model") == 0) {
+        if (!g_modelRenderer.hasModel()) {
+            ok = false;
+            result = "{\"error\":\"no model loaded — call load_model first\"}";
+        } else {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.resetViewRequested = true;  // applied by the render loop next frame
+            result = "{\"framed\":true}";
+        }
+    } else if (strcmp(toolName, "list_animations") == 0) {
+        const int n = g_modelRenderer.animationCount();
+        std::string clips = "[";
+        for (int i = 0; i < n; i++) {
+            std::string nm; float dur = 0;
+            g_modelRenderer.getAnimationInfo(i, nm, dur);
+            snprintf(buf, sizeof(buf), "%s{\"index\":%d,\"name\":\"%s\",\"duration_s\":%.2f}",
+                     i ? "," : "", i, McpJsonEscape(nm).c_str(), dur);
+            clips += buf;
+        }
+        clips += "]";
+        snprintf(buf, sizeof(buf), ",\"active_index\":%d,\"playing\":%s}",
+                 g_modelRenderer.activeAnimation(),
+                 (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) ? "true" : "false");
+        result = "{\"animations\":" + clips + buf;
+    } else if (strcmp(toolName, "play_animation") == 0) {
+        const int n = g_modelRenderer.animationCount();
+        int target = -1;
+        double idx; std::string nm;
+        if (McpJsonGetNumber(a, "index", idx)) {
+            target = (int)idx;
+            if (target < 0 || target >= n) {
+                ok = false;
+                snprintf(buf, sizeof(buf), "{\"error\":\"index out of range (0..%d)\"}", n - 1);
+                result = buf;
+            }
+        } else if (McpJsonGetString(a, "name", nm)) {
+            for (int i = 0; i < n && target < 0; i++) {
+                std::string c; float d;
+                g_modelRenderer.getAnimationInfo(i, c, d);
+                if (c == nm) target = i;
+            }
+            if (target < 0) {
+                ok = false;
+                result = "{\"error\":\"no clip named '" + McpJsonEscape(nm) +
+                         "' — see list_animations\"}";
+            }
+        } else {
+            target = g_modelRenderer.activeAnimation();  // resume the active clip
+            if (target < 0) target = 0;
+        }
+        if (ok) {
+            if (n == 0) {
+                ok = false;
+                result = "{\"error\":\"the loaded model has no animation clips\"}";
+            } else {
+                if (target != g_modelRenderer.activeAnimation())
+                    g_modelRenderer.setActiveAnimation(target);
+                g_modelRenderer.setPaused(false);
+                std::string c; float d = 0;
+                g_modelRenderer.getAnimationInfo(target, c, d);
+                snprintf(buf, sizeof(buf),
+                         "{\"playing\":\"%s\",\"index\":%d,\"duration_s\":%.2f}",
+                         McpJsonEscape(c).c_str(), target, d);
+                result = buf;
+            }
+        }
+    } else if (strcmp(toolName, "stop_animation") == 0) {
+        g_modelRenderer.setPaused(true);
+        std::string c; float d = 0;
+        const int active = g_modelRenderer.activeAnimation();
+        if (active >= 0) g_modelRenderer.getAnimationInfo(active, c, d);
+        snprintf(buf, sizeof(buf), "{\"playing\":false,\"paused_clip\":%s%s%s}",
+                 active >= 0 ? "\"" : "", active >= 0 ? McpJsonEscape(c).c_str() : "null",
+                 active >= 0 ? "\"" : "");
+        result = buf;
+    } else {
+        ok = false;
+        result = "{\"error\":\"unhandled tool\"}";
+    }
+
+    return result;
+}
+
+// Declare the app identity + register the base agent tools (#47). Called once
+// after xrCreateSession, on the main thread (before the render thread spawns).
+// The animation tools are NOT registered here — they appear only once a model
+// with clips loads (UpdateMcpAnimationTools). Failure is non-fatal by design:
+// the MCP capability gate may simply be off; the viewer runs identically
+// without an agent surface.
+static void RegisterModelViewerMcpTools(XrSessionManager& xr) {
+    if (!McpToolsResolved()) {
+        LOG_INFO("XR_DXR_mcp_tools: not available — no agent surface");
+        return;
+    }
+    XrMCPAppInfoDXR mcpAppInfo = {XR_TYPE_MCP_APP_INFO_DXR};
+    strncpy(mcpAppInfo.appId, "modelviewer", sizeof(mcpAppInfo.appId) - 1);
+    XrResult ar = g_pfnSetMcpAppInfo(xr.session, &mcpAppInfo);
+    if (XR_FAILED(ar)) {
+        LOG_INFO("XR_DXR_mcp_tools: appId not accepted (%d) — no agent surface", ar);
+        return;
+    }
+
+    XrMCPToolInfoDXR loadTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+    loadTool.name = "load_model";
+    loadTool.description =
+        "Load a 3D model file into the viewer, replacing the current model. "
+        "Supported formats: glTF (.glb/.gltf), STL, OBJ, FBX, USD "
+        "(.usdz/.usd/.usda/.usdc). The path must be absolute and readable by "
+        "the viewer process. On success the camera re-frames the model "
+        "automatically, and the animation tools (list_animations / "
+        "play_animation / stop_animation) appear or disappear depending on "
+        "whether the new model has animation clips.";
+    loadTool.inputSchemaJson =
+        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
+        "\"description\":\"Absolute filesystem path of the model file to load.\"}},"
+        "\"required\":[\"path\"]}";
+    XrResult t1 = g_pfnRegisterMcpTool(xr.session, &loadTool);
+
+    XrMCPToolInfoDXR statusTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+    statusTool.name = "get_status";
+    statusTool.description =
+        "Read the viewer's live state: loaded model file and primitive count, "
+        "animation clip count + active clip + playing flag, camera orbit "
+        "(azimuth/elevation in degrees, world position, zoom factor), active "
+        "rendering-mode index, and whether the XR session is running.";
+    statusTool.inputSchemaJson = "{\"type\":\"object\"}";
+    XrResult t2 = g_pfnRegisterMcpTool(xr.session, &statusTool);
+
+    XrMCPToolInfoDXR orbitTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+    orbitTool.name = "set_orbit";
+    orbitTool.description =
+        "Orbit the camera around the model. azimuth_deg rotates around the "
+        "vertical axis (0 = the model's authored front, increasing turns the "
+        "model to the right), elevation_deg tilts the view up/down (clamped to "
+        "±85), zoom scales the model on screen (>1 = larger, clamped 0.1–10, "
+        "default 1). All fields are optional; omitted ones keep their current "
+        "value. Also resets the idle auto-orbit timer, like any user input. "
+        "Verify the result visually with capture_frame.";
+    orbitTool.inputSchemaJson =
+        "{\"type\":\"object\",\"properties\":{"
+        "\"azimuth_deg\":{\"type\":\"number\",\"description\":\"Orbit angle around the vertical axis, degrees.\"},"
+        "\"elevation_deg\":{\"type\":\"number\",\"description\":\"Tilt above (+) / below (−) the horizon, degrees, clamped to ±85.\"},"
+        "\"zoom\":{\"type\":\"number\",\"description\":\"View scale factor, 0.1–10; 1 = the auto-fit framing.\"}}}";
+    XrResult t3 = g_pfnRegisterMcpTool(xr.session, &orbitTool);
+
+    XrMCPToolInfoDXR frameTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+    frameTool.name = "frame_model";
+    frameTool.description =
+        "Reset the camera to the loaded model's auto-fit framed pose (same as "
+        "pressing Space): centers the model with comfortable headroom and "
+        "restores zoom to 1. Requires a model to be loaded.";
+    frameTool.inputSchemaJson = "{\"type\":\"object\"}";
+    XrResult t4 = g_pfnRegisterMcpTool(xr.session, &frameTool);
+
+    g_mcpToolsReady = true;
+    SetMcpToolCallHandler(&McpDispatchToolCall);
+    LOG_INFO("XR_DXR_mcp_tools: appId=modelviewer load_model=%d get_status=%d "
+             "set_orbit=%d frame_model=%d", t1, t2, t3, t4);
+
+    // Sync the animation tools with whatever model is already loaded (the
+    // bundled sample may have loaded before this call, depending on ordering).
+    UpdateMcpAnimationTools();
 }
 
 // Fullscreen state
@@ -951,7 +1416,10 @@ static void RenderThreadFunc(
             }
         }
 
-        PollEvents(*xr);
+        // Model-viewer-owned poll (#47): standard events + XR_DXR_mcp_tools
+        // dispatch. Replaces the shared PollEvents, whose baked-in cube-app MCP
+        // handler would consume + drop the viewer's custom tool calls.
+        PollEventsModelViewer(*xr);
 
         // #228 Tier 1: drain a spatial-picker result if one arrived this
         // tick. PollEvents wrote the path + result code onto the session
@@ -1917,6 +2385,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ShutdownLogging();
         return 1;
     }
+
+    // XR_DXR_mcp_tools (#47): declare appId "modelviewer" + register the base
+    // agent tools now that the session exists. Runs on the main thread before
+    // the render thread spawns and before the bundled scene auto-loads, so the
+    // animation tools sync correctly. No-op when the extension / MCP capability
+    // is unavailable.
+    RegisterModelViewerMcpTools(xr);
 
     if (!CreateSpaces(xr)) {
         LOG_ERROR("Reference space creation failed");
