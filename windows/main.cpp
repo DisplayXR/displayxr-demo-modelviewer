@@ -359,8 +359,8 @@ static void ApplyAutoFitForLoadedScene_locked() {
 // macOS build so agents behave identically across platforms. The whole path is
 // inert when McpToolsResolved() is false (older runtime / MCP capability off).
 //
-// All handlers below run on the render thread (dispatched from
-// PollEventsModelViewer), the same thread that owns g_modelRenderer and drives
+// All handlers below run on the render thread (dispatched from the shared
+// PollEvents), the same thread that owns g_modelRenderer and drives
 // per-frame rendering — so model loads are safe here, exactly like the queued-
 // load drain. g_inputState is shared with the window-message thread and so is
 // guarded by g_inputMutex; g_loadedFileName / scene state by g_sceneMutex.
@@ -523,15 +523,20 @@ static void UpdateMcpAnimationTools() {
 }
 
 // Dispatch one agent tool call to the Windows app state. Runs on the render
-// thread (from PollEventsModelViewer). Answers EVERY call — success=false +
-// {"error":…} on bad args — because an unanswered call only fails to the agent
-// after the runtime's ~5 s timeout. Installed via SetMcpToolCallHandler.
-static std::string McpDispatchToolCall(const char* toolName, const char* a, bool& ok) {
+// thread (from the shared PollEvents, common v2.1.0). Answers EVERY call —
+// success=false + {"error":…} on bad args — because an unanswered call only
+// fails to the agent after the runtime's ~5 s timeout. Installed by assigning
+// it to XrSessionManager::mcpToolHandler; PollEvents fetches the args and
+// submits this return value, so the handler is a pure (tool,args)→resultJson
+// map. Matches XrSessionManager::McpToolHandler.
+static std::string McpDispatchToolCall(const std::string& toolName,
+                                       const std::string& argsJson, bool& ok) {
+    const char* a = argsJson.c_str();  // JSON helpers below take a C string
     ok = true;
     std::string result;
     char buf[1024];
 
-    if (strcmp(toolName, "load_model") == 0) {
+    if (toolName == "load_model") {
         std::string path;
         if (!McpJsonGetString(a, "path", path) || path.empty()) {
             ok = false;
@@ -561,7 +566,7 @@ static std::string McpDispatchToolCall(const char* toolName, const char* a, bool
                 result = buf;
             }
         }
-    } else if (strcmp(toolName, "get_status") == 0) {
+    } else if (toolName == "get_status") {
         std::string clip; int ci = -1, cn = 0; float ct = 0, cd = 0; bool playing = false;
         const bool hasClip = g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing);
         // Snapshot the shared camera/scene state under their locks.
@@ -600,7 +605,7 @@ static std::string McpDispatchToolCall(const char* toolName, const char* a, bool
                  g_xr ? g_xr->currentModeIndex : 0u,
                  (g_xr && g_xr->sessionRunning) ? "true" : "false");
         result = buf;
-    } else if (strcmp(toolName, "set_orbit") == 0) {
+    } else if (toolName == "set_orbit") {
         double az, el, zm;
         bool any = false;
         std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -636,7 +641,7 @@ static std::string McpDispatchToolCall(const char* toolName, const char* a, bool
                      g_inputState.viewParams.scaleFactor);
             result = buf;
         }
-    } else if (strcmp(toolName, "frame_model") == 0) {
+    } else if (toolName == "frame_model") {
         if (!g_modelRenderer.hasModel()) {
             ok = false;
             result = "{\"error\":\"no model loaded — call load_model first\"}";
@@ -645,7 +650,7 @@ static std::string McpDispatchToolCall(const char* toolName, const char* a, bool
             g_inputState.resetViewRequested = true;  // applied by the render loop next frame
             result = "{\"framed\":true}";
         }
-    } else if (strcmp(toolName, "list_animations") == 0) {
+    } else if (toolName == "list_animations") {
         const int n = g_modelRenderer.animationCount();
         std::string clips = "[";
         for (int i = 0; i < n; i++) {
@@ -660,7 +665,7 @@ static std::string McpDispatchToolCall(const char* toolName, const char* a, bool
                  g_modelRenderer.activeAnimation(),
                  (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) ? "true" : "false");
         result = "{\"animations\":" + clips + buf;
-    } else if (strcmp(toolName, "play_animation") == 0) {
+    } else if (toolName == "play_animation") {
         const int n = g_modelRenderer.animationCount();
         int target = -1;
         double idx; std::string nm;
@@ -702,7 +707,7 @@ static std::string McpDispatchToolCall(const char* toolName, const char* a, bool
                 result = buf;
             }
         }
-    } else if (strcmp(toolName, "stop_animation") == 0) {
+    } else if (toolName == "stop_animation") {
         g_modelRenderer.setPaused(true);
         std::string c; float d = 0;
         const int active = g_modelRenderer.activeAnimation();
@@ -791,7 +796,10 @@ static void RegisterModelViewerMcpTools(XrSessionManager& xr) {
     XrResult t4 = g_pfnRegisterMcpTool(xr.session, &frameTool);
 
     g_mcpToolsReady = true;
-    SetMcpToolCallHandler(&McpDispatchToolCall);
+    // Install the app dispatcher on the shared PollEvents hook (common v2.1.0):
+    // PollEvents fetches the call args, invokes this, and submits the result —
+    // so the model viewer no longer forks PollEvents to route its tool calls.
+    xr.mcpToolHandler = McpDispatchToolCall;
     LOG_INFO("XR_DXR_mcp_tools: appId=modelviewer load_model=%d get_status=%d "
              "set_orbit=%d frame_model=%d", t1, t2, t3, t4);
 
@@ -1416,10 +1424,11 @@ static void RenderThreadFunc(
             }
         }
 
-        // Model-viewer-owned poll (#47): standard events + XR_DXR_mcp_tools
-        // dispatch. Replaces the shared PollEvents, whose baked-in cube-app MCP
-        // handler would consume + drop the viewer's custom tool calls.
-        PollEventsModelViewer(*xr);
+        // Shared poll (common v2.1.0): standard events + XR_DXR_mcp_tools
+        // dispatch via xr.mcpToolHandler (installed in RegisterModelViewerMcpTools).
+        // The app used to fork this as PollEventsModelViewer solely to swap the
+        // MCP handler — the v2.1.0 hook makes that fork unnecessary.
+        PollEvents(*xr);
 
         // #228 Tier 1: drain a spatial-picker result if one arrived this
         // tick. PollEvents wrote the path + result code onto the session
