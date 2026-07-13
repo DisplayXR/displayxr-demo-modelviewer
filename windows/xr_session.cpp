@@ -8,8 +8,26 @@
 #include "xr_session.h"
 #include "logging.h"
 #include <cstring>
+#include <vector>
 
 bool g_hasViewRigExt = false;
+
+// XR_DXR_mcp_tools (#47): app-owned entry points + dispatch state. Resolved in
+// InitializeOpenXR; NULL when the runtime lacks the extension (feature inert).
+bool                         g_hasMcpToolsExt        = false;
+PFN_xrSetMCPAppInfoDXR       g_pfnSetMcpAppInfo      = nullptr;
+PFN_xrRegisterMCPToolDXR     g_pfnRegisterMcpTool    = nullptr;
+PFN_xrUnregisterMCPToolDXR   g_pfnUnregisterMcpTool  = nullptr;
+PFN_xrGetMCPToolCallArgsDXR  g_pfnGetMcpToolCallArgs = nullptr;
+PFN_xrSubmitMCPToolResultDXR g_pfnSubmitMcpToolResult = nullptr;
+
+// Installed by main.cpp via SetMcpToolCallHandler(); the model-viewer tool
+// dispatcher. NULL until installed → tool calls answer with an error.
+static McpToolCallHandler g_mcpToolCallHandler = nullptr;
+
+void SetMcpToolCallHandler(McpToolCallHandler handler) {
+    g_mcpToolCallHandler = handler;
+}
 
 // INV-1.3 (XR_DXR_display_info v16, runtime#715): 3D panel top-left in
 // Windows virtual-screen pixels, captured from XrDisplayDesktopPositionDXR
@@ -70,6 +88,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
+            g_hasMcpToolsExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -78,6 +99,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_mcp_tools: %s", g_hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -100,6 +122,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasViewRigExt) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_hasMcpToolsExt) {
+        enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -201,6 +226,25 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
+    // XR_DXR_mcp_tools (#47): resolve the agent-tool entry points (instance-level,
+    // like the rest). Tools are registered after xrCreateSession (main.cpp). If
+    // any PFN fails to resolve, McpToolsResolved() stays false and the whole
+    // path is skipped — inert on runtimes without the extension / MCP capability.
+    if (g_hasMcpToolsExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR",
+            (PFN_xrVoidFunction*)&g_pfnSetMcpAppInfo);
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolDXR",
+            (PFN_xrVoidFunction*)&g_pfnRegisterMcpTool);
+        xrGetInstanceProcAddr(xr.instance, "xrUnregisterMCPToolDXR",
+            (PFN_xrVoidFunction*)&g_pfnUnregisterMcpTool);
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsDXR",
+            (PFN_xrVoidFunction*)&g_pfnGetMcpToolCallArgs);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultDXR",
+            (PFN_xrVoidFunction*)&g_pfnSubmitMcpToolResult);
+        LOG_INFO("XR_DXR_mcp_tools entry points: %s",
+            McpToolsResolved() ? "resolved" : "NULL (feature inert)");
+    }
+
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
     xr.configViews.resize(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
@@ -212,6 +256,134 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.configViews[i].recommendedImageRectHeight);
     }
 
+    return true;
+}
+
+// Model-viewer-owned event poll (#47). Mirrors displayxr::common's PollEvents()
+// (kept in lock-step with displayxr-common v2.0.0) for the standard events, and
+// adds an XR_DXR_mcp_tools dispatch that routes tool calls to the app handler.
+// We can't reuse the shared PollEvents here: its baked-in set_spin/get_status
+// handler would consume + drop the viewer's custom tool calls (see xr_session.h).
+bool PollEventsModelViewer(XrSessionManager& xr) {
+    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
+
+    while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
+        switch (event.type) {
+        case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+            auto* stateEvent = (XrEventDataSessionStateChanged*)&event;
+            XrSessionState oldState = xr.sessionState;
+            xr.sessionState = stateEvent->state;
+            LOG_INFO("Session state changed: %s -> %s",
+                GetSessionStateString(oldState),
+                GetSessionStateString(xr.sessionState));
+            switch (xr.sessionState) {
+            case XR_SESSION_STATE_READY: {
+                LOG_INFO("Session READY - calling xrBeginSession...");
+                XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
+                beginInfo.primaryViewConfigurationType = xr.viewConfigType;
+                XrResult result = xrBeginSession(xr.session, &beginInfo);
+                LogXrResult("xrBeginSession", result);
+                if (XR_SUCCEEDED(result)) {
+                    xr.sessionRunning = true;
+                    LOG_INFO("Session is now running");
+                }
+                break;
+            }
+            case XR_SESSION_STATE_STOPPING:
+                LOG_INFO("Session STOPPING - calling xrEndSession...");
+                xrEndSession(xr.session);
+                xr.sessionRunning = false;
+                LOG_INFO("Session stopped");
+                break;
+            case XR_SESSION_STATE_EXITING:
+                LOG_INFO("Session EXITING - requesting exit");
+                xr.exitRequested = true;
+                break;
+            case XR_SESSION_STATE_LOSS_PENDING:
+                LOG_WARN("Session LOSS_PENDING - requesting exit");
+                xr.exitRequested = true;
+                break;
+            default:
+                break;
+            }
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+            LOG_WARN("Instance loss pending - requesting exit");
+            xr.exitRequested = true;
+            break;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
+            LOG_INFO("Rendering mode changed: %u -> %u",
+                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
+            xr.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
+            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
+                etEvent->isTracking == XR_TRUE ? "YES" : "NO",
+                (uint32_t)etEvent->activeMode);
+            xr.isEyeTracking = (etEvent->isTracking == XR_TRUE);
+            xr.activeEyeTrackingMode = (uint32_t)etEvent->activeMode;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR: {
+            // #228 Tier 1: spatial file picker delivered a result. Store on the
+            // session manager; the main loop consumes filePickerHasResult.
+            auto* pickEvent = (XrEventDataFilePickerCompleteDXR*)&event;
+            if (pickEvent->requestId == xr.filePickerRequestId) {
+                xr.filePickerLastResult = pickEvent->result;
+                strncpy(xr.filePickerLastPath, pickEvent->path,
+                    sizeof(xr.filePickerLastPath) - 1);
+                xr.filePickerLastPath[sizeof(xr.filePickerLastPath) - 1] = '\0';
+                xr.filePickerInFlight = false;
+                xr.filePickerHasResult = true;
+                LOG_INFO("[#228] File picker complete: requestId=%llu result=%d path=\"%s\"",
+                    (unsigned long long)pickEvent->requestId,
+                    (int)pickEvent->result, pickEvent->path);
+            } else {
+                LOG_WARN("[#228] Ignoring file picker event for stale requestId=%llu (current=%llu)",
+                    (unsigned long long)pickEvent->requestId,
+                    (unsigned long long)xr.filePickerRequestId);
+            }
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
+            // An agent invoked one of our XR_DXR_mcp_tools tools (#47). Fetch the
+            // JSON args (two-call idiom; argsSize is the required capacity incl.
+            // NUL), dispatch to the app handler on this (render) thread, and
+            // answer EVERY call — an unanswered call fails to the agent after
+            // ~5 s. Only the viewer's own registered tools reach this session.
+            auto* call = (const XrEventDataMCPToolCallDXR*)&event;
+            std::string args;
+            if (g_pfnGetMcpToolCallArgs && call->argsSize > 0) {
+                std::vector<char> buf(call->argsSize, '\0');
+                uint32_t needed = 0;
+                if (XR_SUCCEEDED(g_pfnGetMcpToolCallArgs(xr.session, call->callId,
+                        (uint32_t)buf.size(), &needed, buf.data())))
+                    args.assign(buf.data());
+            }
+            bool ok = true;
+            std::string result;
+            if (g_mcpToolCallHandler) {
+                result = g_mcpToolCallHandler(call->toolName, args.c_str(), ok);
+            } else {
+                ok = false;
+                result = "{\"error\":\"no tool handler installed\"}";
+            }
+            if (g_pfnSubmitMcpToolResult) {
+                g_pfnSubmitMcpToolResult(xr.session, call->callId,
+                    ok ? XR_TRUE : XR_FALSE, result.c_str());
+            }
+            break;
+        }
+        default:
+            LOG_DEBUG("Received event type: %d", event.type);
+            break;
+        }
+        event.type = XR_TYPE_EVENT_DATA_BUFFER;
+    }
     return true;
 }
 
