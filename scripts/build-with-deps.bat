@@ -18,6 +18,10 @@ if "%VULKAN_SDK%"=="" (
     echo        and open a fresh terminal so VULKAN_SDK is exported, then re-run.
     exit /b 1
 )
+REM Put the SDK's Bin on PATH so CMake's find_program(glslangValidator) resolves
+REM (find_package(Vulkan) locates it via VULKAN_SDK, but the bare find_program only
+REM searches PATH — and some installs set VULKAN_SDK without adding Bin to PATH).
+set "PATH=%VULKAN_SDK%\Bin;%PATH%"
 
 REM --- OpenXR loader -------------------------------------------------------------
 REM Auto-provision the prebuilt Khronos loader, pinned to the same spec revision as
