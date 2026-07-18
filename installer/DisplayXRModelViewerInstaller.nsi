@@ -94,6 +94,10 @@ ShowUninstDetails show
 ; UI
 
 !define MUI_ABORTWARNING
+
+; Installer / wizard / uninstaller icon — the demo's own (rounded) app logo.
+!define MUI_ICON   "${SOURCE_DIR}\windows\displayxr\model_viewer_icon.ico"
+!define MUI_UNICON "${SOURCE_DIR}\windows\displayxr\model_viewer_icon.ico"
 !define MUI_WELCOMEPAGE_TITLE "DisplayXR Model Viewer Demo Setup"
 !define MUI_WELCOMEPAGE_TEXT "This will install the Model Viewer reference demo for the DisplayXR runtime.$\r$\n$\r$\nThe DisplayXR runtime must be installed first."
 
