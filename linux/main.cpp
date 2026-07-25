@@ -54,6 +54,7 @@
 #include "display3d_view.h"
 #include "projection_depth.h"
 #include "model_renderer.h"
+#include "recenter_control.h"  // dynamic-recenter per-axis pins (DXR_RECENTER_PIN on Linux)
 #include "model_loader.h"
 
 // ============================================================================
@@ -83,8 +84,28 @@ static uint32_t g_windowW = 1280, g_windowH = 720;
 
 // Camera / fit state (fixed framing — no live input on Linux build-green).
 static ViewParams g_viewParams;
-static float g_camPos[3] = {0, 0, 0};
+static float g_camPos[3] = {0, 0, 0};   // = the fit centre (fixed camera; no user offset)
 static float g_camYaw = 0.0f, g_camPitch = 0.0f;
+
+// Dynamic-recenter pins. Default X Y Z matches the Windows modelviewer's hard
+// pin. No keyboard on this build-green target — control via DXR_RECENTER_PIN.
+static dxr::RecenterControl g_recenter;
+
+// Rig position for this frame: a pinned axis tracks the smoothed animated
+// centroid; an unpinned axis stays at the fixed fit centre (g_camPos). No user
+// offset on Linux (fixed camera). No-op for static models (anchor invalid).
+static void ComputeRigPosition(float out[3]) {
+    out[0] = g_camPos[0];
+    out[1] = g_camPos[1];
+    out[2] = g_camPos[2];
+    float anchor[3];
+    if (g_modelRenderer.getAnimatedAnchor(anchor)) {
+        const dxr::RecenterPins pins = g_recenter.pins();
+        if (pins.x) out[0] = anchor[0];
+        if (pins.y) out[1] = anchor[1];
+        if (pins.z) out[2] = anchor[2];
+    }
+}
 
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 static constexpr float kAutoFitVerticalComfort = 1.4f;
@@ -573,6 +594,11 @@ int main() {
 
     LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan, Linux / hosted-NULL) ===");
 
+    // Dynamic-recenter pins: default hard-pin X+Y+Z (modelviewer parity).
+    // DXR_RECENTER_PIN=XYZ|XY|Z|- overrides (the Linux control path).
+    g_recenter.init(/*x=*/true, /*y=*/true, /*z=*/true);
+    { char lbl[24]; g_recenter.hudLabel(lbl, sizeof(lbl)); LOG_INFO("Recenter: %s", lbl); }
+
     { const char* mode = getenv("SIM_DISPLAY_OUTPUT");
       if (mode) {
           if (strcmp(mode, "sbs") == 0) g_windowW = 2560; // hint only; runtime owns the window
@@ -650,7 +676,8 @@ int main() {
 
             XrPosef cameraPose;
             quat_from_yaw_pitch(g_camYaw, g_camPitch, &cameraPose.orientation);
-            cameraPose.position = {g_camPos[0], g_camPos[1], g_camPos[2]};
+            float rigPos[3]; ComputeRigPosition(rigPos);
+            cameraPose.position = {rigPos[0], rigPos[1], rigPos[2]};
             const float rigVH = g_viewParams.virtualDisplayHeight / g_viewParams.scaleFactor;
 
             const bool useRig = xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
