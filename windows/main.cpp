@@ -31,6 +31,7 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "atlas_capture.h"
+#include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
 
 #include <atomic>
 #include <algorithm>
@@ -274,6 +275,10 @@ static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
 static float g_fitVHeight   = kFallbackVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
 static std::atomic<bool> g_fitValid{false};
+
+// Dynamic-recenter pins. Default X Y Z = the modelviewer's historical hard-pin
+// of all three axes onto the animated centroid; DXR_RECENTER_PIN overrides.
+static dxr::RecenterControl g_recenter;
 
 // XR_DXR_mcp_tools (#47): late (un)registration of the animation tools —
 // list/play/stop_animation exist only while a model with clips is loaded.
@@ -1090,6 +1095,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == 'I' || wParam == 'i') {
             g_captureAtlasRequested.store(true);
         }
+        // Dynamic-recenter pins: P arms, then X/Y/Z toggle that axis' pin.
+        // onKey consumes P (arm) and X/Y/Z (while armed); otherwise it falls
+        // through untouched (X/Y/Z are not bound elsewhere).
+        if (wParam == 'P' || wParam == 'X' || wParam == 'Y' || wParam == 'Z') {
+            if (g_recenter.onKey((char)wParam)) {
+                char lbl[24];
+                g_recenter.hudLabel(lbl, sizeof(lbl));
+                LOG_INFO("Recenter: %s", lbl);
+                return 0;
+            }
+        }
         break;
 
     case WM_SIZE:
@@ -1415,12 +1431,22 @@ static void RenderThreadFunc(
         // (orbit) and vHeight (zoom) stay user-driven. No-op for static models
         // (getAnimatedAnchor returns false). Applied to inputSnapshot only, so
         // g_inputState keeps the user's intended pose for when no model is bound.
+        //
+        // Per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN): a pinned axis tracks the
+        // anchor, an unpinned axis returns to the fit centre. The user's WASDEQ
+        // offset (cameraPos - fitCentre, applied by UpdateCameraMovement above)
+        // adds on top of both, so pinning never disables movement. Default XYZ +
+        // zero offset == the historical hard-pin (no behaviour change).
         {
             float anchor[3];
             if (g_fitValid.load() && g_modelRenderer.getAnimatedAnchor(anchor)) {
-                inputSnapshot.cameraPosX = anchor[0];
-                inputSnapshot.cameraPosY = anchor[1];
-                inputSnapshot.cameraPosZ = anchor[2];
+                const dxr::RecenterPins pins = g_recenter.pins();
+                const float offX = inputSnapshot.cameraPosX - g_fitCenter[0];
+                const float offY = inputSnapshot.cameraPosY - g_fitCenter[1];
+                const float offZ = inputSnapshot.cameraPosZ - g_fitCenter[2];
+                inputSnapshot.cameraPosX = (pins.x ? anchor[0] : g_fitCenter[0]) + offX;
+                inputSnapshot.cameraPosY = (pins.y ? anchor[1] : g_fitCenter[1]) + offY;
+                inputSnapshot.cameraPosZ = (pins.z ? anchor[2] : g_fitCenter[2]) + offZ;
             }
         }
 
@@ -1966,6 +1992,13 @@ static void RenderThreadFunc(
                                 std::wstring cameraText = FormatCameraInfo(
                                     inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
                                     fwdX, fwdY, fwdZ);
+                                {
+                                    char pinBuf[24];
+                                    g_recenter.hudLabel(pinBuf, sizeof(pinBuf));
+                                    wchar_t pinW[32];
+                                    swprintf(pinW, 32, L"\nRecenter: %hs", pinBuf);
+                                    cameraText += pinW;
+                                }
                                 float hudM2v = 1.0f;
                                 if (inputSnapshot.viewParams.virtualDisplayHeight > 0.0f && xr->displayHeightM > 0.0f)
                                     hudM2v = inputSnapshot.viewParams.virtualDisplayHeight / xr->displayHeightM;
@@ -1984,7 +2017,8 @@ static void RenderThreadFunc(
                                 }
                                 std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset | [N] Clip | [K] Play/Pause\n"
-                                    L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
+                                    L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit\n"
+                                    L"[P then X/Y/Z] Pin recenter axis";
 
                                 // Chrome buttons no longer live here — they are a
                                 // separate full-width top-bar window-space layer
@@ -2278,6 +2312,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) ===");
+
+    // Dynamic-recenter pins: default hard-pin X+Y+Z (modelviewer's historical
+    // behaviour); DXR_RECENTER_PIN=XYZ|XY|Z|- overrides for headless testing.
+    g_recenter.init(/*x=*/true, /*y=*/true, /*z=*/true);
 
     // Add DisplayXR to DLL search path
     {
