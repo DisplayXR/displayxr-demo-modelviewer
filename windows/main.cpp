@@ -32,6 +32,7 @@
 #include "text_overlay.h"
 #include "atlas_capture.h"
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
+#include "toast.h"             // dxr::ToastState — transient on-screen confirmation
 
 #include <atomic>
 #include <algorithm>
@@ -101,6 +102,20 @@ static inline float BtnBarHeightFraction(uint32_t windowW, uint32_t windowH) {
     const float texAR = (float)BTN_BAR_TEX_W / (float)BTN_BAR_TEX_H;
     return windowAR / texAR;  // layer width fraction = 1.0
 }
+
+// ── Toast layer (transient confirmation chip) ────────────────────────────────
+// Its own window-space layer, bottom-centre, submitted ONLY while a toast is
+// live (dxr::ToastState decides) — so it is a true toggle, not a transparent
+// layer, and it is independent of the Tab-toggled HUD info panel: a confirmation
+// must be visible at the moment of the action whether or not the HUD is up.
+// Geometry comes from dxr::ComputeToastLayerRect (displayxr-common): the chip
+// is sized off the window's SHORTER side so it looks identical in this
+// landscape window and in the avatar demo's portrait one.
+static const uint32_t TOAST_TEX_W = 768;
+static const uint32_t TOAST_TEX_H = 96;
+static const uint32_t TOAST_FONT_BASE = TOAST_TEX_H * 11;   // ~45px glyphs in a 96px pill
+static const float    TOAST_SIZE_FRACTION = 0.60f;          // of the shorter window side
+static const float    TOAST_Y_FRACTION = 0.84f;             // near the bottom edge
 
 
 // ── XR_DXR_view_rig consume-path math (#396 W7) ──────────────────────────────
@@ -250,6 +265,19 @@ static std::atomic<bool> g_hasAnimations{false};
 // thread. The swapchain is app-owned state (displayxr::common's
 // XrSessionManager carries no app-named fields, #396 W4) — created via the
 // lib's CreateWindowSpaceSwapchain generic, destroyed before CleanupOpenXR.
+// Toast layer resources — same shape as the button-bar set below, but the layer
+// is only submitted on the frames dxr::ToastState says a message is live.
+static dxr::ToastState g_toast;
+static SwapchainInfo  g_toastSwapchain;
+static bool           g_hasToastSwapchain = false;
+static HudRenderer    g_toastHud = {};
+static bool           g_toastReady = false;
+static VkBuffer       g_toastStaging = VK_NULL_HANDLE;
+static VkDeviceMemory g_toastStagingMem = VK_NULL_HANDLE;
+static void*          g_toastStagingMapped = nullptr;
+static VkCommandPool  g_toastCmdPool = VK_NULL_HANDLE;
+static std::vector<XrSwapchainImageVulkanKHR> g_toastSwapImages;
+
 static SwapchainInfo  g_animBtnSwapchain;                // app-owned window-space swapchain
 static bool           g_hasAnimBtnSwapchain = false;
 static HudRenderer    g_animBtnHud = {};                 // own D3D11 text renderer (256×80)
@@ -1099,10 +1127,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // onKey consumes P (arm) and X/Y/Z (while armed); otherwise it falls
         // through untouched (X/Y/Z are not bound elsewhere).
         if (wParam == 'P' || wParam == 'X' || wParam == 'Y' || wParam == 'Z') {
+            const bool wasArmed = g_recenter.armed();
             if (g_recenter.onKey((char)wParam)) {
                 char lbl[24];
                 g_recenter.hudLabel(lbl, sizeof(lbl));
                 LOG_INFO("Recenter: %s", lbl);
+                // Confirm on screen. The arm prompt stays up for the whole arm
+                // window so the toast and the armed state expire together; a
+                // completed toggle uses the default (shorter) toast lifetime.
+                wchar_t w[64];
+                swprintf(w, 64, L"Recenter  %hs", lbl);
+                g_toast.Show(w, wasArmed ? dxr::ToastState::kDefaultSeconds
+                                         : dxr::RecenterControl::kArmSeconds);
                 return 0;
             }
         }
@@ -2232,6 +2268,89 @@ static void RenderThreadFunc(
                     }
                 }
 
+                // ── Toast layer ──────────────────────────────────────────────
+                // Only built + submitted while a message is live; once it
+                // expires the layer is simply absent from the submission.
+                XrCompositionLayerWindowSpaceDXR toastLayer = {};
+                bool toastLayerReady = false;
+                {
+                    std::wstring toastText;
+                    float toastAlpha = 1.0f;
+                    if (g_toastReady && g_hasToastSwapchain &&
+                        g_toast.Snapshot(toastText, toastAlpha)) {
+                        uint32_t pitch = 0;
+                        const void* px = RenderToastStandalone(g_toastHud, &pitch,
+                            toastText, toastAlpha);
+                        uint32_t idx = 0;
+                        if (px && AcquireWindowSpaceImage(g_toastSwapchain, idx)) {
+                            uint8_t* dst = (uint8_t*)g_toastStagingMapped;
+                            for (uint32_t row = 0; row < TOAST_TEX_H; ++row)
+                                memcpy(dst + row * TOAST_TEX_W * 4,
+                                       (const uint8_t*)px + row * pitch, TOAST_TEX_W * 4);
+                            UnmapHud(g_toastHud);
+
+                            VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                            cai.commandPool = g_toastCmdPool;
+                            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                            cai.commandBufferCount = 1;
+                            VkCommandBuffer cb = VK_NULL_HANDLE;
+                            vkAllocateCommandBuffers(vkDevice, &cai, &cb);
+                            VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                            bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                            vkBeginCommandBuffer(cb, &bgi);
+                            VkImage img = g_toastSwapImages[idx].image;
+                            VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                            bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                            bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bar.image = img;
+                            bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+                            VkBufferImageCopy rg = {};
+                            rg.bufferRowLength = TOAST_TEX_W;
+                            rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                            rg.imageOffset = {0, 0, 0};
+                            rg.imageExtent = {TOAST_TEX_W, TOAST_TEX_H, 1};
+                            vkCmdCopyBufferToImage(cb, g_toastStaging, img,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+                            bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                            bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+                            vkEndCommandBuffer(cb);
+                            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                            si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+                            vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
+                            vkQueueWaitIdle(graphicsQueue);
+                            vkFreeCommandBuffers(vkDevice, g_toastCmdPool, 1, &cb);
+                            ReleaseWindowSpaceImage(g_toastSwapchain);
+
+                            const dxr::ToastLayerRect tr = dxr::ComputeToastLayerRect(
+                                windowW, windowH, (float)TOAST_TEX_W / (float)TOAST_TEX_H,
+                                TOAST_SIZE_FRACTION, TOAST_Y_FRACTION);
+                            toastLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
+                            toastLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                            toastLayer.subImage.swapchain = g_toastSwapchain.swapchain;
+                            toastLayer.subImage.imageRect.offset = {0, 0};
+                            toastLayer.subImage.imageRect.extent = {(int32_t)TOAST_TEX_W, (int32_t)TOAST_TEX_H};
+                            toastLayer.subImage.imageArrayIndex = 0;
+                            toastLayer.x = tr.x;
+                            toastLayer.y = tr.y;
+                            toastLayer.width = tr.width;
+                            toastLayer.height = tr.height;
+                            toastLayer.disparity = 0.0f;   // screen depth — UI chrome sits at ZDP
+                            toastLayerReady = true;
+                        } else if (px) {
+                            UnmapHud(g_toastHud);
+                        }
+                    }
+                }
+
                 // Submit frame
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 if (submitViewCount == 0) submitViewCount = 1;
@@ -2246,9 +2365,15 @@ static void RenderThreadFunc(
                     // defaults projectionLayerFlags to 0, so pass the bit
                     // explicitly (the vendored copy hardcoded it; required for
                     // the Ctrl+T transparent-background path).
+                    // Extra window-space layers, submitted in order: the top
+                    // button bar, then the toast on top of it.
+                    XrCompositionLayerWindowSpaceDXR uiLayers[2] = {};
+                    uint32_t uiLayerCount = 0;
+                    if (barLayerReady) uiLayers[uiLayerCount++] = barLayer;
+                    if (toastLayerReady) uiLayers[uiLayerCount++] = toastLayer;
                     EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
-                        barLayerReady ? &barLayer : nullptr, barLayerReady ? 1u : 0u,
+                        uiLayerCount ? uiLayers : nullptr, uiLayerCount,
                         0, 0, -1, -1, /*submitHud=*/hudSubmitted,
                         XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT);
                 } else {
@@ -2624,6 +2749,54 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
+    // ── Toast window-space layer resources ───────────────────────────────────
+    // Same shape as the button bar above (own swapchain + text renderer +
+    // staging + cmd pool), sized to the chip. Failure is non-fatal: without it
+    // the toast simply doesn't draw and the HUD's Recenter line still reports.
+    if (hudOk && xr.hasHudSwapchain) {
+        if (InitializeHudRenderer(g_toastHud, TOAST_TEX_W, TOAST_TEX_H, TOAST_FONT_BASE) &&
+            CreateWindowSpaceSwapchain(xr, g_toastSwapchain, TOAST_TEX_W, TOAST_TEX_H)) {
+            g_hasToastSwapchain = true;
+            uint32_t c = g_toastSwapchain.imageCount;
+            g_toastSwapImages.resize(c, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+            xrEnumerateSwapchainImages(g_toastSwapchain.swapchain, c, &c,
+                (XrSwapchainImageBaseHeader*)g_toastSwapImages.data());
+
+            VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bi.size = (VkDeviceSize)TOAST_TEX_W * TOAST_TEX_H * 4;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            bool ok = vkCreateBuffer(vkDevice, &bi, nullptr, &g_toastStaging) == VK_SUCCESS;
+            if (ok) {
+                VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vkDevice, g_toastStaging, &mr);
+                VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(physDevice, &mp);
+                uint32_t mt = UINT32_MAX;
+                for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+                    if ((mr.memoryTypeBits & (1u << i)) &&
+                        (mp.memoryTypes[i].propertyFlags &
+                         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { mt = i; break; }
+                if (mt != UINT32_MAX) {
+                    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    ai.allocationSize = mr.size; ai.memoryTypeIndex = mt;
+                    vkAllocateMemory(vkDevice, &ai, nullptr, &g_toastStagingMem);
+                    vkBindBufferMemory(vkDevice, g_toastStaging, g_toastStagingMem, 0);
+                    vkMapMemory(vkDevice, g_toastStagingMem, 0, bi.size, 0, &g_toastStagingMapped);
+                } else ok = false;
+            }
+            if (ok) {
+                VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                pci.queueFamilyIndex = queueFamilyIndex;
+                ok = vkCreateCommandPool(vkDevice, &pci, nullptr, &g_toastCmdPool) == VK_SUCCESS;
+            }
+            g_toastReady = ok;
+            LOG_INFO("Toast layer resources %s", ok ? "created" : "FAILED");
+        } else {
+            LOG_WARN("Toast layer init failed — toasts will not show");
+        }
+    }
+
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -2696,6 +2869,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         xrDestroySwapchain(g_animBtnSwapchain.swapchain);
         g_animBtnSwapchain.swapchain = XR_NULL_HANDLE;
         g_hasAnimBtnSwapchain = false;
+    }
+
+    // Toast layer resources (same teardown order as the button bar above).
+    if (g_toastCmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, g_toastCmdPool, nullptr);
+    if (g_toastStaging != VK_NULL_HANDLE) {
+        if (g_toastStagingMapped) vkUnmapMemory(vkDevice, g_toastStagingMem);
+        vkDestroyBuffer(vkDevice, g_toastStaging, nullptr);
+    }
+    if (g_toastStagingMem != VK_NULL_HANDLE) vkFreeMemory(vkDevice, g_toastStagingMem, nullptr);
+    if (g_toastReady) CleanupHudRenderer(g_toastHud);
+    if (g_toastSwapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_toastSwapchain.swapchain);
+        g_toastSwapchain.swapchain = XR_NULL_HANDLE;
+        g_hasToastSwapchain = false;
     }
 
     g_xr = nullptr;
