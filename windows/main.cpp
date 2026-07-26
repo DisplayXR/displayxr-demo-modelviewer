@@ -35,6 +35,7 @@
 #include "toast.h"             // dxr::ToastState — transient on-screen confirmation
 
 #include <atomic>
+#include <cstdarg>   // ToastF varargs
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -268,6 +269,21 @@ static std::atomic<bool> g_hasAnimations{false};
 // Toast layer resources — same shape as the button-bar set below, but the layer
 // is only submitted on the frames dxr::ToastState says a message is live.
 static dxr::ToastState g_toast;
+
+// Post a toast from a printf-style ASCII string. Every user-visible confirmation
+// in this app goes through here so the wording and lifetime stay consistent.
+// ASCII in / wide out: the chip rasterizer takes std::wstring, but every message
+// we produce is ASCII, so %hs widening is enough and avoids a locale dependency.
+static void ToastF(const char* fmt, ...) {
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    wchar_t w[160];
+    swprintf(w, 160, L"%hs", buf);
+    g_toast.Show(w);
+}
 static SwapchainInfo  g_toastSwapchain;
 static bool           g_hasToastSwapchain = false;
 static HudRenderer    g_toastHud = {};
@@ -1329,6 +1345,9 @@ static void RenderThreadFunc(
         bool loadReq = false;
         bool cycleClip = false;
         bool playPause = false;
+        // Toast-worthy state changes latched under the input lock, posted after
+        // it is released (ToastState takes its own lock — no nesting).
+        bool bgToggled = false, bgNow = false;
         uint32_t windowW, windowH;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -1357,6 +1376,8 @@ static void RenderThreadFunc(
                 bool now = !g_transparentBg.load();
                 g_transparentBg.store(now);
                 LOG_INFO("Transparent background: %s (Ctrl+T)", now ? "ON" : "OFF");
+                bgToggled = true;
+                bgNow = now;
             }
             g_inputState.animateToggleRequested = false;
             g_inputState.loadRequested = false;
@@ -1370,6 +1391,21 @@ static void RenderThreadFunc(
             }
             windowW = g_windowWidth;
             windowH = g_windowHeight;
+        }
+
+        // ── Confirmations for state the user just changed ────────────────────
+        // Outside the input lock. Auto-orbit and reset are toasted here rather
+        // than at the keypress because the app decides the RESULTING state.
+        if (bgToggled) {
+            ToastF("Background  %s", bgNow ? "TRANSPARENT" : "OPAQUE");
+        }
+        if (animateToggle) {
+            // Auto-orbit starts on an idle countdown, so without a toast the
+            // key looks inert for a second or two.
+            ToastF("Auto-Orbit  %s", inputSnapshot.animateEnabled ? "ON" : "OFF");
+        }
+        if (resetRequested) {
+            ToastF("View reset");
         }
 
         // Request main thread to open file dialog when L key or Load button was pressed.
@@ -1396,6 +1432,9 @@ static void RenderThreadFunc(
                     LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
                         model_filesize_str(path).c_str());
                     ApplyAutoFitForLoadedScene_locked();
+                    // Success only — the failure path already raises a modal
+                    // MessageBox, so a toast there would be redundant noise.
+                    ToastF("Loaded  %s", g_loadedFileName.c_str());
                 } else {
                     LOG_ERROR("Failed to load scene: %s", path.c_str());
                     MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
@@ -1429,6 +1468,22 @@ static void RenderThreadFunc(
         // updateAnimation call below; apply before it so this frame reflects it.
         if (cycleClip) g_modelRenderer.cycleAnimation();
         if (playPause) g_modelRenderer.togglePaused();
+        // Report the clip state AFTER applying, so the toast names the clip the
+        // user actually landed on rather than echoing the keypress. A static
+        // model has no clips — say so instead of flashing an empty chip.
+        if (cycleClip || playPause) {
+            std::string clip; int ci = 0, cn = 0; float ct = 0, cd = 0; bool playing = false;
+            std::lock_guard<std::mutex> lk(g_sceneMutex);
+            if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing)) {
+                if (cycleClip) {
+                    ToastF("Clip  %s  (%d/%d)", clip.c_str(), ci + 1, cn);
+                } else {
+                    ToastF("%s  %s", playing ? "Playing" : "Paused", clip.c_str());
+                }
+            } else {
+                ToastF("No animation in this model");
+            }
+        }
         // Advance node/TRS animation once per frame (no-op for static models).
         g_modelRenderer.updateAnimation(perfStats.deltaTime);
 
@@ -1902,8 +1957,12 @@ static void RenderThreadFunc(
                             if (g_captureAtlasRequested.exchange(false)) {
                                 if (!hasGsScene) {
                                     LOG_WARN("Capture skipped: no model loaded");
+                                    // Without this the I key is silently inert —
+                                    // no flash, no file, no explanation.
+                                    ToastF("Capture skipped - no model loaded");
                                 } else if (cols <= 1 && rows <= 1) {
                                     LOG_WARN("Capture skipped: mono (1×1) layout");
+                                    ToastF("Capture skipped - mono (1x1) layout");
                                 } else if (xr->pfnCaptureAtlasEXT &&
                                            xr->session != XR_NULL_HANDLE) {
                                     std::string sceneName;
@@ -1928,11 +1987,17 @@ static void RenderThreadFunc(
                                         LOG_INFO("Atlas capture requested -> %s_atlas.png",
                                                  prefix.c_str());
                                         dxr_capture::PostFlashRequest(hwnd);
+                                        // Complements the flash: the flash says
+                                        // "something happened", the toast says WHAT
+                                        // and, more usefully, WHERE it landed.
+                                        ToastF("Captured  %s_atlas.png", prefix.c_str());
                                     } else {
                                         LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
+                                        ToastF("Capture failed (0x%x)", (unsigned)cr);
                                     }
                                 } else {
                                     LOG_WARN("Capture skipped: XR_DXR_atlas_capture not available");
+                                    ToastF("Capture unavailable - no atlas-capture ext");
                                 }
                             }
 
