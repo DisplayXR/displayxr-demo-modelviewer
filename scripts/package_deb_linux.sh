@@ -27,7 +27,16 @@ DISPLAY_NAME="DisplayXR 3D Model Viewer"
 DESCRIPTION="glTF 2.0 / OBJ / STL model viewer for glasses-free 3D displays."
 BINARY="model_viewer_handle_vk_linux"               # build/linux/<BINARY>
 DESKTOP_CATEGORIES="Graphics;Viewer;"
-ASSETS_SUBDIR="assets"                              # repo dir to bundle, "" if none
+ASSETS_SUBDIR=""                                    # repo dir to bundle under assets/, "" if none
+# Asset(s) staged FLAT next to the binary. The app resolves its bundled model
+# via /proc/self/exe → <exe_dir>/sample.glb (NOT an assets/ subdir) — the same
+# place the Windows NSI drops it in $INSTDIR. Without it the app logs "No
+# bundled model … (skipping)" and launches empty. Deliberately defaults-only
+# (no assets/ dir bundling): sample.glb = the canonical shared DamagedHelmet
+# (identical across windows/macos/android; no linux/ copy exists), plus Fox.glb
+# so the user can demo animation-clip switching via the file-open dialog.
+# "repo-relative-src:installed-basename" pairs.
+DEFAULT_ASSETS=("windows/assets/sample.glb:sample.glb" "assets/Fox.glb:Fox.glb")
 
 set -euo pipefail
 
@@ -74,10 +83,24 @@ for f in "$OPENXR_DIR"/lib/libopenxr_loader.so*; do
 done
 [ -e "$APPDIR/libopenxr_loader.so.1" ] || echo "warn: no bundled OpenXR loader — the demo may need a system libopenxr-loader1." >&2
 
-# Bundle assets (sample models etc.).
+# Bundle assets (extra sample models etc.) under assets/.
 if [ -n "$ASSETS_SUBDIR" ] && [ -d "$ROOT/$ASSETS_SUBDIR" ]; then
   cp -aR "$ROOT/$ASSETS_SUBDIR" "$APPDIR/assets"
 fi
+
+# Stage the default asset(s) FLAT next to the binary. The app resolves its
+# bundled model at <exe_dir>/<name> (via /proc/self/exe), so these must sit
+# beside the binary, NOT under assets/. Mirrors the Windows installer layout.
+for pair in "${DEFAULT_ASSETS[@]:-}"; do
+  [ -n "$pair" ] || continue
+  src="$ROOT/${pair%%:*}"; dst="${pair##*:}"
+  if [ -f "$src" ]; then
+    install -m 0644 "$src" "$APPDIR/$dst"
+    echo "==> default asset staged: $dst ($(du -h "$src" | cut -f1))"
+  else
+    echo "warn: default asset '${pair%%:*}' not found — the demo launches with NO bundled model." >&2
+  fi
+done
 
 # Launcher wrapper on PATH.
 cat > "$STAGE/usr/bin/$PKG" <<EOF
