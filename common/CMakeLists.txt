@@ -30,7 +30,10 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.3.1
+    # TODO(#63): DEV PIN — tracks the extra-layers-passthrough branch while the
+    # zones migration is eyeballed. Before merging, tag displayxr-common v2.5.0
+    # (helper v2.4.0 + the passthrough) and restore `GIT_TAG v2.5.0`.
+    GIT_TAG feat/extra-layers-passthrough
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
