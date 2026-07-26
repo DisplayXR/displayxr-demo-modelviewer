@@ -9,11 +9,12 @@
 #
 # linux/main.cpp is the Linux entry point (issue #40, M8 Linux epic
 # runtime#699): system Vulkan (native ICD, no MoltenVK) + OpenXR session +
-# ModelRenderer, in HOSTED-NULL windowing mode — the runtime self-creates the
-# presentation window (no XR_EXT_*_window_binding). This is a BUILD-GREEN
-# target (compiled on CI, not run — CI has no GPU/display). The faithful
-# XR_DXR_xlib_window_binding arm is Phase-3b/hardware-gated; see
-# ../PORTING.md and the runtime's docs/guides/linux-demo-port.md.
+# ModelRenderer, as a HANDLE app — the app owns a decorated X11 window on the
+# 3D panel and passes it via XR_DXR_xlib_window_binding (runtime weaves
+# window-relative; keyboard: O / Ctrl+O = zenity file-open). Falls back to
+# hosted-NULL when no X server is available, which also keeps CI build-green
+# (compiled on CI, not run — CI has no GPU/display). See ../PORTING.md and the
+# runtime's docs/guides/linux-demo-port.md.
 
 cmake_minimum_required(VERSION 3.21)
 
@@ -23,6 +24,13 @@ endif()
 
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
+
+# X11 + Xrandr — the handle app owns an X11 window (panel placement via RandR).
+# Requires libx11-dev + libxrandr-dev (CI installs both).
+find_package(X11 REQUIRED)
+if(NOT X11_Xrandr_LIB)
+    message(FATAL_ERROR "libxrandr-dev not found — required for panel-centered window placement")
+endif()
 
 # OpenXR loader — CONFIG package first (a dev/CI loader built to
 # CMAKE_PREFIX_PATH, e.g. /tmp/openxr-install), else a plain find_library.
@@ -67,6 +75,8 @@ target_link_libraries(model_viewer_handle_vk_linux PRIVATE
     model_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
+    ${X11_LIBRARIES}
+    ${X11_Xrandr_LIB}   # Xrandr — panel rect for window centering (needs libxrandr-dev)
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a

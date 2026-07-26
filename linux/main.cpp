@@ -2,37 +2,45 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  Linux Vulkan OpenXR glTF/PBR model viewer (build-green, hosted-NULL).
+ * @brief  Linux Vulkan OpenXR glTF/PBR model viewer (handle app, X11 window).
  *
  * The Linux arm of displayxr-demo-modelviewer. Renders glTF/STL/OBJ/FBX/USD
  * models on tracked 3D displays via OpenXR + Vulkan, reusing the vendor-neutral
  * model_common/ModelRenderer PBR pipeline shared with the macOS (macos/main.mm)
  * and Windows (windows/main.cpp) entry points.
  *
- * WINDOWING — hosted-NULL (issue #40, M8 Linux epic runtime#699). Unlike the
- * macOS/Windows entries, which own an OS window and pass its handle via
- * XR_DXR_cocoa_window_binding / XR_DXR_win32_window_binding, this entry passes
- * NO window binding: the runtime self-creates a native-resolution window
- * (hosted-NULL). This is the valid interim path per the Linux demo-port
- * playbook (docs/guides/linux-demo-port.md) while the faithful
- * XR_DXR_xlib_window_binding arm is Phase-3b/hardware-gated. It is deliberately
- * headless of any input/HUD/file-dialog stack — this is a BUILD-GREEN target
- * (compiled on CI, not run: CI has no GPU/display). On-screen validation is a
- * separate pass gated on the runtime's Linux present + a GPU + an X server.
+ * WINDOWING — HANDLE app (matching the binary name and the other platforms):
+ * the app owns a decorated X11 window centered on the 3D panel and passes it
+ * via XR_DXR_xlib_window_binding, so the runtime weaves window-relative
+ * (runtime#729/#730) and the app receives keyboard input. The window defaults
+ * to 1920x1080 centered on the panel (XR_DXR_display_info desktop rect, else
+ * Xrandr); MODEL_WINDOW="WxH+X+Y" overrides. When no X server (or window
+ * creation fails) the app falls back to the previous hosted-NULL path — which
+ * also keeps this compiling and startable on the build-green CI runner.
  *
- * The frame loop drives ModelRenderer with a fixed framed camera (no live
- * input) so a Linux runtime with a display can present the bundled sample
- * model; it consumes XR_DXR_view_rig render-ready views when the runtime
+ * INPUT — O / Ctrl+O opens a zenity file-selection dialog (async fork/exec, no
+ * hard dependency: absent zenity logs and no-ops) and loads the chosen model
+ * via the shared ModelRenderer. The camera is otherwise the fixed framed
+ * default; it consumes XR_DXR_view_rig render-ready views when the runtime
  * offers them, matching the macOS render path.
  */
 
 #include <vulkan/vulkan.h>
+
+// X11 window + input (handle app) — before the OpenXR platform header so the
+// xlib binding struct sees the real Display/Window types.
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/keysym.h>
+#include <X11/extensions/Xrandr.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_xlib_window_binding.h>
 
 #include <array>
 #include <chrono>
@@ -45,8 +53,10 @@
 #include <vector>
 
 #include <climits>
+#include <fcntl.h>
 #include <libgen.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -197,6 +207,13 @@ struct AppXrSession {
     float displayWidthM = 0, displayHeightM = 0;
     float nominalViewerZ = 0.5f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
+    int32_t displayScreenLeft = 0;     // 3D-panel top-left in virtual-desktop px (INV-1.3)
+    int32_t displayScreenTop = 0;
+
+    // App-owned X11 window (handle app). Null display = hosted-NULL fallback.
+    Display* xDisplay = nullptr;
+    Window xWindow = 0;
+    unsigned int xWinW = 0, xWinH = 0;
 
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
@@ -257,6 +274,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        di.next = &desktopPos;
         sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
             xr.displayWidthM = di.displaySizeMeters.width;
@@ -264,6 +284,8 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.nominalViewerZ = di.nominalViewerPositionInDisplaySpace.z;
             xr.displayPixelWidth = di.displayPixelWidth;
             xr.displayPixelHeight = di.displayPixelHeight;
+            xr.displayScreenLeft = desktopPos.left;
+            xr.displayScreenTop = desktopPos.top;
         }
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
                               (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
@@ -384,9 +406,21 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueFamilyIndex = qfi;
     vkBinding.queueIndex = 0;
 
+    // Handle app: pass the app-owned X11 window via XR_DXR_xlib_window_binding
+    // so the runtime weaves window-relative (runtime#729/#730). Falls back to
+    // hosted-NULL (no window binding) when CreateAppWindow didn't run.
+    XrXlibWindowBindingCreateInfoDXR xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
+    xlibBinding.next = &vkBinding;
+    xlibBinding.xDisplay = xr.xDisplay;
+    xlibBinding.window = xr.xWindow;
+    xlibBinding.transparentBackgroundEnabled = XR_FALSE;
+    const bool useAppWindow = (xr.xDisplay != nullptr && xr.xWindow != 0);
+
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
-    si.next = &vkBinding; si.systemId = xr.systemId;
+    si.next = useAppWindow ? (const void*)&xlibBinding : (const void*)&vkBinding;
+    si.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
+    LOG_INFO("Session created (%s)", useAppWindow ? "app-owned window, handle app" : "hosted-NULL");
 
     if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
         uint32_t modeCount = 0;
@@ -532,6 +566,174 @@ static void CleanupOpenXR(AppXrSession& xr) {
     if (xr.localSpace) xrDestroySpace(xr.localSpace);
     if (xr.session) xrDestroySession(xr.session);
     if (xr.instance) xrDestroyInstance(xr.instance);
+    // Tear down the app-owned X11 window after the runtime has released it.
+    if (xr.xWindow != 0 && xr.xDisplay != nullptr) XDestroyWindow(xr.xDisplay, xr.xWindow);
+    if (xr.xDisplay != nullptr) XCloseDisplay(xr.xDisplay);
+    xr.xWindow = 0;
+    xr.xDisplay = nullptr;
+}
+
+// ============================================================================
+// App-owned X11 window (handle app)
+// ============================================================================
+
+static const unsigned int kDefaultWindowW = 1920;
+static const unsigned int kDefaultWindowH = 1080;
+static Atom g_wmDeleteAtom = None;
+
+// Find the target panel rect (virtual-desktop px). Prefer the RandR PRIMARY
+// output; else the largest connected NON-eDP/LVDS output (the 3D display is an
+// external panel, not the laptop's built-in). Same helper as the avatar demo.
+static bool GetPanelRect(Display* dpy, Window root, int& x, int& y, int& w, int& h) {
+    XRRScreenResources* res = XRRGetScreenResources(dpy, root);
+    if (res == nullptr) return false;
+
+    auto tryOutput = [&](RROutput out) -> bool {
+        XRROutputInfo* oi = XRRGetOutputInfo(dpy, res, out);
+        if (oi == nullptr) return false;
+        bool ok = false;
+        if (oi->connection == RR_Connected && oi->crtc != 0) {
+            XRRCrtcInfo* ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
+            if (ci != nullptr && ci->width > 0 && ci->height > 0) {
+                x = ci->x; y = ci->y; w = (int)ci->width; h = (int)ci->height;
+                ok = true;
+            }
+            if (ci != nullptr) XRRFreeCrtcInfo(ci);
+        }
+        XRRFreeOutputInfo(oi);
+        return ok;
+    };
+
+    bool found = false;
+    RROutput primary = XRRGetOutputPrimary(dpy, root);
+    if (primary != 0 && tryOutput(primary)) {
+        found = true;
+    }
+    if (!found) {
+        long bestArea = 0;
+        for (int i = 0; i < res->noutput; i++) {
+            XRROutputInfo* oi = XRRGetOutputInfo(dpy, res, res->outputs[i]);
+            if (oi == nullptr) continue;
+            const bool isBuiltin = oi->name != nullptr &&
+                (strncasecmp(oi->name, "eDP", 3) == 0 || strncasecmp(oi->name, "LVDS", 4) == 0);
+            if (oi->connection == RR_Connected && oi->crtc != 0 && !isBuiltin) {
+                XRRCrtcInfo* ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
+                if (ci != nullptr && ci->width > 0 && ci->height > 0) {
+                    const long area = (long)ci->width * (long)ci->height;
+                    if (area > bestArea) {
+                        bestArea = area;
+                        x = ci->x; y = ci->y; w = (int)ci->width; h = (int)ci->height;
+                        found = true;
+                    }
+                }
+                if (ci != nullptr) XRRFreeCrtcInfo(ci);
+            }
+            XRRFreeOutputInfo(oi);
+        }
+    }
+    XRRFreeScreenResources(res);
+    return found;
+}
+
+// Create a normal decorated X11 window for the viewer (opaque, default visual),
+// landscape 1920x1080 centered on the 3D panel — the app passes it via
+// XR_DXR_xlib_window_binding so the runtime weaves window-relative. Override
+// with MODEL_WINDOW="WxH+X+Y" (X,Y absolute virtual-desktop px; WxH alone
+// re-centers). Returns false (xDisplay left null) when no X server is
+// available, so the caller falls back to hosted-NULL (also the CI-safe path).
+static bool CreateAppWindow(AppXrSession& xr) {
+    Display* dpy = XOpenDisplay(nullptr);
+    if (dpy == nullptr) {
+        LOG_INFO("XOpenDisplay failed (no X server) — using hosted-NULL windowing");
+        return false;
+    }
+    int screen = DefaultScreen(dpy);
+    Window root = RootWindow(dpy, screen);
+
+    XSetWindowAttributes attrs = {};
+    attrs.background_pixel = BlackPixel(dpy, screen);
+    attrs.event_mask = StructureNotifyMask | KeyPressMask;
+
+    unsigned int w = kDefaultWindowW, h = kDefaultWindowH;
+    int px = 0, py = 0;
+    int prx = 0, pry = 0, prw = 0, prh = 0;
+    if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        // Authoritative: XR_DXR_display_info reports the 3D panel's desktop
+        // rect. Prefer it — on a multi-monitor box the RandR PRIMARY is often
+        // NOT the 3D panel.
+        prx = xr.displayScreenLeft;
+        pry = xr.displayScreenTop;
+        prw = (int)xr.displayPixelWidth;
+        prh = (int)xr.displayPixelHeight;
+        px = prx + (prw - (int)w) / 2;
+        py = pry + (prh - (int)h) / 2;
+        LOG_INFO("3D panel (display_info) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
+                 prw, prh, prx, pry, w, h, px, py);
+    } else if (GetPanelRect(dpy, root, prx, pry, prw, prh)) {
+        px = prx + (prw - (int)w) / 2;
+        py = pry + (prh - (int)h) / 2;
+        LOG_INFO("Panel rect (Xrandr) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
+                 prw, prh, prx, pry, w, h, px, py);
+    } else {
+        const int sw = DisplayWidth(dpy, screen), sh = DisplayHeight(dpy, screen);
+        px = (sw - (int)w) / 2;
+        py = (sh - (int)h) / 2;
+        LOG_INFO("Xrandr panel query failed — centering %ux%u on default screen %dx%d at (%d,%d)",
+                 w, h, sw, sh, px, py);
+    }
+
+    // MODEL_WINDOW="WxH+X+Y" override (X,Y absolute virtual-desktop px); WxH
+    // alone re-centers on the same panel/screen origin.
+    if (const char* wenv = getenv("MODEL_WINDOW")) {
+        unsigned int ow = 0, oh = 0; int ox = 0, oy = 0;
+        int n = sscanf(wenv, "%ux%u+%d+%d", &ow, &oh, &ox, &oy);
+        if (n >= 2 && ow > 0 && oh > 0) {
+            w = ow; h = oh;
+            if (n >= 4) {
+                px = ox; py = oy;
+                LOG_INFO("MODEL_WINDOW override: %ux%u at absolute (%d,%d)", w, h, px, py);
+            } else {
+                if (prw > 0 && prh > 0) { px = prx + (prw - (int)w) / 2; py = pry + (prh - (int)h) / 2; }
+                LOG_INFO("MODEL_WINDOW override: %ux%u (re-centered at %d,%d)", w, h, px, py);
+            }
+        }
+    }
+
+    Window win = XCreateWindow(dpy, root, px, py, w, h, 0, CopyFromParent, InputOutput,
+                               CopyFromParent, CWBackPixel | CWEventMask, &attrs);
+    if (win == 0) {
+        LOG_ERROR("XCreateWindow failed — using hosted-NULL windowing");
+        XCloseDisplay(dpy);
+        return false;
+    }
+    XStoreName(dpy, win, "DisplayXR 3D Model Viewer");
+
+    // Close button → clean exit (ClientMessage in the event pump).
+    g_wmDeleteAtom = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    if (g_wmDeleteAtom != None) XSetWMProtocols(dpy, win, &g_wmDeleteAtom, 1);
+
+    // WM_NORMAL_HINTS with USPosition|PPosition so the WM honors the
+    // create-time position instead of auto-placing (GNOME/Mutter).
+    {
+        XSizeHints hints = {};
+        hints.flags = USPosition | PPosition;
+        hints.x = px; hints.y = py;
+        XSetWMNormalHints(dpy, win, &hints);
+    }
+
+    XMapWindow(dpy, win);
+    XFlush(dpy);
+    // Re-assert the position after mapping — Mutter ignores the create-time
+    // x/y of a freshly-mapped toplevel but honors a post-map move.
+    XMoveWindow(dpy, win, px, py);
+    XFlush(dpy);
+
+    xr.xDisplay = dpy;
+    xr.xWindow = win;
+    xr.xWinW = w;
+    xr.xWinH = h;
+    LOG_INFO("Created %ux%u app window at (%d,%d) — XR_DXR_xlib_window_binding", w, h, px, py);
+    return true;
 }
 
 // ============================================================================
@@ -580,6 +782,109 @@ static void TryAutoLoadBundledScene() {
     }
 }
 
+// ============================================================================
+// File-open dialog (O / Ctrl+O) — async zenity picker + X11 event pump
+// ============================================================================
+
+// Non-blocking zenity file-selection: fork/exec with a pipe, polled every
+// frame so the XR frame loop never stalls. zenity is NOT a hard dependency —
+// when absent the child exits 127 and we log a hint. Windows-parity semantics:
+// pick a file → validate → g_modelRenderer.loadModel → re-run auto-fit.
+static pid_t g_pickerPid = -1;
+static int g_pickerFd = -1;
+static std::string g_pickerBuf;
+
+static void StartFilePicker() {
+    if (g_pickerPid > 0) return; // dialog already open
+    int fds[2];
+    if (pipe(fds) != 0) { LOG_WARN("file picker: pipe() failed"); return; }
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); LOG_WARN("file picker: fork() failed"); return; }
+    if (pid == 0) {
+        // Child: zenity prints the chosen path on stdout.
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[0]); close(fds[1]);
+        std::string startDir = ExeDir(); // bundled models (sample.glb, Fox.glb) live here
+        if (!startDir.empty() && startDir.back() != '/') startDir += '/';
+        std::string filenameArg = "--filename=" + startDir;
+        const char* argv[] = {"zenity", "--file-selection", "--title=Open 3D model",
+                              filenameArg.c_str(),
+                              "--file-filter=3D models | *.glb *.gltf *.obj *.stl *.fbx *.usdz *.GLB *.GLTF",
+                              "--file-filter=All files | *", nullptr};
+        execvp("zenity", const_cast<char* const*>(argv));
+        _exit(127); // zenity not installed
+    }
+    close(fds[1]);
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    g_pickerPid = pid;
+    g_pickerFd = fds[0];
+    g_pickerBuf.clear();
+    LOG_INFO("file picker: zenity dialog opened");
+}
+
+static void PollFilePicker() {
+    if (g_pickerPid <= 0) return;
+    // Drain whatever the child has written so far.
+    char buf[512];
+    ssize_t n;
+    while ((n = read(g_pickerFd, buf, sizeof(buf))) > 0) g_pickerBuf.append(buf, (size_t)n);
+    int status = 0;
+    pid_t r = waitpid(g_pickerPid, &status, WNOHANG);
+    if (r != g_pickerPid) return; // still open
+    while ((n = read(g_pickerFd, buf, sizeof(buf))) > 0) g_pickerBuf.append(buf, (size_t)n);
+    close(g_pickerFd);
+    g_pickerFd = -1; g_pickerPid = -1;
+
+    const int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == 127) { LOG_WARN("file picker: zenity not installed (apt install zenity)"); return; }
+    if (code != 0) { LOG_INFO("file picker: cancelled"); return; }
+    // Trim the trailing newline zenity appends.
+    while (!g_pickerBuf.empty() && (g_pickerBuf.back() == '\n' || g_pickerBuf.back() == '\r'))
+        g_pickerBuf.pop_back();
+    if (g_pickerBuf.empty()) return;
+    if (!model_validate_file(g_pickerBuf)) { LOG_WARN("file picker: unsupported file '%s'", g_pickerBuf.c_str()); return; }
+    LOG_INFO("Loading model: %s", g_pickerBuf.c_str());
+    if (g_modelRenderer.loadModel(g_pickerBuf.c_str())) {
+        g_loadedFileName = model_basename(g_pickerBuf);
+        ApplyAutoFitForLoadedScene();
+        LOG_INFO("Loaded %s", g_loadedFileName.c_str());
+    } else {
+        LOG_WARN("file picker: load failed for %s", g_pickerBuf.c_str());
+    }
+}
+
+// Pump the app window's X11 events: O / Ctrl+O = open-file dialog, close
+// button = clean exit, ConfigureNotify = track live window size.
+static void PumpXEvents(AppXrSession& xr) {
+    if (xr.xDisplay == nullptr) return;
+    while (XPending(xr.xDisplay) > 0) {
+        XEvent ev;
+        XNextEvent(xr.xDisplay, &ev);
+        switch (ev.type) {
+        case KeyPress: {
+            KeySym sym = XLookupKeysym(&ev.xkey, 0);
+            if (sym == XK_o || sym == XK_O) StartFilePicker(); // with or without Ctrl
+            break;
+        }
+        case ConfigureNotify:
+            if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
+                xr.xWinW = (unsigned int)ev.xconfigure.width;
+                xr.xWinH = (unsigned int)ev.xconfigure.height;
+                g_windowW = xr.xWinW;
+                g_windowH = xr.xWinH;
+            }
+            break;
+        case ClientMessage:
+            if (g_wmDeleteAtom != None && (Atom)ev.xclient.data.l[0] == g_wmDeleteAtom) {
+                LOG_INFO("Window closed — exiting");
+                g_running = false;
+            }
+            break;
+        default: break;
+        }
+    }
+}
+
 static void SignalHandler(int) { g_running = false; }
 
 // ============================================================================
@@ -606,6 +911,12 @@ int main() {
 
     AppXrSession xr = {};
     if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
+
+    // Handle app: own an X11 window on the 3D panel (display_info queried in
+    // InitializeOpenXR gives the panel rect). Falls back to hosted-NULL when
+    // no X server is available (also the CI-safe path — CI never runs this).
+    CreateAppWindow(xr);
+
     if (!GetVulkanGraphicsRequirements(xr)) { CleanupOpenXR(xr); return 1; }
 
     VkInstance vkInstance = VK_NULL_HANDLE;
@@ -639,13 +950,20 @@ int main() {
                               queueFamilyIndex, xr.swapchain.width, xr.swapchain.height))
         LOG_WARN("model renderer init failed");
 
-    if (xr.displayPixelWidth > 0) g_windowW = xr.displayPixelWidth;
-    if (xr.displayPixelHeight > 0) g_windowH = xr.displayPixelHeight;
+    // Tile basis: the app window when we own one (window×scaleXY, #729-style);
+    // else the full panel (hosted-NULL renders display-sized).
+    if (xr.xWinW > 0 && xr.xWinH > 0) {
+        g_windowW = xr.xWinW;
+        g_windowH = xr.xWinH;
+    } else {
+        if (xr.displayPixelWidth > 0) g_windowW = xr.displayPixelWidth;
+        if (xr.displayPixelHeight > 0) g_windowH = xr.displayPixelHeight;
+    }
     xr.currentRenderingMode = xr.renderingModeCount > 1 ? 1 : 0;
 
     TryAutoLoadBundledScene();
 
-    LOG_INFO("=== Entering main loop (headless build-green; fixed framing) ===");
+    LOG_INFO("=== Entering main loop ===");
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (g_running && !xr.exitRequested) {
@@ -659,6 +977,8 @@ int main() {
 
         g_modelRenderer.updateAnimation(dt);
         PollEvents(xr);
+        PumpXEvents(xr);   // O / Ctrl+O = open dialog; close button = exit
+        PollFilePicker();  // async zenity result → loadModel + auto-fit
 
         if (!xr.sessionRunning) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); continue; }
 
