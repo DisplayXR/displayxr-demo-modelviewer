@@ -33,6 +33,7 @@
 #include "atlas_capture.h"
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
 #include "toast.h"             // dxr::ToastState — transient on-screen confirmation
+#include "zone_default.h"      // dxr::FullWindowZone — zones-by-default (#63 / INV-5.6)
 
 #include <atomic>
 #include <cstdarg>   // ToastF varargs
@@ -266,6 +267,14 @@ static std::atomic<bool> g_hasAnimations{false};
 // thread. The swapchain is app-owned state (displayxr::common's
 // XrSessionManager carries no app-named fields, #396 W4) — created via the
 // lib's CreateWindowSpaceSwapchain generic, destroyed before CleanupOpenXR.
+// Zones-by-default (#63 / INV-5.6): one full-window XrDisplayZoneDXR chained
+// on locate + projection every frame. Buys the zones-frame composition rules —
+// most visibly, the toast below can be a Local2D layer composited POST-weave,
+// so it stops being clipped by the transparency silhouette in Ctrl+T mode.
+// Unavailable (old runtime / extension pair absent / headless): both chain
+// calls return NULL and every path below degrades to the legacy frame.
+static dxr::FullWindowZone g_fwZone;
+
 // Toast layer resources — same shape as the button-bar set below, but the layer
 // is only submitted on the frames dxr::ToastState says a message is live.
 static dxr::ToastState g_toast;
@@ -1652,6 +1661,24 @@ static void RenderThreadFunc(
                             viewState.next = &viewRigRaw;
                         }
 
+                        // Zones-by-default (#63): lazy one-time caps probe, then a
+                        // zone-scoped locate — the full-window zone with the rig
+                        // chained THROUGH it. Requires the rig (a zone locate
+                        // without a rig descriptor has no framing to scope), so
+                        // gate on useRig; NULL chain = legacy locate unchanged.
+                        {
+                            static bool s_zoneTried = false;
+                            if (!s_zoneTried && g_hasDisplayZonesExt && useRig) {
+                                s_zoneTried = true;
+                                dxr::FullWindowZoneInit(g_fwZone, xr->instance, xr->session);
+                            }
+                            if (useRig) {
+                                const XrDisplayZoneDXR* zc = dxr::FullWindowZoneLocateChain(
+                                    g_fwZone, windowW, windowH, &displayRig);
+                                if (zc != nullptr) locateInfo.next = zc;
+                            }
+                        }
+
                         // Over-allocate to the runtime's max possible view_count (sim_display
                         // reports 4 for Quad mode; LeiaSR reports 2). Hardcoding 2 here used
                         // to fail with XR_ERROR_SIZE_INSUFFICIENT under sim_display.
@@ -2338,8 +2365,17 @@ static void RenderThreadFunc(
                 // ── Toast layer ──────────────────────────────────────────────
                 // Only built + submitted while a message is live; once it
                 // expires the layer is simply absent from the submission.
+                //
+                // Two shapes, one uploaded image (#63): on a zones frame the
+                // chip is a LOCAL2D layer — composited post-weave, so it stays
+                // intact over the transparency silhouette in Ctrl+T mode. On
+                // the legacy fallback it stays a window-space layer (stamped
+                // into the atlas; silhouette-clipped in transparent mode — the
+                // pre-#63 behaviour, kept for old runtimes).
                 XrCompositionLayerWindowSpaceDXR toastLayer = {};
-                bool toastLayerReady = false;
+                XrCompositionLayerLocal2DDXR toastLayer2D = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+                bool toastLayerReady = false;       // window-space shape valid
+                bool toastLayer2DReady = false;     // Local2D shape valid
                 {
                     std::wstring toastText;
                     float toastAlpha = 1.0f;
@@ -2400,18 +2436,36 @@ static void RenderThreadFunc(
                             const dxr::ToastLayerRect tr = dxr::ComputeToastLayerRect(
                                 windowW, windowH, (float)TOAST_TEX_W / (float)TOAST_TEX_H,
                                 TOAST_SIZE_FRACTION, TOAST_Y_FRACTION);
-                            toastLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
-                            toastLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-                            toastLayer.subImage.swapchain = g_toastSwapchain.swapchain;
-                            toastLayer.subImage.imageRect.offset = {0, 0};
-                            toastLayer.subImage.imageRect.extent = {(int32_t)TOAST_TEX_W, (int32_t)TOAST_TEX_H};
-                            toastLayer.subImage.imageArrayIndex = 0;
-                            toastLayer.x = tr.x;
-                            toastLayer.y = tr.y;
-                            toastLayer.width = tr.width;
-                            toastLayer.height = tr.height;
-                            toastLayer.disparity = 0.0f;   // screen depth — UI chrome sits at ZDP
-                            toastLayerReady = true;
+                            if (g_fwZone.available) {
+                                // Local2D takes a PIXEL rect in the window.
+                                int32_t rx = (int32_t)(tr.x * (float)windowW + 0.5f);
+                                int32_t ry = (int32_t)(tr.y * (float)windowH + 0.5f);
+                                int32_t rw = (int32_t)(tr.width  * (float)windowW + 0.5f);
+                                int32_t rh = (int32_t)(tr.height * (float)windowH + 0.5f);
+                                if (rw < 2) rw = 2;
+                                if (rh < 2) rh = 2;
+                                toastLayer2D.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                                toastLayer2D.subImage.swapchain = g_toastSwapchain.swapchain;
+                                toastLayer2D.subImage.imageRect.offset = {0, 0};
+                                toastLayer2D.subImage.imageRect.extent = {(int32_t)TOAST_TEX_W, (int32_t)TOAST_TEX_H};
+                                toastLayer2D.subImage.imageArrayIndex = 0;
+                                toastLayer2D.rect.offset = {rx, ry};
+                                toastLayer2D.rect.extent = {rw, rh};
+                                toastLayer2DReady = true;
+                            } else {
+                                toastLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
+                                toastLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                                toastLayer.subImage.swapchain = g_toastSwapchain.swapchain;
+                                toastLayer.subImage.imageRect.offset = {0, 0};
+                                toastLayer.subImage.imageRect.extent = {(int32_t)TOAST_TEX_W, (int32_t)TOAST_TEX_H};
+                                toastLayer.subImage.imageArrayIndex = 0;
+                                toastLayer.x = tr.x;
+                                toastLayer.y = tr.y;
+                                toastLayer.width = tr.width;
+                                toastLayer.height = tr.height;
+                                toastLayer.disparity = 0.0f;   // screen depth — UI chrome sits at ZDP
+                                toastLayerReady = true;
+                            }
                         } else if (px) {
                             UnmapHud(g_toastHud);
                         }
@@ -2433,16 +2487,28 @@ static void RenderThreadFunc(
                     // explicitly (the vendored copy hardcoded it; required for
                     // the Ctrl+T transparent-background path).
                     // Extra window-space layers, submitted in order: the top
-                    // button bar, then the toast on top of it.
+                    // button bar, then (legacy fallback only) the window-space
+                    // toast on top of it.
                     XrCompositionLayerWindowSpaceDXR uiLayers[2] = {};
                     uint32_t uiLayerCount = 0;
                     if (barLayerReady) uiLayers[uiLayerCount++] = barLayer;
                     if (toastLayerReady) uiLayers[uiLayerCount++] = toastLayer;
+                    // Zones frame (#63): the same XrDisplayZoneDXR instance the
+                    // locate used chains on the projection layer, and the toast
+                    // rides as a Local2D extra layer (composited post-weave, on
+                    // top of everything). Both are NULL/empty on the legacy
+                    // fallback, collapsing to the exact pre-#63 submission.
+                    const XrCompositionLayerBaseHeader* extraLayers[1] = {};
+                    uint32_t extraLayerCount = 0;
+                    if (toastLayer2DReady)
+                        extraLayers[extraLayerCount++] = (const XrCompositionLayerBaseHeader*)&toastLayer2D;
                     EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
                         uiLayerCount ? uiLayers : nullptr, uiLayerCount,
                         0, 0, -1, -1, /*submitHud=*/hudSubmitted,
-                        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT);
+                        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                        dxr::FullWindowZoneSubmitChain(g_fwZone),
+                        extraLayerCount ? extraLayers : nullptr, extraLayerCount);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;

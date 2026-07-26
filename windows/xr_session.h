@@ -13,6 +13,8 @@
 #include "xr_session_common.h"
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_mcp_tools.h>
+#include <openxr/XR_DXR_display_zones.h>
+#include <openxr/XR_DXR_local_3d_zone.h>
 #include <string>
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
@@ -20,6 +22,9 @@
 // flag (displayxr::common's XrSessionManager carries no app-named fields,
 // #396 W4); set by InitializeOpenXR.
 extern bool g_hasViewRigExt;
+// XR_DXR_display_zones + XR_DXR_local_3d_zone both present (#63): the
+// zones-by-default full-window zone needs the pair (zone chain + Local2D).
+extern bool g_hasDisplayZonesExt;
 
 // INV-1.3 (XR_DXR_display_info v16, runtime#715): 3D panel top-left in
 // Windows virtual-screen pixels (XrDisplayDesktopPositionDXR). (0,0) =
