@@ -1114,8 +1114,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleFullscreen(hwnd);
             return 0;
         }
-        // L key = load shortcut
-        if (wParam == 'L') {
+        // Ctrl+O = open a model (uniform across demos + platforms, incl. the
+        // mediaplayer). Strict: Ctrl must be held. WM_USER+1 runs the picker on
+        // the message loop. (Was bare L — retired for the uniform chord.)
+        if (wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) {
             PostMessage(hwnd, WM_USER + 1, 0, 0);
             return 0;
         }
@@ -1987,7 +1989,7 @@ static void RenderThreadFunc(
                                         std::wstring fname(g_loadedFileName.begin(), g_loadedFileName.end());
                                         sceneText += L"\nLoaded: " + fname;
                                     } else {
-                                        sceneText += L"\nNo scene loaded (press L or click Load)";
+                                        sceneText += L"\nNo scene loaded (Ctrl+O or click Load)";
                                     }
                                 }
                                 modeText += sceneText;
@@ -2053,7 +2055,7 @@ static void RenderThreadFunc(
                                 }
                                 std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset | [N] Clip | [K] Play/Pause\n"
-                                    L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit\n"
+                                    L"[M] Auto-Orbit | [V] Mode | [Ctrl+O] Load | [Tab] HUD | [ESC] Quit\n"
                                     L"[P then X/Y/Z] Pin recenter axis";
 
                                 // Chrome buttons no longer live here — they are a
