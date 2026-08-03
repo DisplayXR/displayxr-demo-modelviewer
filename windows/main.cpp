@@ -2131,8 +2131,14 @@ static void RenderThreadFunc(
                                         std::lock_guard<std::mutex> tb(g_toastBandMtx);
                                         if (g_toastBandLive) chrome[nChrome++] = g_toastBand;
                                     }
+                                    // Union the LAST view's tile too — a view-0-only
+                                    // region clips the other views' parallax edges
+                                    // once content moves off ZDP.
+                                    const uint32_t lastV = (uint32_t)(eyeCount - 1);
                                     g_punch.update(graphicsQueue, (*swapchainVkImages)[imageIndex],
-                                                   renderW, renderH, hwnd, windowW, windowH, chrome, nChrome);
+                                                   renderW, renderH, hwnd, windowW, windowH, chrome, nChrome,
+                                                   (lastV % cols) * renderW, (lastV / cols) * renderH,
+                                                   eyeCount > 1);
                                 }
                             } else if (g_punch.shaped()) {
                                 g_punch.disable(hwnd);
