@@ -15,7 +15,6 @@
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_display_zones.h>
 #include <openxr/XR_DXR_local_3d_zone.h>
-#include <string>
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
 // returns render-ready XrView{pose, fov}; the app deletes its own. App-owned
@@ -75,15 +74,14 @@ bool CreateVulkanInstance(XrSessionManager& xr, VkInstance& vkInstance);
 bool GetVulkanPhysicalDevice(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice& physDevice);
 
 // Get required device extensions from the runtime
-bool GetVulkanDeviceExtensions(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
-    std::vector<const char*>& deviceExtensions, std::vector<std::string>& extensionStorage);
+// (vulkan_enable2: device extensions are appended by the runtime in
+// xrCreateVulkanDeviceKHR — no app-side extension query needed.)
 
 // Find a graphics queue family
 bool FindGraphicsQueueFamily(VkPhysicalDevice physDevice, uint32_t& queueFamilyIndex);
 
 // Create Vulkan logical device with required extensions
-bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
-    const std::vector<const char*>& deviceExtensions,
+bool CreateVulkanDevice(XrSessionManager& xr, VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     VkDevice& device, VkQueue& graphicsQueue);
 
 // Create OpenXR session with Vulkan binding + win32_window_binding
