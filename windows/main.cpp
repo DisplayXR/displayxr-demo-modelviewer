@@ -31,6 +31,7 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "atlas_capture.h"
+#include "vk_overlay_kit.h"   // dxr::CachedLayerUploader (#837 — no per-frame layer upload+wait)
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
 #include "toast.h"             // dxr::ToastState — transient on-screen confirmation
 #include "zone_default.h"      // dxr::FullWindowZone — zones-by-default (#63 / INV-5.6)
@@ -2064,8 +2065,7 @@ static void RenderThreadFunc(
                         // toggle), so we must NOT acquire its image this frame.
                         if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages &&
                             inputSnapshot.hudVisible) {
-                            uint32_t hudImageIndex;
-                            if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
+                            {
                                 std::wstring sessionText(xr->systemName, xr->systemName + strlen(xr->systemName));
                                 sessionText += L"\nSession: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
@@ -2154,78 +2154,47 @@ static void RenderThreadFunc(
                                 // separate full-width top-bar window-space layer
                                 // (see the button-bar block below). This layer is
                                 // the info panel only, toggled by Tab via drawBody.
-                                uint32_t srcRowPitch = 0;
-                                const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, stereoText, helpText, {},
-                                    /*drawBody=*/true,
-                                    /*bodyAtBottom=*/true);
-                                if (pixels) {
-                                    const uint8_t* src = (const uint8_t*)pixels;
-                                    uint8_t* dst = (uint8_t*)hudStagingMapped;
-                                    for (uint32_t row = 0; row < hudHeight; row++) {
-                                        memcpy(dst + row * hudWidth * 4, src + row * srcRowPitch, hudWidth * 4);
-                                    }
-                                    UnmapHud(*hud);
+                                //
+                                // #837 overlay kit: rasterize + upload only when the
+                                // content changed. The panel is all live readouts, so
+                                // the hash rides a 250 ms bucket (4 Hz refresh) plus
+                                // the stable strings; the upload submits with a fence
+                                // and never waits (the old per-frame vkQueueWaitIdle
+                                // drained the frame's queued GPU work on the iGPU).
+                                static dxr::CachedLayerUploader s_hudUp;
+                                static bool s_hudUpInit = false;
+                                static bool s_hudUploadedOnce = false;
+                                if (!s_hudUpInit) {
+                                    s_hudUpInit = s_hudUp.init(vkDevice, physDevice,
+                                        queueFamilyIndex, hudWidth, hudHeight);
                                 }
+                                uint64_t hh = dxr::HashBytes(sessionText.data(),
+                                    sessionText.size() * sizeof(wchar_t));
+                                hh = dxr::HashBytes(modeText.data(), modeText.size() * sizeof(wchar_t), hh);
+                                hh = dxr::HashBytes(dispText.data(), dispText.size() * sizeof(wchar_t), hh);
+                                const uint64_t bucket = GetTickCount64() / 250;
+                                hh = dxr::HashBytes(&bucket, sizeof(bucket), hh);
 
-                                // Copy staging buffer to HUD swapchain image
-                                VkCommandBufferAllocateInfo cmdAllocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                                cmdAllocInfo.commandPool = hudCmdPool;
-                                cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                                cmdAllocInfo.commandBufferCount = 1;
-
-                                VkCommandBuffer cmdBuf;
-                                vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmdBuf);
-
-                                VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                                vkBeginCommandBuffer(cmdBuf, &beginInfo);
-
-                                VkImage hudImg = (*hudSwapchainImages)[hudImageIndex].image;
-
-                                VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                                barrier.srcAccessMask = 0;
-                                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.image = hudImg;
-                                barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                VkBufferImageCopy region = {};
-                                region.bufferRowLength = hudWidth;
-                                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                                region.imageOffset = {0, 0, 0};
-                                region.imageExtent = {hudWidth, hudHeight, 1};
-                                vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, hudImg,
-                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-                                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                vkEndCommandBuffer(cmdBuf);
-
-                                VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                                submitInfo.commandBufferCount = 1;
-                                submitInfo.pCommandBuffers = &cmdBuf;
-                                vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-                                vkQueueWaitIdle(graphicsQueue);
-
-                                vkFreeCommandBuffers(vkDevice, hudCmdPool, 1, &cmdBuf);
-
-                                ReleaseHudSwapchainImage(*xr);
-                                hudSubmitted = true;
+                                if (s_hudUpInit && s_hudUp.needsUpload(hh)) {
+                                    uint32_t hudImageIndex;
+                                    if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
+                                        uint32_t srcRowPitch = 0;
+                                        const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
+                                            cameraText, stereoText, helpText, {},
+                                            /*drawBody=*/true,
+                                            /*bodyAtBottom=*/true);
+                                        if (pixels) {
+                                            VkImage hudImg = (*hudSwapchainImages)[hudImageIndex].image;
+                                            if (s_hudUp.upload(graphicsQueue, hudImg, pixels,
+                                                    srcRowPitch, hudWidth * 4, hudHeight, hh)) {
+                                                s_hudUploadedOnce = true;
+                                            }
+                                            UnmapHud(*hud);
+                                        }
+                                        ReleaseHudSwapchainImage(*xr);
+                                    }
+                                }
+                                hudSubmitted = s_hudUploadedOnce;
                             }
                         }
 
@@ -2292,59 +2261,51 @@ static void RenderThreadFunc(
                         barButtons.push_back(makeBtn(AnimBtnXFraction(), ANIM_BTN_WIDTH_FRACTION, animLabel));
                     }
 
-                    uint32_t pitch = 0;
-                    const void* px = RenderHudAndMap(g_animBtnHud, &pitch,
-                        L"", L"", L"", L"", L"", L"", L"", L"",
-                        barButtons, /*drawBody=*/false, /*bodyAtBottom=*/true);
-                    uint32_t idx = 0;
-                    if (px && AcquireWindowSpaceImage(g_animBtnSwapchain, idx)) {
-                        uint8_t* dst = (uint8_t*)g_animBtnStagingMapped;
-                        for (uint32_t row = 0; row < BTN_BAR_TEX_H; ++row)
-                            memcpy(dst + row * BTN_BAR_TEX_W * 4,
-                                   (const uint8_t*)px + row * pitch, BTN_BAR_TEX_W * 4);
-                        UnmapHud(g_animBtnHud);
+                    // #837 overlay kit: the bar is static except for hover state
+                    // and label changes (mode/anim) — rasterize + upload only when
+                    // those change; the last-released image keeps serving the
+                    // layer. Upload submits with a fence, never waits.
+                    static dxr::CachedLayerUploader s_barUp;
+                    static bool s_barUpInit = false;
+                    static bool s_barUploadedOnce = false;
+                    if (!s_barUpInit) {
+                        s_barUpInit = s_barUp.init(vkDevice, physDevice, queueFamilyIndex,
+                            BTN_BAR_TEX_W, BTN_BAR_TEX_H);
+                    }
+                    uint64_t bh = 1469598103934665603ull;
+                    for (const HudButton& b : barButtons) {
+                        bh = dxr::HashBytes(b.label.data(), b.label.size() * sizeof(wchar_t), bh);
+                        bh = dxr::HashBytes(&b.hovered, sizeof(b.hovered), bh);
+                    }
 
-                        VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                        cai.commandPool = g_animBtnCmdPool;
-                        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                        cai.commandBufferCount = 1;
-                        VkCommandBuffer cb = VK_NULL_HANDLE;
-                        vkAllocateCommandBuffers(vkDevice, &cai, &cb);
-                        VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                        bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                        vkBeginCommandBuffer(cb, &bgi);
-                        VkImage img = g_animBtnSwapImages[idx].image;
-                        VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                        bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                        bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                        bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                        bar.image = img;
-                        bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
-                        VkBufferImageCopy rg = {};
-                        rg.bufferRowLength = BTN_BAR_TEX_W;
-                        rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                        rg.imageOffset = {0, 0, 0};
-                        rg.imageExtent = {BTN_BAR_TEX_W, BTN_BAR_TEX_H, 1};
-                        vkCmdCopyBufferToImage(cb, g_animBtnStaging, img,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
-                        bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                        bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                        bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                        bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
-                        vkEndCommandBuffer(cb);
-                        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-                        vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
-                        vkQueueWaitIdle(graphicsQueue);
-                        vkFreeCommandBuffers(vkDevice, g_animBtnCmdPool, 1, &cb);
-                        ReleaseWindowSpaceImage(g_animBtnSwapchain);
+                    if (s_barUpInit && s_barUp.needsUpload(bh)) {
+                        uint32_t pitch = 0;
+                        const void* px = RenderHudAndMap(g_animBtnHud, &pitch,
+                            L"", L"", L"", L"", L"", L"", L"", L"",
+                            barButtons, /*drawBody=*/false, /*bodyAtBottom=*/true);
+                        uint32_t idx = 0;
+                        if (px && AcquireWindowSpaceImage(g_animBtnSwapchain, idx)) {
+                            if (s_barUp.upload(graphicsQueue, g_animBtnSwapImages[idx].image, px,
+                                    pitch, BTN_BAR_TEX_W * 4, BTN_BAR_TEX_H, bh)) {
+                                s_barUploadedOnce = true;
+                            } else {
+                                static bool s_warned = false;
+                                if (!s_warned) { s_warned = true; LOG_WARN("bar: kit upload FAILED"); }
+                            }
+                            UnmapHud(g_animBtnHud);
+                            ReleaseWindowSpaceImage(g_animBtnSwapchain);
+                        } else {
+                            static bool s_warned2 = false;
+                            if (!s_warned2) { s_warned2 = true; LOG_WARN("bar: px=%d acquire failed", px != nullptr); }
+                            if (px) UnmapHud(g_animBtnHud);
+                        }
+                    }
+                    {
+                        static bool s_logged = false;
+                        if (!s_logged) { s_logged = true; LOG_INFO("bar: kit init=%d uploadedOnce=%d", (int)s_barUpInit, (int)s_barUploadedOnce); }
+                    }
 
+                    if (s_barUploadedOnce) {
                         barLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
                         barLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                         barLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
@@ -2357,8 +2318,6 @@ static void RenderThreadFunc(
                         barLayer.height = barH;
                         barLayer.disparity = 0.0f;
                         barLayerReady = true;
-                    } else if (px) {
-                        UnmapHud(g_animBtnHud);
                     }
                 }
 
@@ -2381,58 +2340,40 @@ static void RenderThreadFunc(
                     float toastAlpha = 1.0f;
                     if (g_toastReady && g_hasToastSwapchain &&
                         g_toast.Snapshot(toastText, toastAlpha)) {
-                        uint32_t pitch = 0;
-                        const void* px = RenderToastStandalone(g_toastHud, &pitch,
-                            toastText, toastAlpha);
-                        uint32_t idx = 0;
-                        if (px && AcquireWindowSpaceImage(g_toastSwapchain, idx)) {
-                            uint8_t* dst = (uint8_t*)g_toastStagingMapped;
-                            for (uint32_t row = 0; row < TOAST_TEX_H; ++row)
-                                memcpy(dst + row * TOAST_TEX_W * 4,
-                                       (const uint8_t*)px + row * pitch, TOAST_TEX_W * 4);
-                            UnmapHud(g_toastHud);
+                        // #837 overlay kit: re-rasterize only when the text or the
+                        // (quantized, 1/32 steps) fade alpha changes — the fade
+                        // re-uploads a handful of times instead of every frame,
+                        // and the steady chip costs nothing. Fence, no wait.
+                        static dxr::CachedLayerUploader s_toastUp;
+                        static bool s_toastUpInit = false;
+                        static bool s_toastUploadedOnce = false;
+                        if (!s_toastUpInit) {
+                            s_toastUpInit = s_toastUp.init(vkDevice, physDevice, queueFamilyIndex,
+                                TOAST_TEX_W, TOAST_TEX_H);
+                        }
+                        const uint32_t alphaQ = (uint32_t)(toastAlpha * 32.0f + 0.5f);
+                        uint64_t th = dxr::HashBytes(toastText.data(),
+                            toastText.size() * sizeof(wchar_t));
+                        th = dxr::HashBytes(&alphaQ, sizeof(alphaQ), th);
 
-                            VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                            cai.commandPool = g_toastCmdPool;
-                            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                            cai.commandBufferCount = 1;
-                            VkCommandBuffer cb = VK_NULL_HANDLE;
-                            vkAllocateCommandBuffers(vkDevice, &cai, &cb);
-                            VkCommandBufferBeginInfo bgi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                            bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                            vkBeginCommandBuffer(cb, &bgi);
-                            VkImage img = g_toastSwapImages[idx].image;
-                            VkImageMemoryBarrier bar = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                            bar.srcAccessMask = 0; bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                            bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                            bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                            bar.image = img;
-                            bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
-                            VkBufferImageCopy rg = {};
-                            rg.bufferRowLength = TOAST_TEX_W;
-                            rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                            rg.imageOffset = {0, 0, 0};
-                            rg.imageExtent = {TOAST_TEX_W, TOAST_TEX_H, 1};
-                            vkCmdCopyBufferToImage(cb, g_toastStaging, img,
-                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
-                            bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                            bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                            bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                            bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
-                            vkEndCommandBuffer(cb);
-                            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                            si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-                            vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
-                            vkQueueWaitIdle(graphicsQueue);
-                            vkFreeCommandBuffers(vkDevice, g_toastCmdPool, 1, &cb);
-                            ReleaseWindowSpaceImage(g_toastSwapchain);
+                        if (s_toastUpInit && s_toastUp.needsUpload(th)) {
+                            uint32_t pitch = 0;
+                            const void* px = RenderToastStandalone(g_toastHud, &pitch,
+                                toastText, toastAlpha);
+                            uint32_t idx = 0;
+                            if (px && AcquireWindowSpaceImage(g_toastSwapchain, idx)) {
+                                if (s_toastUp.upload(graphicsQueue, g_toastSwapImages[idx].image, px,
+                                        pitch, TOAST_TEX_W * 4, TOAST_TEX_H, th)) {
+                                    s_toastUploadedOnce = true;
+                                }
+                                UnmapHud(g_toastHud);
+                                ReleaseWindowSpaceImage(g_toastSwapchain);
+                            } else if (px) {
+                                UnmapHud(g_toastHud);
+                            }
+                        }
 
+                        if (s_toastUploadedOnce) {
                             const dxr::ToastLayerRect tr = dxr::ComputeToastLayerRect(
                                 windowW, windowH, (float)TOAST_TEX_W / (float)TOAST_TEX_H,
                                 TOAST_SIZE_FRACTION, TOAST_Y_FRACTION);
@@ -2466,8 +2407,6 @@ static void RenderThreadFunc(
                                 toastLayer.disparity = 0.0f;   // screen depth — UI chrome sits at ZDP
                                 toastLayerReady = true;
                             }
-                        } else if (px) {
-                            UnmapHud(g_toastHud);
                         }
                     }
                 }
