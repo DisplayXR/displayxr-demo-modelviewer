@@ -32,6 +32,8 @@
 #include "text_overlay.h"
 #include "atlas_capture.h"
 #include "vk_overlay_kit.h"   // dxr::CachedLayerUploader (#837 — no per-frame layer upload+wait)
+#include "vk_clickthrough_region.h" // dxr::ClickThroughRegion (#833 — transparent-mode punch-through)
+#include "win_window_drag.h"        // dxr::RmbWindowDrag (move the borderless overlay)
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
 #include "toast.h"             // dxr::ToastState — transient on-screen confirmation
 #include "zone_default.h"      // dxr::FullWindowZone — zones-by-default (#63 / INV-5.6)
@@ -257,6 +259,22 @@ static std::atomic<bool> g_captureAtlasRequested{false};
 // renderer's output alpha (1 → 1-T) so background-uncovered pixels
 // punch through to the desktop.
 static std::atomic<bool> g_transparentBg{false};
+// #833 punch-through: under opaque present (DXR_PRESENT_OPAQUE) DWM completes
+// no blends, so transparent mode must CARVE the uncovered pixels out of the
+// window (dxr::ClickThroughRegion) instead of relying on alpha — and a shaped
+// WS_EX_NOREDIRECTIONBITMAP window can never paint an OS frame, so Ctrl+T
+// also goes borderless (WS_POPUP) while transparent. kBorderlessMsg runs the
+// style swap on the window-owning thread; the render thread posts it.
+static const UINT kBorderlessMsg = WM_APP + 0x33;
+static std::atomic<bool> g_borderless{false};
+static dxr::ClickThroughRegion g_punch; // render-thread owned
+static dxr::RmbWindowDrag g_windowDrag; // window-thread owned (WndProc)
+// Toast band published by the render thread's toast block so the region
+// keeps the chip visible (a shaped window clips ANY pixel outside the
+// region — including post-weave Local2D layers).
+static std::mutex g_toastBandMtx;
+static RECT g_toastBand = {0, 0, 0, 0};
+static bool g_toastBandLive = false;
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
 // True when the loaded model has animation clips — gates the animation button
@@ -1067,6 +1085,14 @@ static void OpenLoadDialog(HWND hwnd) {
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // #833: RMB-drag moves the borderless punch-through window (Unity
+    // desktop-avatar convention). Consumed BEFORE the input handler so a
+    // window-drag doesn't double as camera input. Opaque-element gating is
+    // free: shaped-out pixels never deliver mouse messages.
+    if (g_windowDrag.handleMessage(hwnd, msg, wParam, lParam, g_borderless.load())) {
+        return 0;
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
         UpdateInputState(g_inputState, msg, wParam, lParam);
@@ -1123,6 +1149,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // (the message-pump thread that owns the HWND).
         dxr_capture::TriggerCaptureFlash(hwnd);
         return 0;
+
+    case WM_NCHITTEST:
+        // Shaped borderless mode: the OS only delivers hits inside the
+        // region; claim them for normal app input (outside reaches the
+        // desktop natively).
+        if (g_borderless.load()) return HTCLIENT;
+        break;
+
+    case kBorderlessMsg: {
+        // Ctrl+T style swap, on the window-owning thread. Client rect is
+        // preserved across the swap (the avatar recipe); shaping happens on
+        // the render thread once coverage lands.
+        const bool borderless = wParam != 0;
+        RECT client = {};
+        GetClientRect(hwnd, &client);
+        POINT tl = {0, 0};
+        ClientToScreen(hwnd, &tl);
+        const DWORD style = (borderless ? WS_POPUP : WS_OVERLAPPEDWINDOW) | WS_VISIBLE;
+        SetWindowLong(hwnd, GWL_STYLE, (LONG)style);
+        RECT want = {tl.x, tl.y, tl.x + client.right, tl.y + client.bottom};
+        AdjustWindowRect(&want, style, FALSE);
+        SetWindowPos(hwnd, nullptr, want.left, want.top, want.right - want.left,
+                     want.bottom - want.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+        g_borderless.store(borderless);
+        return 0;
+    }
 
     case WM_TIMER:
         if (wParam == dxr_capture::kFlashTimerId) {
@@ -1388,6 +1440,10 @@ static void RenderThreadFunc(
                 LOG_INFO("Transparent background: %s (Ctrl+T)", now ? "ON" : "OFF");
                 bgToggled = true;
                 bgNow = now;
+                // #833: transparent mode is borderless + region punch-through
+                // (see kBorderlessMsg); the style swap runs on the window
+                // thread. Un-shaping on OFF happens in the render loop below.
+                PostMessage(hwnd, kBorderlessMsg, now ? 1 : 0, 0);
             }
             g_inputState.animateToggleRequested = false;
             g_inputState.loadRequested = false;
@@ -2051,6 +2107,36 @@ static void RenderThreadFunc(
                                     projectionViews[eye].fov = monoMode ? rawViews[0].fov : rawViews[eye].fov;
                                 }
                             }
+
+                            // #833 punch-through: while Ctrl+T transparent AND
+                            // borderless, shape the window from view 0's alpha
+                            // (fence-pipelined, ~2-frame lag — no waits). The
+                            // button-bar band stays in-region. Leaving the mode
+                            // un-shapes; the framed style returns via
+                            // kBorderlessMsg.
+                            if (g_transparentBg.load() && g_borderless.load()) {
+                                static bool s_punchInit = false;
+                                if (!s_punchInit) {
+                                    s_punchInit = g_punch.init(vkDevice, physDevice, queueFamilyIndex);
+                                }
+                                if (s_punchInit) {
+                                    // Chrome is hidden in transparent mode (see
+                                    // the bar block) — only the live toast band
+                                    // stays in-region.
+                                    RECT chrome[1];
+                                    uint32_t nChrome = 0;
+                                    {
+                                        // Previous frame's toast band — the region
+                                        // lags a couple frames anyway.
+                                        std::lock_guard<std::mutex> tb(g_toastBandMtx);
+                                        if (g_toastBandLive) chrome[nChrome++] = g_toastBand;
+                                    }
+                                    g_punch.update(graphicsQueue, (*swapchainVkImages)[imageIndex],
+                                                   renderW, renderH, hwnd, windowW, windowH, chrome, nChrome);
+                                }
+                            } else if (g_punch.shaped()) {
+                                g_punch.disable(hwnd);
+                            }
                             ReleaseSwapchainImage(*xr);
                         } else {
                             rendered = false;
@@ -2210,7 +2296,12 @@ static void RenderThreadFunc(
                 //    to a bar — see runtime issue #389. ──
                 XrCompositionLayerWindowSpaceDXR barLayer = {};
                 bool barLayerReady = false;
-                if (g_animBtnReady && g_hasAnimBtnSwapchain) {
+                // #833: chrome is hidden in transparent/punch-through mode by
+                // design (product call 2026-08-03) — the model floats clean
+                // over the live desktop; Ctrl+T back brings the buttons back.
+                // (Also sidesteps leia-plugin's WSUI-content-under-compose
+                // bug, filed separately.)
+                if (g_animBtnReady && g_hasAnimBtnSwapchain && !g_transparentBg.load()) {
                     const float mxf = (g_windowWidth > 0)
                         ? (float)inputSnapshot.mouseX / (float)g_windowWidth : 0.0f;
                     const float myf = (g_windowHeight > 0)
@@ -2338,6 +2429,10 @@ static void RenderThreadFunc(
                 {
                     std::wstring toastText;
                     float toastAlpha = 1.0f;
+                    {
+                        std::lock_guard<std::mutex> tb(g_toastBandMtx);
+                        g_toastBandLive = false; // republished below while live
+                    }
                     if (g_toastReady && g_hasToastSwapchain &&
                         g_toast.Snapshot(toastText, toastAlpha)) {
                         // #837 overlay kit: re-rasterize only when the text or the
@@ -2377,6 +2472,19 @@ static void RenderThreadFunc(
                             const dxr::ToastLayerRect tr = dxr::ComputeToastLayerRect(
                                 windowW, windowH, (float)TOAST_TEX_W / (float)TOAST_TEX_H,
                                 TOAST_SIZE_FRACTION, TOAST_Y_FRACTION);
+                            // #833: publish the chip's client-px band so the
+                            // punch-through region keeps it visible — the shape
+                            // clips ANY pixel outside the region, including
+                            // post-weave Local2D layers (this is not the #63
+                            // WSUI-vs-Local2D clipping, which stays fixed).
+                            {
+                                std::lock_guard<std::mutex> tb(g_toastBandMtx);
+                                g_toastBand.left = (LONG)(tr.x * (float)windowW);
+                                g_toastBand.top = (LONG)(tr.y * (float)windowH);
+                                g_toastBand.right = (LONG)((tr.x + tr.width) * (float)windowW + 1.0f);
+                                g_toastBand.bottom = (LONG)((tr.y + tr.height) * (float)windowH + 1.0f);
+                                g_toastBandLive = true;
+                            }
                             if (g_fwZone.available) {
                                 // Local2D takes a PIXEL rect in the window.
                                 int32_t rx = (int32_t)(tr.x * (float)windowW + 0.5f);
