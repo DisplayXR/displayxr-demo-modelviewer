@@ -55,6 +55,20 @@ struct ModelMaterial {
     int normalTex = -1;
     int occlusionTex = -1;
     int emissiveTex = -1;
+
+    // ── KHR_materials_* (issue #70 phase 2) ──────────────────────────────────
+    // Defaults are the glTF-specified "extension absent" values, so a material
+    // that declares none of these behaves exactly as it did before the
+    // extensions existed. Texture-driven variants of these factors
+    // (clearcoatTexture, sheenColorTexture, …) are not read yet — factors only.
+    float ior = 1.5f;                       // KHR_materials_ior (1.5 = f0 0.04)
+    float specularFactor = 1.0f;            // KHR_materials_specular
+    float specularColorFactor[3] = {1, 1, 1};
+    float clearcoatFactor = 0.0f;           // KHR_materials_clearcoat
+    float clearcoatRoughness = 0.0f;
+    float sheenColorFactor[3] = {0, 0, 0};  // KHR_materials_sheen (black = off)
+    float sheenRoughness = 0.0f;
+    float emissiveStrength = 1.0f;          // KHR_materials_emissive_strength
 };
 
 struct ModelPrimitive {

@@ -149,7 +149,24 @@ private:
         float model[16];
         float baseColorFactor[4];
         float mrParams[4];   // x=metallic, y=roughness, z=isSkinned(0/1), w=jointBase
-        float emissive[4];   // rgb
+        float emissive[4];   // rgb, w = index into the material-extension SSBO
+    };
+
+    // Per-material KHR_materials_* factors (set 0, binding 1; std430).
+    //
+    // These live in an SSBO rather than push constants because they don't fit:
+    // the push block is already 112 of the 128 bytes Vulkan guarantees, and the
+    // tier-1 extensions alone need ~18 floats. Indexing by material (passed in
+    // PushBlock::emissive[3]) keeps it to one buffer and one binding no matter
+    // how many extensions land later.
+    //
+    // Packing is dictated by std430 vec4 alignment — five vec4s, 80 bytes.
+    struct MaterialExtGpu {
+        float p0[4];   // ior, specularFactor, clearcoatFactor, clearcoatRoughness
+        float p1[4];   // specularColorFactor.rgb, sheenRoughness
+        float p2[4];   // sheenColorFactor.rgb, emissiveStrength
+        float p3[4];   // reserved — anisotropy (strength, rotation), iridescence
+        float p4[4];   // reserved — iridescence (factor, ior, thickness min/max)
     };
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag} + skybox.frag).
     struct UniformBlock {
@@ -226,6 +243,12 @@ private:
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
     ModelBuffer uniformBuffer_;   // host-visible UniformBlock
+    // Host-visible MaterialExtGpu[]; rebuilt per model load. Always holds at
+    // least one (all-default) entry so the binding is valid even for a model
+    // with no materials at all.
+    ModelBuffer materialExtBuffer_;
+    uint32_t    materialExtCount_ = 0;
+    bool uploadMaterialExtensions(const std::vector<ModelMaterial>& mats);
 
     // ── Material textures (set = 1: 5 combined image samplers) ───────────
     VkSampler sampler_ = VK_NULL_HANDLE;

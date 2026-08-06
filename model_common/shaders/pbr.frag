@@ -30,8 +30,22 @@ layout(push_constant) uniform Push {
     mat4 model;
     vec4 baseColorFactor;  // linear (glTF factor)
     vec4 mrParams;         // x=metallic factor, y=roughness factor
-    vec4 emissive;         // rgb emissive factor (linear)
+    vec4 emissive;         // rgb emissive factor (linear), w = material index
 } pc;
+
+// Per-material KHR_materials_* factors (issue #70 phase 2). An SSBO rather than
+// push constants because the push block is already 112 of the guaranteed 128
+// bytes. Indexed by pc.emissive.w. See ModelRenderer::MaterialExtGpu.
+struct MatExt {
+    vec4 p0;   // ior, specularFactor, clearcoatFactor, clearcoatRoughness
+    vec4 p1;   // specularColorFactor.rgb, sheenRoughness
+    vec4 p2;   // sheenColorFactor.rgb, emissiveStrength
+    vec4 p3;   // reserved (anisotropy)
+    vec4 p4;   // reserved (iridescence)
+};
+layout(set = 0, binding = 1, std430) readonly buffer MatExtBuf {
+    MatExt materials[];
+} matExt;
 
 // Set 1: per-material textures. Absent maps default to white / flat normal.
 layout(set = 1, binding = 0) uniform sampler2D baseColorTex;
@@ -88,6 +102,21 @@ vec3 F_SchlickRoughness(float cosT, vec3 f0, float rough) {
     return f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
 
+// ── KHR_materials_sheen ─────────────────────────────────────────────────────
+// Charlie distribution + Ashikhmin visibility, as specified by the extension.
+// Models retroreflective fabric fuzz, which GGX cannot: the lobe peaks at
+// grazing angles rather than around the mirror direction.
+float D_Charlie(float ndoth, float sheenRough) {
+    float alpha = max(sheenRough * sheenRough, 1e-4);
+    float invAlpha = 1.0 / alpha;
+    float cos2h = ndoth * ndoth;
+    float sin2h = max(1.0 - cos2h, 1e-7);
+    return (2.0 + invAlpha) * pow(sin2h, invAlpha * 0.5) / (2.0 * PI);
+}
+float V_Ashikhmin(float ndotl, float ndotv) {
+    return clamp(1.0 / (4.0 * (ndotl + ndotv - ndotl * ndotv)), 0.0, 1.0);
+}
+
 // Tangent-free normal mapping (Christian Schüler). Builds a cotangent frame
 // from screen-space derivatives of position + uv, so no TANGENT attribute is
 // needed. N is the (viewer-facing) geometric normal.
@@ -140,12 +169,31 @@ void main() {
     float ndotv = max(dot(N, V), 1e-4);
     float ndoth = max(dot(N, H), 0.0);
 
-    vec3 f0 = mix(vec3(0.04), albedo, metallic);
+    MatExt me = matExt.materials[int(pc.emissive.w + 0.5)];
+    float ior                = me.p0.x;
+    float specularFactor     = me.p0.y;
+    float clearcoatFactor    = me.p0.z;
+    float clearcoatRoughness = clamp(me.p0.w, 0.03, 1.0);
+    vec3  specularColor      = me.p1.rgb;
+    float sheenRoughness     = clamp(me.p1.w, 0.05, 1.0);
+    vec3  sheenColor         = me.p2.rgb;
+    float emissiveStrength   = me.p2.w;
+
+    // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────
+    // The dielectric reflectance is no longer hard-coded at 0.04. That constant
+    // was only ever the value for ior 1.5; with the extensions present it is
+    // derived, then tinted and scaled. Metals keep taking f0 from base colour —
+    // both extensions only affect the dielectric lobe, per spec.
+    float iorF0 = (ior - 1.0) / (ior + 1.0);
+    vec3 dielF0 = min(vec3(iorF0 * iorF0) * specularColor, vec3(1.0)) * specularFactor;
+    vec3 f0 = mix(dielF0, albedo, metallic);
+    vec3 f90 = vec3(mix(specularFactor, 1.0, metallic));
 
     // Direct directional light.
     float D = D_GGX(ndoth, a);
     float G = G_SchlickSmith(ndotv, ndotl, a);
-    vec3  F = F_Schlick(max(dot(H, V), 0.0), f0);
+    float vdoth = max(dot(H, V), 0.0);
+    vec3  F = f0 + (f90 - f0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0);
     vec3 spec = (D * G) * F / max(4.0 * ndotv * ndotl, 1e-4);
     vec3 kd = (1.0 - F) * (1.0 - metallic);
     // Direct light is scaled by ubo.tone.z, which the renderer drops to 0 when
@@ -164,10 +212,56 @@ void main() {
     vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
     vec3 ambient = (diffuseIBL + specularIBL) * ao;
 
+    vec3 color = direct + ambient;
+
+    // ── KHR_materials_sheen ──────────────────────────────────────────────────
+    // Added on top of the base layer, direct + a cheap ambient term. NOTE: the
+    // spec's energy compensation (scaling the base by 1 - max(sheenColor)*E,
+    // where E is the sheen directional albedo) needs a lookup table we don't
+    // generate, so it is omitted — sheen here adds energy rather than
+    // redistributing it. Documented as an approximation in the README; it shows
+    // up as a fabric that is slightly too bright at grazing angles.
+    if (max(sheenColor.r, max(sheenColor.g, sheenColor.b)) > 0.0) {
+        float sheenD = D_Charlie(ndoth, sheenRoughness);
+        float sheenV = V_Ashikhmin(ndotl, ndotv);
+        color += sheenColor * sheenD * sheenV * 3.0 * ubo.tone.z * ndotl;
+        // Ambient sheen: the irradiance cube stands in for the full integral.
+        color += sheenColor * texture(irradianceMap, N).rgb
+               * pow(1.0 - ndotv, 3.0) * ao;
+    }
+
+    // ── KHR_materials_clearcoat ──────────────────────────────────────────────
+    // A second, always-dielectric GGX lobe (ior 1.5 → f0 0.04) layered over
+    // everything above. The base is attenuated by the coat's Fresnel so the
+    // layering conserves energy: what the coat reflects, the base doesn't get.
+    // The coat uses the same normal as the base — KHR_materials_clearcoat also
+    // allows a separate clearcoatNormalTexture, which we don't read.
+    if (clearcoatFactor > 0.0) {
+        float ca = clearcoatRoughness * clearcoatRoughness;
+        float ccF = (0.04 + 0.96 * pow(clamp(1.0 - ndotv, 0.0, 1.0), 5.0)) * clearcoatFactor;
+
+        float ccD = D_GGX(ndoth, ca);
+        float ccG = G_SchlickSmith(ndotv, ndotl, ca);
+        float ccFd = (0.04 + 0.96 * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0));
+        float ccSpec = (ccD * ccG) * ccFd / max(4.0 * ndotv * ndotl, 1e-4);
+
+        vec2 ccAb = texture(brdfLUT, vec2(ndotv, clearcoatRoughness)).rg;
+        vec3 ccIbl = textureLod(prefilteredMap, reflect(-V, N), clearcoatRoughness * maxLod).rgb
+                   * (0.04 * ccAb.x + ccAb.y);
+
+        color = color * (1.0 - ccF)
+              + (vec3(ccSpec) * 3.0 * ubo.tone.z * ndotl + ccIbl * ao) * clearcoatFactor;
+    }
+
+    // ── KHR_materials_emissive_strength ──────────────────────────────────────
+    // A plain multiplier on the emissive term, which is exactly what lets an
+    // emissive surface exceed 1.0 and actually reach the tone curve's shoulder.
+    color += emissive * emissiveStrength;
+
     // Exposure + tone curve, THEN the transfer function. Tone mapping runs on
     // both swapchain paths — only the sRGB *encode* is conditional (an sRGB
     // swapchain format gets that from the blit's hardware write).
-    vec3 color = applyToneMapping(direct + ambient + emissive, ubo.tone);
+    color = applyToneMapping(color, ubo.tone);
     if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);
     outColor = vec4(color, baseSample.a * pc.baseColorFactor.a);
 }
