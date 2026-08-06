@@ -682,6 +682,21 @@ static void OpenLoadDialog() {
             if (g_input.renderingModeCount > 3) g_input.currentRenderingMode = 3;
             g_input.renderingModeChangeRequested = true;
             break;
+        // Viewing conditions (issue #70): exposure in quarter stops, and the
+        // tone curve. Both are reported in the HUD so a screen capture records
+        // the grading it was taken under.
+        case '[':
+            g_modelRenderer.setExposureEV(g_modelRenderer.exposureEV() - 0.25f);
+            LOG_INFO("Exposure: %+.2f EV", g_modelRenderer.exposureEV());
+            break;
+        case ']':
+            g_modelRenderer.setExposureEV(g_modelRenderer.exposureEV() + 0.25f);
+            LOG_INFO("Exposure: %+.2f EV", g_modelRenderer.exposureEV());
+            break;
+        case 'g': case 'G':   // grading: cycle the tone curve (T is eye-tracking)
+            g_modelRenderer.cycleToneCurve();
+            LOG_INFO("Tone curve: %s", g_modelRenderer.toneCurveName());
+            break;
         case '\t':
             g_input.hudVisible = !g_input.hudVisible;
             break;
@@ -2011,6 +2026,24 @@ static void ApplyAutoFitForLoadedScene() {
     // +Y-up convention. No runtime view-stage flips needed.
 }
 
+// A bundled environment.hdr, when present next to the exe, becomes the IBL
+// source at startup (issue #70). Absent, the viewer keeps the procedural
+// analytic sky — so this is purely additive and the demo still runs with no
+// environment asset at all. Either way the HUD names the active environment,
+// which is what makes a reference capture self-documenting.
+static void TryAutoLoadBundledEnvironment() {
+    std::string dir = ExeDir();
+    if (dir.empty()) return;
+    std::string path = dir + "/environment.hdr";
+    if (!FileExists(path)) {
+        LOG_INFO("No bundled environment.hdr (using the procedural analytic sky)");
+        return;
+    }
+    if (g_modelRenderer.setEnvironment(path.c_str())) {
+        LOG_INFO("Environment: %s", g_modelRenderer.environmentName().c_str());
+    }
+}
+
 static void TryAutoLoadBundledScene() {
     std::string dir = ExeDir();
     if (dir.empty()) return;
@@ -2159,12 +2192,17 @@ int main() {
     // Reflect initial state in top-bar buttons.
     UpdateTopBarButtonTitles(xr);
 
+    // Environment before model: setEnvironment rebakes the IBL cubes, and doing
+    // it first means the model's first rendered frame is already lit correctly.
+    TryAutoLoadBundledEnvironment();
+
     // Try loading the bundled sample.glb model (copied next to the exe by CMake).
     TryAutoLoadBundledScene();
 
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
     LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
+    LOG_INFO("          [/]=Exposure  G=Tone curve  (drop an .hdr to change the environment)");
     LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.glb/.gltf also accept drag-and-drop)");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -2654,6 +2692,7 @@ int main() {
                         @"%s\nSession: %d\n"
                         "Mode: %s (%s, %u view%s)\n"
                         "%@\n"
+                        "Env: %s  EV %+.2f  Tone: %s\n"
                         "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s\n"
                         "FPS: %.0f (%.1f ms)\n"
                         "Render: %ux%u  Window: %ux%u\n"
@@ -2662,12 +2701,15 @@ int main() {
                         "Vdisplay: (%.2f, %.2f, %.2f)\n"
                         "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
                         "DblClick=Focus  -/= Depth  Space=Reset  N=Clip  K=Play/Pause\n"
-                        "M=Auto-Orbit  V=Mode  L=Load  Tab=HUD  ESC=Quit",
+                        "M=Auto-Orbit  V=Mode  L=Load  [/]=Exposure  G=Tone\n"
+                        "Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",
                         (xr.renderingModeCount > 0 ? (xr.renderingModeDisplay3D[g_input.currentRenderingMode] ? "3D" : "2D") : "3D"),
                         activeViewCount, activeViewCount == 1 ? "" : "s",
                         sceneInfo,
+                        g_modelRenderer.environmentName().c_str(),
+                        g_modelRenderer.exposureEV(), g_modelRenderer.toneCurveName(),
                         depthPct, g_input.viewParams.scaleFactor, orbitLabel,
                         fps, g_avgFrameTime * 1000.0,
                         g_renderW, g_renderH, g_windowW, g_windowH,

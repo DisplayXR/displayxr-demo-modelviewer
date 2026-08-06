@@ -5,10 +5,12 @@
 // glTF material texture set (base-color, metallic-roughness, normal, occlusion,
 // emissive), sRGB-correct sampling, tangent-free normal mapping (Schüler's
 // cotangent frame from screen-space derivatives), one directional light, and a
-// hemispherical-ambient stand-in for IBL (so metal reflects sky/ground instead
-// of going black). Real image-based lighting (env cubemap + prefiltered specular
-// + BRDF LUT) is the remaining follow-up. See ../../PORTING.md.
+// image-based lighting (irradiance + prefiltered specular + BRDF LUT, baked
+// from the active environment), and an explicit exposure + named tone curve
+// (tonemap.glsl). See ../../PORTING.md.
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "tonemap.glsl"
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -21,6 +23,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 cameraPos;
     vec4 lightDir;     // .xyz = light dir, .w = clipFar (view-space; 0=off)
     mat4 invViewProj;  // (skybox only)
+    vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale
 } ubo;
 
 layout(push_constant) uniform Push {
@@ -134,7 +137,11 @@ void main() {
     vec3  F = F_Schlick(max(dot(H, V), 0.0), f0);
     vec3 spec = (D * G) * F / max(4.0 * ndotv * ndotl, 1e-4);
     vec3 kd = (1.0 - F) * (1.0 - metallic);
-    vec3 direct = (kd * albedo / PI + spec) * vec3(3.0) * ndotl;
+    // Direct light is scaled by ubo.tone.z, which the renderer drops to 0 when
+    // an HDRI environment is active: a real capture already contains its own
+    // sun, so keeping the analytic key light would double-count the dominant
+    // light source and quietly break any authoring-tool comparison.
+    vec3 direct = (kd * albedo / PI + spec) * vec3(3.0 * ubo.tone.z) * ndotl;
 
     // Ambient = image-based lighting (split-sum): irradiance cube for diffuse,
     // prefiltered cube + BRDF LUT for specular.
@@ -146,7 +153,10 @@ void main() {
     vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
     vec3 ambient = (diffuseIBL + specularIBL) * ao;
 
-    vec3 color = direct + ambient + emissive;
+    // Exposure + tone curve, THEN the transfer function. Tone mapping runs on
+    // both swapchain paths — only the sRGB *encode* is conditional (an sRGB
+    // swapchain format gets that from the blit's hardware write).
+    vec3 color = applyToneMapping(direct + ambient + emissive, ubo.tone);
     if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);
     outColor = vec4(color, baseSample.a * pc.baseColorFactor.a);
 }

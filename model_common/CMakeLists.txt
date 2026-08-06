@@ -121,7 +121,9 @@ set(SHADER_SOURCES
 # GLSL #include dependencies (force recompile when these change).
 set(SHADER_INCLUDES
     ${SHADER_INCLUDE_DIR}/sky.glsl
+    ${SHADER_INCLUDE_DIR}/env.glsl
     ${SHADER_INCLUDE_DIR}/ibl_common.glsl
+    ${SHADER_INCLUDE_DIR}/tonemap.glsl
 )
 
 set(SHADER_HEADERS "")

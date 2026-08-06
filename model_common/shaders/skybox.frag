@@ -8,6 +8,8 @@
 // sun disk, hard gradients) cause lightfield cross-talk / ghosting. A soft sky
 // stays comfortable. Drawn (opaque mode only) behind the model, depth off.
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "tonemap.glsl"
 
 layout(location = 0) in vec2 inUV;   // NDC [-1,1]
 
@@ -17,6 +19,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 cameraPos;
     vec4 lightDir;
     mat4 invViewProj;
+    vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale
 } ubo;
 layout(set = 2, binding = 1) uniform samplerCube prefilteredMap;
 
@@ -37,7 +40,9 @@ void main() {
     vec3 dir = normalize(world - ubo.cameraPos.xyz);
     // Blur the background: sample well up the roughness-mip chain.
     float lod = float(textureQueryLevels(prefilteredMap) - 1) * 0.6;
-    vec3 color = textureLod(prefilteredMap, dir, lod).rgb;
+    // Same exposure + curve as pbr.frag — the background and the model must be
+    // graded identically or the model reads as pasted onto the environment.
+    vec3 color = applyToneMapping(textureLod(prefilteredMap, dir, lod).rgb, ubo.tone);
     if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);
     outColor = vec4(color, 1.0);
 }
