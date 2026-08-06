@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+# Copyright 2026, The DisplayXR Project and its contributors
+# SPDX-License-Identifier: Apache-2.0
+"""
+Generate the material-grid reference scene: assets/material_grid.glb
+
+Phase 1 of issue #70. A sphere per material axis, laid out as a grid — one row
+per material family, one column per step of that family's parameter sweep.
+
+Why a generator and not a checked-in binary
+-------------------------------------------
+The grid is a *measurement instrument*, not art. Every value in it needs to be
+inspectable and re-derivable: when a phase 2 shader change moves a pixel, the
+question is always "what exactly is that sphere's roughness / clearcoat /
+anisotropy?", and a 300 KB opaque .glb can't answer it. The script can, and it
+regenerates byte-identical output.
+
+It deliberately writes the real `KHR_materials_*` extensions even though the
+viewer implements none of them today. That makes it three things at once:
+
+  1. the development target for phase 2 (implement a row, watch it come alive);
+  2. the asset that proves unsupported features degrade *explicitly* — every row
+     from CLEARCOAT down currently renders as its base metallic-roughness layer,
+     which is the correct fallback, and the viewer should say so rather than
+     silently pretend;
+  3. a stable reference the OpenPBR-authored hero scene can be checked against.
+
+The extensions go in `extensionsUsed`, never `extensionsRequired`, so a
+conformant loader that doesn't implement them still loads the file instead of
+refusing it.
+
+Usage:
+    python3 scripts/make_material_grid.py [out.glb]
+"""
+
+import json
+import math
+import struct
+import sys
+from pathlib import Path
+
+# ── Geometry ────────────────────────────────────────────────────────────────
+LON, LAT = 48, 32          # sphere tessellation (smooth enough for a specular ref)
+RADIUS = 0.45
+SPACING = 1.0              # centre-to-centre, so 0.1 of gap between spheres
+STEPS = 7                  # columns = sweep steps per family
+
+
+def uv_sphere(radius, lon, lat):
+    """Positions / normals / uvs / indices for a lat-long sphere, +Y up."""
+    pos, nrm, uv, idx = [], [], [], []
+    for j in range(lat + 1):
+        v = j / lat
+        theta = v * math.pi
+        st, ct = math.sin(theta), math.cos(theta)
+        for i in range(lon + 1):
+            u = i / lon
+            phi = u * 2.0 * math.pi
+            sp, cp = math.sin(phi), math.cos(phi)
+            n = (st * cp, ct, st * sp)
+            nrm.append(n)
+            pos.append((n[0] * radius, n[1] * radius, n[2] * radius))
+            uv.append((u, v))
+    for j in range(lat):
+        for i in range(lon):
+            a = j * (lon + 1) + i
+            b = a + lon + 1
+            # CCW when viewed from outside, matching glTF's front-face winding.
+            idx += [a, b, a + 1, a + 1, b, b + 1]
+    return pos, nrm, uv, idx
+
+
+# ── Material families ───────────────────────────────────────────────────────
+# Each entry: (row label, docstring, builder(t) -> glTF material dict) where t
+# sweeps 0..1 across the row. Base colours are chosen so a family stays
+# recognisable at a glance once its extension is implemented.
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def pbr(base, metallic, roughness):
+    return {"baseColorFactor": list(base) + [1.0],
+            "metallicFactor": metallic,
+            "roughnessFactor": roughness}
+
+
+def m_dielectric(t):
+    return {"pbrMetallicRoughness": pbr((0.80, 0.80, 0.82), 0.0, max(0.03, t))}
+
+
+def m_metal(t):
+    return {"pbrMetallicRoughness": pbr((0.94, 0.78, 0.38), 1.0, max(0.03, t))}
+
+
+def m_clearcoat(t):
+    return {"pbrMetallicRoughness": pbr((0.55, 0.06, 0.06), 0.0, 0.55),
+            "extensions": {"KHR_materials_clearcoat": {
+                "clearcoatFactor": t, "clearcoatRoughnessFactor": 0.06}}}
+
+
+def m_sheen(t):
+    return {"pbrMetallicRoughness": pbr((0.14, 0.20, 0.42), 0.0, 0.85),
+            "extensions": {"KHR_materials_sheen": {
+                "sheenColorFactor": [0.85, 0.80, 0.70],
+                "sheenRoughnessFactor": max(0.05, t)}}}
+
+
+def m_anisotropy(t):
+    return {"pbrMetallicRoughness": pbr((0.85, 0.85, 0.88), 1.0, 0.35),
+            "extensions": {"KHR_materials_anisotropy": {
+                "anisotropyStrength": t, "anisotropyRotation": 0.0}}}
+
+
+def m_iridescence(t):
+    return {"pbrMetallicRoughness": pbr((0.05, 0.05, 0.06), 0.0, 0.12),
+            "extensions": {"KHR_materials_iridescence": {
+                "iridescenceFactor": 1.0,
+                "iridescenceIor": 1.3,
+                "iridescenceThicknessMinimum": 100.0,
+                "iridescenceThicknessMaximum": lerp(200.0, 800.0, t)}}}
+
+
+def m_specular_ior(t):
+    return {"pbrMetallicRoughness": pbr((0.72, 0.72, 0.75), 0.0, 0.20),
+            "extensions": {
+                "KHR_materials_specular": {"specularFactor": t},
+                "KHR_materials_ior": {"ior": lerp(1.0, 2.0, t)}}}
+
+
+def m_transmission(t):
+    return {"pbrMetallicRoughness": pbr((1.0, 1.0, 1.0), 0.0, 0.05),
+            "extensions": {
+                "KHR_materials_transmission": {"transmissionFactor": t},
+                "KHR_materials_ior": {"ior": 1.5},
+                "KHR_materials_volume": {
+                    "thicknessFactor": 0.9,
+                    "attenuationDistance": 1.5,
+                    "attenuationColor": [0.85, 0.95, 0.92]}}}
+
+
+def m_emissive(t):
+    return {"pbrMetallicRoughness": pbr((0.02, 0.02, 0.02), 0.0, 0.6),
+            "emissiveFactor": [0.10, 0.55, 0.85],
+            "extensions": {"KHR_materials_emissive_strength": {
+                "emissiveStrength": lerp(0.0, 6.0, t)}}}
+
+
+ROWS = [
+    ("dielectric",   "metallic 0, roughness 0.03 → 1.0",            m_dielectric),
+    ("metal",        "metallic 1, roughness 0.03 → 1.0",            m_metal),
+    ("clearcoat",    "clearcoatFactor 0 → 1 over a rough red base", m_clearcoat),
+    ("sheen",        "sheenRoughnessFactor 0.05 → 1.0",             m_sheen),
+    ("anisotropy",   "anisotropyStrength 0 → 1 on a brushed metal", m_anisotropy),
+    ("iridescence",  "film thickness 200 → 800 nm",                 m_iridescence),
+    ("specular_ior", "specularFactor 0 → 1, ior 1.0 → 2.0",         m_specular_ior),
+    ("transmission", "transmissionFactor 0 → 1, ior 1.5, volume",   m_transmission),
+    ("emissive",     "emissiveStrength 0 → 6",                      m_emissive),
+]
+
+# Extensions this scene references. extensionsUsed ONLY — putting any of these
+# in extensionsRequired would make a conformant loader that lacks them refuse
+# the file, which defeats the point of it being a degradation test.
+EXTENSIONS_USED = [
+    "KHR_materials_clearcoat",
+    "KHR_materials_sheen",
+    "KHR_materials_anisotropy",
+    "KHR_materials_iridescence",
+    "KHR_materials_specular",
+    "KHR_materials_ior",
+    "KHR_materials_transmission",
+    "KHR_materials_volume",
+    "KHR_materials_emissive_strength",
+]
+
+
+def build_glb():
+    pos, nrm, uv, idx = uv_sphere(RADIUS, LON, LAT)
+
+    pos_b = b"".join(struct.pack("<3f", *p) for p in pos)
+    nrm_b = b"".join(struct.pack("<3f", *n) for n in nrm)
+    uv_b = b"".join(struct.pack("<2f", *t) for t in uv)
+    idx_b = b"".join(struct.pack("<H", i) for i in idx)
+    assert len(idx_b) % 4 == 0, "index block must stay 4-byte aligned"
+    blob = pos_b + nrm_b + uv_b + idx_b
+
+    pmin = [min(p[k] for p in pos) for k in range(3)]
+    pmax = [max(p[k] for p in pos) for k in range(3)]
+
+    off = 0
+    views = []
+    for data, target in ((pos_b, 34962), (nrm_b, 34962), (uv_b, 34962), (idx_b, 34963)):
+        views.append({"buffer": 0, "byteOffset": off, "byteLength": len(data), "target": target})
+        off += len(data)
+
+    accessors = [
+        {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3",
+         "min": pmin, "max": pmax},
+        {"bufferView": 1, "componentType": 5126, "count": len(nrm), "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5126, "count": len(uv), "type": "VEC2"},
+        {"bufferView": 3, "componentType": 5123, "count": len(idx), "type": "SCALAR"},
+    ]
+
+    materials, meshes, nodes, layout = [], [], [], []
+    rows, cols = len(ROWS), STEPS
+    for r, (name, doc, make) in enumerate(ROWS):
+        for c in range(cols):
+            t = c / (cols - 1)
+            mat = make(t)
+            mat["name"] = f"{r:02d}_{name}_{t:.2f}"
+            mi = len(materials)
+            materials.append(mat)
+            meshes.append({"name": mat["name"], "primitives": [{
+                "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2},
+                "indices": 3, "material": mi}]})
+            # Grid centred on the origin; row 0 on top, sweep running left→right.
+            x = (c - (cols - 1) / 2.0) * SPACING
+            y = ((rows - 1) / 2.0 - r) * SPACING
+            nodes.append({"name": mat["name"], "mesh": mi, "translation": [x, y, 0.0]})
+        layout.append(f"  row {r}  {name:<13} {doc}")
+
+    gltf = {
+        "asset": {"version": "2.0",
+                  "generator": "DisplayXR model-viewer material grid "
+                               "(scripts/make_material_grid.py, issue #70)"},
+        "extensionsUsed": EXTENSIONS_USED,
+        "scene": 0,
+        "scenes": [{"name": "material_grid", "nodes": list(range(len(nodes)))}],
+        "nodes": nodes,
+        "meshes": meshes,
+        "materials": materials,
+        "accessors": accessors,
+        "bufferViews": views,
+        "buffers": [{"byteLength": len(blob)}],
+    }
+
+    json_b = json.dumps(gltf, separators=(",", ":")).encode()
+    json_b += b" " * ((4 - len(json_b) % 4) % 4)          # pad with spaces
+    blob += b"\x00" * ((4 - len(blob) % 4) % 4)           # pad with zeros
+
+    total = 12 + 8 + len(json_b) + 8 + len(blob)
+    out = struct.pack("<III", 0x46546C67, 2, total)
+    out += struct.pack("<II", len(json_b), 0x4E4F534A) + json_b
+    out += struct.pack("<II", len(blob), 0x004E4942) + blob
+    return out, len(materials), rows, cols, layout
+
+
+def main():
+    dest = Path(sys.argv[1]) if len(sys.argv) > 1 else \
+        Path(__file__).resolve().parent.parent / "assets" / "material_grid.glb"
+    glb, nmat, rows, cols, layout = build_glb()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(glb)
+    print(f"wrote {dest} ({len(glb):,} bytes)")
+    print(f"{rows} families x {cols} steps = {nmat} materials, sweep runs left to right:")
+    print("\n".join(layout))
+
+
+if __name__ == "__main__":
+    main()

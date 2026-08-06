@@ -170,6 +170,15 @@ struct ModelData {
     float bboxMin[3] = {0, 0, 0};
     float bboxMax[3] = {0, 0, 0};
     bool  hasBBox = false;
+
+    // glTF extensions the file declares in `extensionsUsed` that this renderer
+    // does NOT implement (issue #70). Recorded so the viewer can say so out
+    // loud: an unimplemented KHR_materials_* extension is not a load failure —
+    // the base metallic-roughness layer still renders, which is the correct
+    // fallback — but it IS a silent difference from what the author saw, and a
+    // material-fidelity demo must never let that pass unremarked. Empty for a
+    // file that uses nothing we lack. Populated by the glTF backend only.
+    std::vector<std::string> unsupportedExtensions;
 };
 
 // Parse a glTF 2.0 file (.glb or .gltf). Returns false on parse failure or if

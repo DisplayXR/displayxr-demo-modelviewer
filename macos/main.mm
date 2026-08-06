@@ -2676,6 +2676,14 @@ int main() {
                     NSString *sceneInfo = g_modelRenderer.hasModel()
                         ? [NSString stringWithFormat:@"Model: %s", g_loadedFileName.c_str()]
                         : @"No model loaded (Ctrl+O)";
+                    // Say out loud when the asset uses material extensions we
+                    // don't implement — those materials are rendering as their
+                    // base layer, and #70 forbids letting that pass silently.
+                    const std::string unsup = g_modelRenderer.unsupportedExtensionsSummary();
+                    if (!unsup.empty()) {
+                        sceneInfo = [sceneInfo stringByAppendingFormat:
+                            @"\n  ! ignoring: %s", unsup.c_str()];
+                    }
 
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
                     const char *orbitLabel = g_input.animateEnabled
