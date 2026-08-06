@@ -54,6 +54,52 @@ bool LoadImageStb(tinygltf::Image* image, const int /*imageIdx*/, std::string* e
     return true;
 }
 
+// ── KHR_materials_* factor extraction (issue #70 phase 2) ───────────────────
+// tinygltf exposes extensions as a generic Value tree, so these are the small
+// accessors that turn "maybe there's a number under this key" into a float.
+// Absent keys leave the caller's default untouched, which is what the glTF spec
+// requires — every extension property has a defined default and omitting the
+// property must behave identically to supplying that default.
+
+double extNumber(const tinygltf::Value& obj, const char* key, double fallback) {
+    if (!obj.IsObject() || !obj.Has(key)) return fallback;
+    const tinygltf::Value& v = obj.Get(key);
+    return v.IsNumber() ? v.GetNumberAsDouble() : fallback;
+}
+
+void extVec3(const tinygltf::Value& obj, const char* key, float out[3]) {
+    if (!obj.IsObject() || !obj.Has(key)) return;
+    const tinygltf::Value& a = obj.Get(key);
+    if (!a.IsArray() || a.ArrayLen() < 3) return;
+    for (int i = 0; i < 3; ++i) {
+        const tinygltf::Value& c = a.Get(i);
+        if (c.IsNumber()) out[i] = (float)c.GetNumberAsDouble();
+    }
+}
+
+void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm) {
+    auto ext = [&](const char* name) -> const tinygltf::Value* {
+        auto it = mat.extensions.find(name);
+        return it == mat.extensions.end() ? nullptr : &it->second;
+    };
+    if (const tinygltf::Value* v = ext("KHR_materials_ior"))
+        mm.ior = (float)extNumber(*v, "ior", mm.ior);
+    if (const tinygltf::Value* v = ext("KHR_materials_specular")) {
+        mm.specularFactor = (float)extNumber(*v, "specularFactor", mm.specularFactor);
+        extVec3(*v, "specularColorFactor", mm.specularColorFactor);
+    }
+    if (const tinygltf::Value* v = ext("KHR_materials_clearcoat")) {
+        mm.clearcoatFactor    = (float)extNumber(*v, "clearcoatFactor", mm.clearcoatFactor);
+        mm.clearcoatRoughness = (float)extNumber(*v, "clearcoatRoughnessFactor", mm.clearcoatRoughness);
+    }
+    if (const tinygltf::Value* v = ext("KHR_materials_sheen")) {
+        extVec3(*v, "sheenColorFactor", mm.sheenColorFactor);
+        mm.sheenRoughness = (float)extNumber(*v, "sheenRoughnessFactor", mm.sheenRoughness);
+    }
+    if (const tinygltf::Value* v = ext("KHR_materials_emissive_strength"))
+        mm.emissiveStrength = (float)extNumber(*v, "emissiveStrength", mm.emissiveStrength);
+}
+
 // Compose a node's local transform: explicit matrix if present, else T*R*S.
 glm::mat4 nodeLocalMatrix(const tinygltf::Node& node) {
     if (node.matrix.size() == 16) {
@@ -349,9 +395,17 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
     // those, so reaching here means every omission is survivable.
     {
         static const char* kImplemented[] = {
-            // Nothing yet beyond core metallic-roughness. Phase 2 adds entries
-            // here as each extension lands; keep in lockstep with the README
-            // support matrix.
+            // Phase 2 tier 1. Factors only — the texture-driven variants of
+            // these properties (clearcoatTexture, sheenColorTexture, …) are not
+            // read, which is a partial implementation rather than a missing one
+            // and is called out in the README matrix. Add an entry here the
+            // moment an extension's shading lands, and keep this list in
+            // lockstep with that matrix.
+            "KHR_materials_ior",
+            "KHR_materials_specular",
+            "KHR_materials_clearcoat",
+            "KHR_materials_sheen",
+            "KHR_materials_emissive_strength",
             nullptr
         };
         for (const std::string& ext : model.extensionsUsed) {
@@ -412,7 +466,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         return out.textures[src].rgba.empty() ? -1 : src;  // -1 → renderer default
     };
 
-    // Materials (factors + texture refs).
+    // Materials (factors + texture refs + KHR_materials_* factors).
     out.materials.reserve(model.materials.size());
     for (const auto& mat : model.materials) {
         ModelMaterial mm{};
@@ -428,6 +482,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         mm.normalTex             = resolveTex(mat.normalTexture.index);
         mm.occlusionTex          = resolveTex(mat.occlusionTexture.index);
         mm.emissiveTex           = resolveTex(mat.emissiveTexture.index);
+        parseMaterialExtensions(mat, mm);
         out.materials.push_back(mm);
     }
 

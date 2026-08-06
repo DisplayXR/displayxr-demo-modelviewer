@@ -298,15 +298,22 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
 }
 
 bool ModelRenderer::createPipeline() {
-    // Set-0: one UBO, visible to vertex + fragment.
-    VkDescriptorSetLayoutBinding b0 = {};
-    b0.binding = 0;
-    b0.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    b0.descriptorCount = 1;
-    b0.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Set-0: binding 0 = the per-frame UBO (vertex + fragment); binding 1 = the
+    // per-material KHR_materials_* factor SSBO (fragment), indexed by the
+    // material id in the push block. See MaterialExtGpu for why it isn't a push
+    // constant.
+    VkDescriptorSetLayoutBinding b0[2] = {};
+    b0[0].binding = 0;
+    b0[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b0[0].descriptorCount = 1;
+    b0[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    b0[1].binding = 1;
+    b0[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b0[1].descriptorCount = 1;
+    b0[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo dlci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dlci.bindingCount = 1;
-    dlci.pBindings = &b0;
+    dlci.bindingCount = 2;
+    dlci.pBindings = b0;
     if (vkCreateDescriptorSetLayout(device_, &dlci, nullptr, &dsLayout_) != VK_SUCCESS) return false;
 
     // Set 1: per-material textures — base color, MR, normal, occlusion, emissive.
@@ -466,11 +473,12 @@ bool ModelRenderer::createPipeline() {
     }
 
     // Descriptor pool + set + the host-visible uniform buffer.
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 1;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &ps;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes = ps;
     if (vkCreateDescriptorPool(device_, &dpci, nullptr, &descriptorPool_) != VK_SUCCESS) return false;
 
     VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -491,6 +499,70 @@ bool ModelRenderer::createPipeline() {
     w.descriptorCount = 1;
     w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     w.pBufferInfo = &dbi;
+    vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+
+    // Seed binding 1 with a single all-default entry. A model may load before
+    // any material extensions exist (or have no materials at all), and the
+    // descriptor must reference a live buffer on the very first draw either way.
+    if (!uploadMaterialExtensions({})) return false;
+    return true;
+}
+
+// Pack the loaded materials' KHR_materials_* factors into the set-0 SSBO and
+// point the descriptor at it. Called on every model load; the buffer is
+// reallocated because material counts vary wildly between assets (1 for a cube,
+// 63 for the phase 1 material grid).
+bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& mats) {
+    std::vector<MaterialExtGpu> gpu;
+    gpu.reserve(mats.empty() ? 1 : mats.size());
+    for (const ModelMaterial& m : mats) {
+        MaterialExtGpu g{};
+        g.p0[0] = m.ior;
+        g.p0[1] = m.specularFactor;
+        g.p0[2] = m.clearcoatFactor;
+        g.p0[3] = m.clearcoatRoughness;
+        g.p1[0] = m.specularColorFactor[0];
+        g.p1[1] = m.specularColorFactor[1];
+        g.p1[2] = m.specularColorFactor[2];
+        g.p1[3] = m.sheenRoughness;
+        g.p2[0] = m.sheenColorFactor[0];
+        g.p2[1] = m.sheenColorFactor[1];
+        g.p2[2] = m.sheenColorFactor[2];
+        g.p2[3] = m.emissiveStrength;
+        gpu.push_back(g);
+    }
+    if (gpu.empty()) {
+        // Defaults matching ModelMaterial's: ior 1.5, specular on, no coat, no
+        // sheen, emissive strength 1 — i.e. "behaves as if no extension exists".
+        MaterialExtGpu g{};
+        g.p0[0] = 1.5f; g.p0[1] = 1.0f;
+        g.p1[0] = g.p1[1] = g.p1[2] = 1.0f;
+        g.p2[3] = 1.0f;
+        gpu.push_back(g);
+    }
+
+    if (materialExtBuffer_.buffer != VK_NULL_HANDLE) {
+        vkQueueWaitIdle(queue_);
+        modelDestroyBuffer(device_, materialExtBuffer_);
+    }
+    const VkDeviceSize bytes = (VkDeviceSize)gpu.size() * sizeof(MaterialExtGpu);
+    materialExtBuffer_ = modelCreateBuffer(device_, physDevice_, bytes,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (materialExtBuffer_.buffer == VK_NULL_HANDLE) return false;
+    void* mapped = nullptr;
+    vkMapMemory(device_, materialExtBuffer_.memory, 0, bytes, 0, &mapped);
+    std::memcpy(mapped, gpu.data(), (size_t)bytes);
+    vkUnmapMemory(device_, materialExtBuffer_.memory);
+    materialExtCount_ = (uint32_t)gpu.size();
+
+    VkDescriptorBufferInfo bi = {materialExtBuffer_.buffer, 0, bytes};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = descriptorSet_;
+    w.dstBinding = 1;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &bi;
     vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
     return true;
 }
@@ -1041,6 +1113,7 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
             modelTextures_[i] = uploadTexture(md.textures[i]);
 
     materials_ = std::move(md.materials);
+    if (!uploadMaterialExtensions(materials_)) return false;
     primitives_ = std::move(md.primitives);
 
     // Animation graph (Phase 1). Auto-play the first clip; no clips → static
@@ -1817,6 +1890,12 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         pb.emissive[0] = m.emissive[0];
         pb.emissive[1] = m.emissive[1];
         pb.emissive[2] = m.emissive[2];
+        // .w indexes the material-extension SSBO. A primitive with no material
+        // (-1) falls to slot 0, which uploadMaterialExtensions guarantees exists
+        // and — for a model with no materials at all — holds the glTF defaults.
+        const int extIdx = (p.material >= 0 && (uint32_t)p.material < materialExtCount_)
+                         ? p.material : 0;
+        pb.emissive[3] = (float)extIdx;
         vkCmdPushConstants(cmd, pipelineLayout_,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(PushBlock), &pb);
@@ -1953,6 +2032,7 @@ void ModelRenderer::cleanup() {
         *c = {};
     }
     if (uniformBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, uniformBuffer_);
+    if (materialExtBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, materialExtBuffer_);
     if (descriptorPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
