@@ -63,7 +63,18 @@ float G_SchlickSmith(float ndotv, float ndotl, float a) {
 vec3 F_Schlick(float cosT, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
-vec3 srgbToLinear(vec3 c) { return pow(c, vec3(2.2)); }
+// sRGB EOTF (accurate piecewise). MUST be the exact inverse of linearToSrgb()
+// below, or the pipeline is not transfer-function-neutral: a texel that should
+// survive a round trip unchanged comes back shifted. The old pow(c, 2.2)
+// approximation crushed shadows badly while leaving midtones alone — 0.05
+// returned as 0.018 (-64%), 0.10 as 0.073 (-27%), 0.35 as 0.348 (-0.6%) — which
+// reads as "the scene is a bit dark" and would have been silently charged to
+// the material rather than to the decode (issue #70).
+vec3 srgbToLinear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(hi, lo, vec3(lessThanEqual(c, vec3(0.04045))));
+}
 // Inverse sRGB EOTF (accurate piecewise), for encoding the final linear color
 // into a UNORM swapchain. Gated by ubo.cameraPos.w (1 = encode, 0 = skip).
 vec3 linearToSrgb(vec3 c) {
