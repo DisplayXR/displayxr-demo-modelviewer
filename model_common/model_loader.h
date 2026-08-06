@@ -69,6 +69,12 @@ struct ModelMaterial {
     float sheenColorFactor[3] = {0, 0, 0};  // KHR_materials_sheen (black = off)
     float sheenRoughness = 0.0f;
     float emissiveStrength = 1.0f;          // KHR_materials_emissive_strength
+    float anisotropyStrength = 0.0f;        // KHR_materials_anisotropy
+    float anisotropyRotation = 0.0f;        // radians
+    float iridescenceFactor = 0.0f;         // KHR_materials_iridescence (0 = off)
+    float iridescenceIor = 1.3f;
+    float iridescenceThicknessMin = 100.0f; // nanometres
+    float iridescenceThicknessMax = 400.0f;
 };
 
 struct ModelPrimitive {

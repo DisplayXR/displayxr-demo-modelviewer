@@ -4,10 +4,10 @@
 // Metallic-roughness PBR fragment shader (Cook-Torrance GGX) with the full
 // glTF material texture set (base-color, metallic-roughness, normal, occlusion,
 // emissive), sRGB-correct sampling, tangent-free normal mapping (Schüler's
-// cotangent frame from screen-space derivatives), one directional light, and a
+// cotangent frame from screen-space derivatives), one directional light,
 // image-based lighting (irradiance + prefiltered specular + BRDF LUT, baked
-// from the active environment), and an explicit exposure + named tone curve
-// (tonemap.glsl). See ../../PORTING.md.
+// from the active environment), the tier-1 KHR_materials_* layers, and an
+// explicit exposure + named tone curve (tonemap.glsl). See ../../PORTING.md.
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "tonemap.glsl"
@@ -40,8 +40,8 @@ struct MatExt {
     vec4 p0;   // ior, specularFactor, clearcoatFactor, clearcoatRoughness
     vec4 p1;   // specularColorFactor.rgb, sheenRoughness
     vec4 p2;   // sheenColorFactor.rgb, emissiveStrength
-    vec4 p3;   // reserved (anisotropy)
-    vec4 p4;   // reserved (iridescence)
+    vec4 p3;   // anisotropyStrength, anisotropyRotation, iridescenceFactor, iridescenceIor
+    vec4 p4;   // iridescenceThicknessMin, iridescenceThicknessMax, unused x2
 };
 layout(set = 0, binding = 1, std430) readonly buffer MatExtBuf {
     MatExt materials[];
@@ -120,20 +120,125 @@ float V_Ashikhmin(float ndotl, float ndotv) {
 // Tangent-free normal mapping (Christian Schüler). Builds a cotangent frame
 // from screen-space derivatives of position + uv, so no TANGENT attribute is
 // needed. N is the (viewer-facing) geometric normal.
-vec3 perturbNormal(vec3 N, vec2 uv) {
-    vec3 mapN = texture(normalTex, uv).xyz * 2.0 - 1.0;
+// Builds the frame; `valid` is false when there's no usable UV gradient (a mesh
+// without TEXCOORD_0, e.g. AnimatedMorphCube) — T/B collapse to 0 there and
+// inversesqrt(0) would poison everything downstream with NaNs.
+void cotangentFrame(vec3 N, vec2 uv, out vec3 T, out vec3 B, out bool valid) {
     vec3 dp1 = dFdx(inWorldPos), dp2 = dFdy(inWorldPos);
     vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
     vec3 dp2perp = cross(dp2, N), dp1perp = cross(N, dp1);
-    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-    // No usable UV gradient (mesh without TEXCOORD_0, e.g. AnimatedMorphCube) →
-    // T/B collapse to 0 and inversesqrt(0) would poison N with NaNs. Keep the
-    // geometric normal in that case (a flat normal map is identity here anyway).
+    T = dp2perp * duv1.x + dp1perp * duv2.x;
+    B = dp2perp * duv1.y + dp1perp * duv2.y;
     float maxlen = max(dot(T, T), dot(B, B));
-    if (maxlen < 1e-12) return N;
+    valid = maxlen >= 1e-12;
+    if (!valid) { T = vec3(1.0, 0.0, 0.0); B = vec3(0.0, 1.0, 0.0); return; }
     float invmax = inversesqrt(maxlen);
-    return normalize(mat3(T * invmax, B * invmax, N) * mapN);
+    T *= invmax;
+    B *= invmax;
+}
+
+vec3 perturbNormal(vec3 N, vec2 uv, vec3 T, vec3 B, bool valid) {
+    if (!valid) return N;   // a flat normal map is identity here anyway
+    vec3 mapN = texture(normalTex, uv).xyz * 2.0 - 1.0;
+    return normalize(mat3(T, B, N) * mapN);
+}
+
+// ── KHR_materials_anisotropy ────────────────────────────────────────────────
+// Reference formulation from the extension spec (D and V verbatim).
+float D_GGX_anisotropic(float ndoth, float tdoth, float bdoth, float at, float ab) {
+    float a2 = at * ab;
+    vec3 f = vec3(ab * tdoth, at * bdoth, a2 * ndoth);
+    float w2 = a2 / dot(f, f);
+    return a2 * w2 * w2 / PI;
+}
+float V_GGX_anisotropic(float ndotl, float ndotv, float bdotv, float tdotv,
+                        float tdotl, float bdotl, float at, float ab) {
+    float ggxV = ndotl * length(vec3(at * tdotv, ab * bdotv, ndotv));
+    float ggxL = ndotv * length(vec3(at * tdotl, ab * bdotl, ndotl));
+    return clamp(0.5 / (ggxV + ggxL), 0.0, 1.0);
+}
+
+// ── KHR_materials_iridescence ───────────────────────────────────────────────
+// Thin-film interference, following the extension's reference implementation.
+// The colour does not come from a pigment: it's the wavelength-dependent
+// interference between light reflected off the top of a film and off the
+// substrate under it, so it swings with both view angle and film thickness.
+float sq(float x) { return x * x; }
+vec3  sq(vec3 x)  { return x * x; }
+
+float iorToFresnel0(float transmittedIor, float incidentIor) {
+    return sq((transmittedIor - incidentIor) / (transmittedIor + incidentIor));
+}
+vec3 iorToFresnel0(vec3 transmittedIor, float incidentIor) {
+    return sq((transmittedIor - vec3(incidentIor)) / (transmittedIor + vec3(incidentIor)));
+}
+vec3 fresnel0ToIor(vec3 f0) {
+    vec3 s = sqrt(clamp(f0, vec3(0.0), vec3(0.9999)));
+    return (vec3(1.0) + s) / (vec3(1.0) - s);
+}
+
+// Maps an optical path difference to an RGB response by integrating against
+// Gaussian fits of the CIE colour matching functions, then converting XYZ→sRGB.
+const mat3 XYZ_TO_REC709 = mat3(
+     3.2404542, -0.9692660,  0.0556434,
+    -1.5371385,  1.8760108, -0.2040259,
+    -0.4985314,  0.0415560,  1.0572252);
+
+vec3 evalSensitivity(float opd, vec3 shift) {
+    float phase = 2.0 * PI * opd * 1.0e-9;
+    vec3 val = vec3(5.4856e-13, 4.4201e-13, 5.2481e-13);
+    vec3 pos = vec3(1.6810e+06, 1.7953e+06, 2.2084e+06);
+    vec3 var = vec3(4.3278e+09, 9.3046e+09, 6.6121e+09);
+    vec3 xyz = val * sqrt(2.0 * PI * var) * cos(pos * phase + shift)
+             * exp(-sq(phase) * var);
+    xyz.x += 9.7470e-14 * sqrt(2.0 * PI * 4.5282e+09)
+           * cos(2.2399e+06 * phase + shift[0]) * exp(-4.5282e+09 * sq(phase));
+    xyz /= 1.0685e-7;
+    return XYZ_TO_REC709 * xyz;
+}
+
+vec3 evalIridescence(float outsideIor, float filmIor, float cosTheta1,
+                     float thickness, vec3 baseF0) {
+    // Thin film thinner than a wavelength behaves as if absent.
+    if (thickness < 1.0) return F_Schlick(cosTheta1, baseF0);
+
+    // Snell into the film. Total internal reflection → pure mirror.
+    float iridIor = mix(outsideIor, filmIor, smoothstep(0.0, 0.03, thickness));
+    float sinTheta2Sq = sq(outsideIor / iridIor) * (1.0 - sq(cosTheta1));
+    float cosTheta2Sq = 1.0 - sinTheta2Sq;
+    if (cosTheta2Sq < 0.0) return vec3(1.0);
+    float cosTheta2 = sqrt(cosTheta2Sq);
+
+    float r0 = iorToFresnel0(iridIor, outsideIor);
+    float r12 = F_Schlick(cosTheta1, vec3(r0)).x;
+    float t121 = 1.0 - r12;
+
+    vec3 baseIor = fresnel0ToIor(clamp(baseF0, vec3(0.0), vec3(0.9999)) + vec3(0.0001));
+    vec3 r1 = iorToFresnel0(baseIor, iridIor);
+    vec3 r23 = F_Schlick(cosTheta2, r1);
+
+    float opd = 2.0 * iridIor * thickness * cosTheta2;
+
+    // Half-wave phase shifts wherever light reflects off a denser medium.
+    float phi12 = iridIor < outsideIor ? PI : 0.0;
+    float phi21 = PI - phi12;
+    vec3 phi23 = vec3(baseIor.x < iridIor ? PI : 0.0,
+                      baseIor.y < iridIor ? PI : 0.0,
+                      baseIor.z < iridIor ? PI : 0.0);
+    vec3 phi = vec3(phi21) + phi23;
+
+    vec3 r123 = clamp(vec3(r12) * r23, vec3(1e-5), vec3(0.9999));
+    vec3 sqrtR123 = sqrt(r123);
+    vec3 rs = sq(t121) * r23 / (vec3(1.0) - r123);
+
+    vec3 I = vec3(r12) + rs;      // m = 0 term
+    vec3 cm = rs - vec3(t121);
+    for (int m = 1; m <= 2; ++m) {
+        cm *= sqrtR123;
+        vec3 sm = 2.0 * evalSensitivity(float(m) * opd, float(m) * phi);
+        I += cm * sm;
+    }
+    return max(I, vec3(0.0));
 }
 
 void main() {
@@ -161,7 +266,9 @@ void main() {
     // geometric under the renderer's Y-flipped projection, so flip only true
     // back-faces — visible front faces keep their authored outward normal.
     if (!gl_FrontFacing) Ng = -Ng;
-    vec3 N = perturbNormal(Ng, inUV);
+    vec3 frameT, frameB; bool frameValid;
+    cotangentFrame(Ng, inUV, frameT, frameB, frameValid);
+    vec3 N = perturbNormal(Ng, inUV, frameT, frameB, frameValid);
 
     vec3 L = normalize(ubo.lightDir.xyz);
     vec3 H = normalize(V + L);
@@ -178,6 +285,11 @@ void main() {
     float sheenRoughness     = clamp(me.p1.w, 0.05, 1.0);
     vec3  sheenColor         = me.p2.rgb;
     float emissiveStrength   = me.p2.w;
+    float anisoStrength      = clamp(me.p3.x, 0.0, 1.0);
+    float anisoRotation      = me.p3.y;
+    float iridescenceFactor  = clamp(me.p3.z, 0.0, 1.0);
+    float iridescenceIor     = me.p3.w;
+    float iridThickness      = me.p4.y;   // no thickness texture → the maximum
 
     // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────
     // The dielectric reflectance is no longer hard-coded at 0.04. That constant
@@ -189,12 +301,45 @@ void main() {
     vec3 f0 = mix(dielF0, albedo, metallic);
     vec3 f90 = vec3(mix(specularFactor, 1.0, metallic));
 
-    // Direct directional light.
-    float D = D_GGX(ndoth, a);
-    float G = G_SchlickSmith(ndotv, ndotl, a);
+    // ── KHR_materials_iridescence ────────────────────────────────────────────
+    // Replaces the specular Fresnel with the thin-film response, blended by
+    // iridescenceFactor. Because it substitutes F rather than adding a lobe, it
+    // costs no extra energy — it recolours the reflection that was already
+    // there, which is exactly what a soap-film or fuel-slick does.
     float vdoth = max(dot(H, V), 0.0);
-    vec3  F = f0 + (f90 - f0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0);
-    vec3 spec = (D * G) * F / max(4.0 * ndotv * ndotl, 1e-4);
+    vec3 F = f0 + (f90 - f0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0);
+    vec3 Fr_base = F_SchlickRoughness(ndotv, f0, roughness);
+    if (iridescenceFactor > 0.0) {
+        vec3 iriDirect = evalIridescence(1.0, iridescenceIor, vdoth, iridThickness, f0);
+        vec3 iriView   = evalIridescence(1.0, iridescenceIor, ndotv, iridThickness, f0);
+        F       = mix(F,       iriDirect, iridescenceFactor);
+        Fr_base = mix(Fr_base, iriView,   iridescenceFactor);
+    }
+
+    // Direct directional light. Anisotropy swaps the isotropic GGX lobe for the
+    // spec's anisotropic D and V; everything else is untouched.
+    vec3 spec;
+    if (anisoStrength > 0.0 && frameValid) {
+        // Rotate the tangent frame in the tangent plane, then re-derive the
+        // bitangent so T/B/N stay orthonormal after the rotation.
+        vec2 dir = vec2(cos(anisoRotation), sin(anisoRotation));
+        vec3 aT = normalize(frameT * dir.x + frameB * dir.y);
+        vec3 aB = normalize(cross(N, aT));
+        // Per spec: the tangent direction gets rougher, the bitangent keeps the
+        // material roughness — so the highlight stretches ALONG the tangent.
+        float at = mix(a, 1.0, anisoStrength * anisoStrength);
+        float ab = a;
+        float tdoth = dot(aT, H), bdoth = dot(aB, H);
+        float tdotv = dot(aT, V), bdotv = dot(aB, V);
+        float tdotl = dot(aT, L), bdotl = dot(aB, L);
+        float Da = D_GGX_anisotropic(ndoth, tdoth, bdoth, at, ab);
+        float Va = V_GGX_anisotropic(ndotl, ndotv, bdotv, tdotv, tdotl, bdotl, at, ab);
+        spec = Da * Va * F;
+    } else {
+        float D = D_GGX(ndoth, a);
+        float G = G_SchlickSmith(ndotv, ndotl, a);
+        spec = (D * G) * F / max(4.0 * ndotv * ndotl, 1e-4);
+    }
     vec3 kd = (1.0 - F) * (1.0 - metallic);
     // Direct light is scaled by ubo.tone.z, which the renderer drops to 0 when
     // an HDRI environment is active: a real capture already contains its own
@@ -204,10 +349,26 @@ void main() {
 
     // Ambient = image-based lighting (split-sum): irradiance cube for diffuse,
     // prefiltered cube + BRDF LUT for specular.
-    vec3 Fr = F_SchlickRoughness(ndotv, f0, roughness);
+    vec3 Fr = Fr_base;
     vec3 diffuseIBL = texture(irradianceMap, N).rgb * albedo * (1.0 - metallic);
     float maxLod = float(textureQueryLevels(prefilteredMap) - 1);
-    vec3 prefiltered = textureLod(prefilteredMap, reflect(-V, N), roughness * maxLod).rgb;
+    // Anisotropic reflections: bend the reflection vector towards the direction
+    // the highlight is stretched in. This is the glTF sample-viewer approach —
+    // the extension specifies the direct-light D and V but leaves prefiltered
+    // IBL to the implementation, so this is an approximation, not spec text.
+    // NOTE — anisotropy affects DIRECT light only. The usual trick for
+    // anisotropic IBL is to bend the reflection vector toward the stretch
+    // direction, which is not spec text but standard practice. It was tried and
+    // removed: it needs a dependable tangent frame, and ours is synthesized from
+    // screen-space UV derivatives (no TANGENT attribute is read yet). On a UV
+    // sphere that frame flips across the seam and degenerates at the poles, and
+    // the bent reflection then samples the dark ground hemisphere — black
+    // blotches that look like a shading bug because they are one. Reading the
+    // glTF TANGENT attribute is the prerequisite; until then the honest choice
+    // is spec-correct direct light and unbent IBL, which costs visibility (a
+    // metal under IBL is dominated by the environment term) but never lies.
+    vec3 reflDir = reflect(-V, N);
+    vec3 prefiltered = textureLod(prefilteredMap, reflDir, roughness * maxLod).rgb;
     vec2 ab = texture(brdfLUT, vec2(ndotv, roughness)).rg;
     vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
     vec3 ambient = (diffuseIBL + specularIBL) * ao;
