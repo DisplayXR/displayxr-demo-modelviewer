@@ -261,7 +261,14 @@ private:
     std::string envName_ = "analytic sky";
 
     // ── Grading (issue #70 phase 0) ──────────────────────────────────────────
-    float     exposureEV_ = 0.0f;
+    // +1 EV is not arbitrary: this viewer's fixed key light and analytic sky
+    // produce a dim linear image, while PBR Neutral (like any filmic curve)
+    // expects a scene exposed so mid-grey lands near 0.18 and highlights run
+    // past 1.0. At EV 0 the scene never reaches the curve's shoulder, so the
+    // curve only ever subtracts its 0.04 linear black point — all cost, no
+    // highlight rolloff, and measurably darker than no tone mapping at all.
+    // Exposure and curve have to be chosen together; this is that choice.
+    float     exposureEV_ = 1.0f;
     ToneCurve toneCurve_  = ToneCurve::PbrNeutral;
 
     // ── Skinning (set = 3: joint-matrix SSBO, vertex stage) ──────────────
