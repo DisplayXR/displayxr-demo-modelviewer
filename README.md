@@ -36,10 +36,10 @@ per-backend breakdown and roadmap.
 
 ### Material feature support
 
-The renderer implements **core glTF metallic-roughness only**. No
-`KHR_materials_*` extension is honoured yet — a glTF that uses one still loads
-and renders, but only its base layer does (a clear-coat material renders without
-the coat, a transmissive material renders opaque).
+The renderer implements core glTF metallic-roughness plus the **tier-1
+`KHR_materials_*` layers** (see the table). Anything not yet implemented still
+loads and renders, but only its base layer does — a transmissive material
+currently renders opaque.
 
 That fallback is what the spec prescribes, but it is **never silent**. Anything
 the asset declares in `extensionsUsed` that the renderer lacks is listed on
@@ -60,7 +60,8 @@ difference.
 | `KHR_materials_clearcoat` | ✅ factors — second GGX lobe, base attenuated by the coat's Fresnel. No `clearcoatNormalTexture` |
 | `KHR_materials_sheen` | ⚠️ factors — Charlie + Ashikhmin. **No energy compensation** (see below) |
 | `KHR_materials_emissive_strength` | ✅ |
-| `KHR_materials_anisotropy` / `_iridescence` | ❌ planned |
+| `KHR_materials_anisotropy` | ⚠️ factors — spec D/V, **direct light only** (see below) |
+| `KHR_materials_iridescence` | ✅ factors — full thin-film model, no thickness texture |
 | `KHR_materials_transmission` / `_volume` | ❌ planned (needs a scene-colour copy per view) |
 | `KHR_texture_transform`, Draco, KTX2/Basis | ❌ |
 
@@ -74,6 +75,23 @@ appear in the ignored-extension warning — check this table.
 the sheen directional albedo so sheen redistributes energy rather than adding
 it, which needs a lookup table this renderer doesn't generate. Sheen is
 therefore additive here: fabric reads slightly too bright at grazing angles.
+
+**Documented limitation — anisotropy is direct-light only.** The extension's
+distribution and visibility terms are implemented verbatim, but anisotropy is
+not applied to image-based lighting. The usual trick (bending the IBL reflection
+vector toward the stretch direction) needs a dependable tangent frame, and this
+renderer synthesizes one from screen-space UV derivatives rather than reading
+the glTF `TANGENT` attribute. On a UV sphere that frame flips across the seam
+and degenerates at the poles, and the bent reflection then samples the dark
+ground hemisphere — black blotches that look exactly like a shading bug. Reading
+`TANGENT` is the prerequisite for doing this properly. Consequence: on a metal
+lit mostly by an environment, anisotropy is measurable but close to invisible.
+
+**Both anisotropy and iridescence are subtle in the material grid**, and that is
+physical rather than a defect. Anisotropy for the reason above; iridescence
+because the grid's row is a 4 % dielectric under a broad sky, where thin-film
+interference shifts the reflection only slightly. Pixel probes across each row
+confirm both vary monotonically with their sweep.
 
 Tracking issue: [#70 — OpenPBR reference scene and material interoperability](https://github.com/DisplayXR/displayxr-demo-modelviewer/issues/70).
 
@@ -94,10 +112,12 @@ against: 9 material families × a 7-step parameter sweep, 63 spheres.
 | 7 | transmission | `transmissionFactor` 0 → 1, `ior` 1.5, volume |
 | 8 | emissive | `emissiveStrength` 0 → 6 |
 
-Today rows 0–1 sweep visibly and rows 2–8 are flat — each row is uniform because
-its extension is ignored. **That flatness is the worklist**: a row comes alive
-exactly when its extension lands, which makes the grid a progress meter as much
-as a test asset.
+**The grid is a progress meter as much as a test asset**: a row is flat while
+its extension is ignored and comes alive when the extension lands. Rows 0–6 and
+8 now sweep; row 7 (transmission) is still flat, and is exactly what the
+ignored-extension warning still names. Anisotropy and iridescence sweep only
+faintly for the physical reasons documented above — measurable by pixel probe,
+easy to miss by eye.
 
 It is generated, not hand-authored, and the generator is the source of truth:
 

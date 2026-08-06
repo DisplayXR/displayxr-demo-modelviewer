@@ -529,6 +529,12 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p2[1] = m.sheenColorFactor[1];
         g.p2[2] = m.sheenColorFactor[2];
         g.p2[3] = m.emissiveStrength;
+        g.p3[0] = m.anisotropyStrength;
+        g.p3[1] = m.anisotropyRotation;
+        g.p3[2] = m.iridescenceFactor;
+        g.p3[3] = m.iridescenceIor;
+        g.p4[0] = m.iridescenceThicknessMin;
+        g.p4[1] = m.iridescenceThicknessMax;
         gpu.push_back(g);
     }
     if (gpu.empty()) {
@@ -538,6 +544,8 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p0[0] = 1.5f; g.p0[1] = 1.0f;
         g.p1[0] = g.p1[1] = g.p1[2] = 1.0f;
         g.p2[3] = 1.0f;
+        g.p3[3] = 1.3f;                    // iridescenceIor
+        g.p4[0] = 100.0f; g.p4[1] = 400.0f; // thickness min/max (nm)
         gpu.push_back(g);
     }
 

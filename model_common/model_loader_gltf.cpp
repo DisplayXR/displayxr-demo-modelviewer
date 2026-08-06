@@ -98,6 +98,18 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm) {
     }
     if (const tinygltf::Value* v = ext("KHR_materials_emissive_strength"))
         mm.emissiveStrength = (float)extNumber(*v, "emissiveStrength", mm.emissiveStrength);
+    if (const tinygltf::Value* v = ext("KHR_materials_anisotropy")) {
+        mm.anisotropyStrength = (float)extNumber(*v, "anisotropyStrength", mm.anisotropyStrength);
+        mm.anisotropyRotation = (float)extNumber(*v, "anisotropyRotation", mm.anisotropyRotation);
+    }
+    if (const tinygltf::Value* v = ext("KHR_materials_iridescence")) {
+        mm.iridescenceFactor = (float)extNumber(*v, "iridescenceFactor", mm.iridescenceFactor);
+        mm.iridescenceIor    = (float)extNumber(*v, "iridescenceIor", mm.iridescenceIor);
+        mm.iridescenceThicknessMin =
+            (float)extNumber(*v, "iridescenceThicknessMinimum", mm.iridescenceThicknessMin);
+        mm.iridescenceThicknessMax =
+            (float)extNumber(*v, "iridescenceThicknessMaximum", mm.iridescenceThicknessMax);
+    }
 }
 
 // Compose a node's local transform: explicit matrix if present, else T*R*S.
@@ -406,6 +418,8 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
             "KHR_materials_clearcoat",
             "KHR_materials_sheen",
             "KHR_materials_emissive_strength",
+            "KHR_materials_anisotropy",
+            "KHR_materials_iridescence",
             nullptr
         };
         for (const std::string& ext : model.extensionsUsed) {

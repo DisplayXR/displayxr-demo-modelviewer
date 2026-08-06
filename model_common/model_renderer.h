@@ -165,8 +165,8 @@ private:
         float p0[4];   // ior, specularFactor, clearcoatFactor, clearcoatRoughness
         float p1[4];   // specularColorFactor.rgb, sheenRoughness
         float p2[4];   // sheenColorFactor.rgb, emissiveStrength
-        float p3[4];   // reserved — anisotropy (strength, rotation), iridescence
-        float p4[4];   // reserved — iridescence (factor, ior, thickness min/max)
+        float p3[4];   // anisotropyStrength, anisotropyRotation, iridescenceFactor, iridescenceIor
+        float p4[4];   // iridescenceThicknessMin, iridescenceThicknessMax, unused x2
     };
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag} + skybox.frag).
     struct UniformBlock {
