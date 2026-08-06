@@ -1157,7 +1157,26 @@ bool ModelRenderer::loadModel(const char* gltfPath) {
     if (!model_loader_load(gltfPath, md)) return false;
     if (!finalizeModel(md)) return false;
     loadedModelPath_ = gltfPath;
+    unsupportedExtensions_ = md.unsupportedExtensions;
     return true;
+}
+
+std::string ModelRenderer::unsupportedExtensionsSummary(size_t maxNamed) const {
+    if (unsupportedExtensions_.empty()) return std::string();
+    // Drop the vendor prefix — "KHR_materials_clearcoat" is mostly boilerplate
+    // and the HUD has one line to spend.
+    auto shortName = [](const std::string& s) {
+        static const std::string kPrefix = "KHR_materials_";
+        return s.rfind(kPrefix, 0) == 0 ? s.substr(kPrefix.size()) : s;
+    };
+    const size_t n = unsupportedExtensions_.size();
+    std::string out;
+    for (size_t i = 0; i < n && i < maxNamed; ++i) {
+        if (i) out += ", ";
+        out += shortName(unsupportedExtensions_[i]);
+    }
+    if (n > maxNamed) out += ", +" + std::to_string(n - maxNamed) + " more";
+    return out;
 }
 
 bool ModelRenderer::loadDebugModel() {

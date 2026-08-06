@@ -339,6 +339,42 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         return false;
     }
 
+    // Explicit degradation (issue #70). Anything the file declares in
+    // extensionsUsed that we don't implement changes how the asset looks versus
+    // what its author saw. That's legal — the base layer is the specified
+    // fallback — but it must be stated, not swallowed: a viewer whose whole
+    // purpose is "does this material match the authoring tool" cannot silently
+    // drop a clear coat and let the difference be blamed on the renderer.
+    // extensionsRequired is a different matter and tinygltf already refuses
+    // those, so reaching here means every omission is survivable.
+    {
+        static const char* kImplemented[] = {
+            // Nothing yet beyond core metallic-roughness. Phase 2 adds entries
+            // here as each extension lands; keep in lockstep with the README
+            // support matrix.
+            nullptr
+        };
+        for (const std::string& ext : model.extensionsUsed) {
+            bool have = false;
+            for (const char** p = kImplemented; *p; ++p) {
+                if (ext == *p) { have = true; break; }
+            }
+            if (!have) out.unsupportedExtensions.push_back(ext);
+        }
+        if (!out.unsupportedExtensions.empty()) {
+            std::string list;
+            for (size_t i = 0; i < out.unsupportedExtensions.size(); ++i) {
+                if (i) list += ", ";
+                list += out.unsupportedExtensions[i];
+            }
+            std::fprintf(stderr,
+                "[model_loader] NOT IMPLEMENTED — %zu extension(s) declared by this "
+                "asset are ignored; affected materials render as their base "
+                "metallic-roughness layer: %s\n",
+                out.unsupportedExtensions.size(), list.c_str());
+        }
+    }
+
     // Decode images → RGBA8 (parallel to model.images). Empty entries (decode
     // failed / unsupported bit depth) make the renderer fall back to a default.
     out.textures.resize(model.images.size());

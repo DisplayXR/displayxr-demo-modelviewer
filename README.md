@@ -37,9 +37,16 @@ per-backend breakdown and roadmap.
 ### Material feature support
 
 The renderer implements **core glTF metallic-roughness only**. No
-`KHR_materials_*` extension is honoured yet — a glTF that uses one loads and
-renders, but the extension's contribution is silently absent (a clear-coat
-material renders as its base layer, a transmissive material renders opaque).
+`KHR_materials_*` extension is honoured yet — a glTF that uses one still loads
+and renders, but only its base layer does (a clear-coat material renders without
+the coat, a transmissive material renders opaque).
+
+That fallback is what the spec prescribes, but it is **never silent**. Anything
+the asset declares in `extensionsUsed` that the renderer lacks is listed on
+stderr at load and summarised in the HUD (`! ignoring: clearcoat, sheen, +3
+more`). A viewer whose job is "does this material match the authoring tool"
+must not let a dropped extension be mistaken for a renderer or display
+difference.
 
 | Feature | Status |
 |---|---|
@@ -53,6 +60,43 @@ material renders as its base layer, a transmissive material renders opaque).
 | `KHR_texture_transform`, Draco, KTX2/Basis | ❌ |
 
 Tracking issue: [#70 — OpenPBR reference scene and material interoperability](https://github.com/DisplayXR/displayxr-demo-modelviewer/issues/70).
+
+### The material grid
+
+`assets/material_grid.glb` is the reference scene the matrix above is measured
+against: 9 material families × a 7-step parameter sweep, 63 spheres.
+
+| Row | Family | Sweep |
+|---|---|---|
+| 0 | dielectric | roughness 0.03 → 1.0 |
+| 1 | metal | roughness 0.03 → 1.0 |
+| 2 | clearcoat | `clearcoatFactor` 0 → 1 over a rough red base |
+| 3 | sheen | `sheenRoughnessFactor` 0.05 → 1.0 |
+| 4 | anisotropy | `anisotropyStrength` 0 → 1 on brushed metal |
+| 5 | iridescence | film thickness 200 → 800 nm |
+| 6 | specular / IOR | `specularFactor` 0 → 1, `ior` 1.0 → 2.0 |
+| 7 | transmission | `transmissionFactor` 0 → 1, `ior` 1.5, volume |
+| 8 | emissive | `emissiveStrength` 0 → 6 |
+
+Today rows 0–1 sweep visibly and rows 2–8 are flat — each row is uniform because
+its extension is ignored. **That flatness is the worklist**: a row comes alive
+exactly when its extension lands, which makes the grid a progress meter as much
+as a test asset.
+
+It is generated, not hand-authored, and the generator is the source of truth:
+
+```bash
+python3 scripts/make_material_grid.py          # → assets/material_grid.glb
+```
+
+A grid is a measuring instrument, so every value in it has to be inspectable and
+re-derivable — when a shader change moves a pixel, the question is always "what
+exactly is that sphere's roughness?", and a checked-in binary can't answer it.
+The script can, and it regenerates byte-identical output. Materials are named
+(`04_anisotropy_0.50`), so the glTF is self-documenting too.
+
+The extensions are declared in `extensionsUsed`, never `extensionsRequired`, so
+a loader that implements none of them still opens the file — which is the point.
 
 ## Environment and grading
 

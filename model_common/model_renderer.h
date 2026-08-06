@@ -71,6 +71,18 @@ struct ModelRenderer {
     void      cycleToneCurve();
     const char* toneCurveName() const;
 
+    // Extensions the loaded asset declares that this renderer doesn't implement
+    // (issue #70). Non-empty means the model on screen differs from what its
+    // author saw — the affected materials fall back to their base
+    // metallic-roughness layer. Surfaced in the HUD so the difference is never
+    // silently attributed to the renderer or the display.
+    const std::vector<std::string>& unsupportedExtensions() const {
+        return unsupportedExtensions_;
+    }
+    // "clearcoat, sheen, +3 more" — compact enough for a HUD line. Empty string
+    // when the asset uses nothing we lack. Strips the "KHR_materials_" prefix.
+    std::string unsupportedExtensionsSummary(size_t maxNamed = 2) const;
+
     // Advance the active animation clip by dtSeconds and refresh per-primitive
     // model matrices. No-op (static fast-path) when the model has no animation.
     // Call once per frame, before renderEye. Frozen while paused (the pose is
@@ -266,10 +278,16 @@ private:
     // expects a scene exposed so mid-grey lands near 0.18 and highlights run
     // past 1.0. At EV 0 the scene never reaches the curve's shoulder, so the
     // curve only ever subtracts its 0.04 linear black point — all cost, no
-    // highlight rolloff, and measurably darker than no tone mapping at all.
-    // Exposure and curve have to be chosen together; this is that choice.
+    // highlight rolloff, measurably darker than no tone mapping at all
+    // (helmet mean luma 55.6 clamped vs 46.6). Exposure and curve have to be
+    // chosen together; this is that choice. Revisit against the phase 1
+    // material grid rather than tuning by eye on one asset.
     float     exposureEV_ = 1.0f;
     ToneCurve toneCurve_  = ToneCurve::PbrNeutral;
+
+    // Carried over from the loaded ModelData; cleared on every model load so it
+    // always describes the asset currently on screen.
+    std::vector<std::string> unsupportedExtensions_;
 
     // ── Skinning (set = 3: joint-matrix SSBO, vertex stage) ──────────────
     VkDescriptorSetLayout jointSetLayout_ = VK_NULL_HANDLE;
