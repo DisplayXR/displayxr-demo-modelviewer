@@ -75,6 +75,12 @@ struct ModelMaterial {
     float iridescenceIor = 1.3f;
     float iridescenceThicknessMin = 100.0f; // nanometres
     float iridescenceThicknessMax = 400.0f;
+    float transmissionFactor = 0.0f;        // KHR_materials_transmission (0 = opaque)
+    float volumeThickness = 0.0f;           // KHR_materials_volume (0 = thin surface)
+    float attenuationColor[3] = {1, 1, 1};
+    // glTF's default is +Infinity, i.e. no absorption. 0 is the sentinel for
+    // that here so the shader can guard with a finite comparison.
+    float attenuationDistance = 0.0f;
 };
 
 struct ModelPrimitive {

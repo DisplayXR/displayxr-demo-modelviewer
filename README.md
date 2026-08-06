@@ -36,10 +36,9 @@ per-backend breakdown and roadmap.
 
 ### Material feature support
 
-The renderer implements core glTF metallic-roughness plus the **tier-1
-`KHR_materials_*` layers** (see the table). Anything not yet implemented still
-loads and renders, but only its base layer does — a transmissive material
-currently renders opaque.
+The renderer implements core glTF metallic-roughness plus **every
+`KHR_materials_*` extension listed below**. Anything not implemented still loads
+and renders, but only its base layer does.
 
 That fallback is what the spec prescribes, but it is **never silent**. Anything
 the asset declares in `extensionsUsed` that the renderer lacks is listed on
@@ -62,7 +61,8 @@ difference.
 | `KHR_materials_emissive_strength` | ✅ |
 | `KHR_materials_anisotropy` | ⚠️ factors — spec D/V, **direct light only** (see below) |
 | `KHR_materials_iridescence` | ✅ factors — full thin-film model, no thickness texture |
-| `KHR_materials_transmission` / `_volume` | ❌ planned (needs a scene-colour copy per view) |
+| `KHR_materials_transmission` | ✅ factor — refracts the rendered scene, roughness-blurred |
+| `KHR_materials_volume` | ✅ factors — thickness-driven refraction + Beer-Lambert attenuation |
 | `KHR_texture_transform`, Draco, KTX2/Basis | ❌ |
 
 **Factors only.** The texture-driven variants of the implemented extensions
@@ -75,6 +75,15 @@ appear in the ignored-extension warning — check this table.
 the sheen directional albedo so sheen redistributes energy rather than adding
 it, which needs a lookup table this renderer doesn't generate. Sheen is
 therefore additive here: fabric reads slightly too bright at grazing angles.
+
+**Transmission costs a scene-colour copy per view.** Refracting the *rendered
+scene* (rather than only the environment, which the spec calls out as falling
+short) means the opaque pass has to be captured before transmissive surfaces are
+drawn. That copy happens once per `renderEye` — i.e. **once per view tile in the
+atlas** — so its cost scales with view count, which is the one place where
+driving a multiview 3D display genuinely changes the renderer's budget. It is
+skipped entirely when no loaded material transmits, and in transparent-background
+mode (where there is no opaque scene to refract, so glass falls back to IBL).
 
 **Documented limitation — anisotropy is direct-light only.** The extension's
 distribution and visibility terms are implemented verbatim, but anisotropy is
@@ -113,11 +122,12 @@ against: 9 material families × a 7-step parameter sweep, 63 spheres.
 | 8 | emissive | `emissiveStrength` 0 → 6 |
 
 **The grid is a progress meter as much as a test asset**: a row is flat while
-its extension is ignored and comes alive when the extension lands. Rows 0–6 and
-8 now sweep; row 7 (transmission) is still flat, and is exactly what the
-ignored-extension warning still names. Anisotropy and iridescence sweep only
-faintly for the physical reasons documented above — measurable by pixel probe,
-easy to miss by eye.
+its extension is ignored and comes alive when the extension lands. All nine rows
+now sweep, and the grid raises no ignored-extension warning at all. Anisotropy
+and iridescence sweep only faintly for the physical reasons documented above —
+measurable by pixel probe, easy to miss by eye. The transmission row is the
+clearest demonstration: the emissive spheres from the row below appear refracted
+inside each glass sphere, more strongly as `transmissionFactor` rises.
 
 It is generated, not hand-authored, and the generator is the source of truth:
 

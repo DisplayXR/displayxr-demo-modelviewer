@@ -24,6 +24,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 lightDir;     // .xyz = light dir, .w = clipFar (view-space; 0=off)
     mat4 invViewProj;  // (skybox only)
     vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale
+    vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target
 } ubo;
 
 layout(push_constant) uniform Push {
@@ -41,7 +42,8 @@ struct MatExt {
     vec4 p1;   // specularColorFactor.rgb, sheenRoughness
     vec4 p2;   // sheenColorFactor.rgb, emissiveStrength
     vec4 p3;   // anisotropyStrength, anisotropyRotation, iridescenceFactor, iridescenceIor
-    vec4 p4;   // iridescenceThicknessMin, iridescenceThicknessMax, unused x2
+    vec4 p4;   // iridescenceThicknessMin, iridescenceThicknessMax, transmissionFactor, thicknessFactor
+    vec4 p5;   // attenuationColor.rgb, attenuationDistance
 };
 layout(set = 0, binding = 1, std430) readonly buffer MatExtBuf {
     MatExt materials[];
@@ -58,6 +60,10 @@ layout(set = 1, binding = 4) uniform sampler2D emissiveTex;
 layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
 layout(set = 2, binding = 1) uniform samplerCube prefilteredMap;  // specular (roughness mips)
 layout(set = 2, binding = 2) uniform sampler2D   brdfLUT;         // split-sum scale/bias
+// Mipped copy of the opaque pass's colour — what transmissive surfaces refract
+// against. Mip level is chosen from roughness, so a rough transmissive surface
+// scatters what's behind it (KHR_materials_transmission, issue #70 tier 2).
+layout(set = 2, binding = 3) uniform sampler2D   sceneColor;
 
 layout(location = 0) out vec4 outColor;
 
@@ -290,6 +296,10 @@ void main() {
     float iridescenceFactor  = clamp(me.p3.z, 0.0, 1.0);
     float iridescenceIor     = me.p3.w;
     float iridThickness      = me.p4.y;   // no thickness texture → the maximum
+    float transmissionFactor = clamp(me.p4.z, 0.0, 1.0);
+    float volumeThickness    = me.p4.w;
+    vec3  attenuationColor   = me.p5.rgb;
+    float attenuationDist    = me.p5.w;
 
     // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────
     // The dielectric reflectance is no longer hard-coded at 0.04. That constant
@@ -412,6 +422,53 @@ void main() {
 
         color = color * (1.0 - ccF)
               + (vec3(ccSpec) * 3.0 * ubo.tone.z * ndotl + ccIbl * ao) * clearcoatFactor;
+    }
+
+    // ── KHR_materials_transmission + KHR_materials_volume ────────────────────
+    // Refract through the surface, find where the ray leaves the volume, project
+    // that exit point to screen space and read the already-rendered scene there.
+    // This is why transmission needed its own milestone: it consumes a copy of
+    // the frame, and that copy is per view tile in the atlas.
+    if (transmissionFactor > 0.0) {
+        // Ray through the volume. thickness 0 (a thin surface) degenerates to
+        // sampling straight behind the fragment, which is the correct
+        // "infinitely thin" behaviour the transmission spec describes.
+        vec3 refracted = refract(-V, N, 1.0 / max(ior, 1.0001));
+        vec3 exitPos = inWorldPos + normalize(refracted) * volumeThickness;
+
+        vec4 clip = ubo.viewProj * vec4(exitPos, 1.0);
+        vec2 ndc = clip.xy / max(clip.w, 1e-5);
+        // Y is inverted because the renderer rasterises through a NEGATIVE-height
+        // viewport (+Y-up world without a view-matrix flip), so NDC +Y is image
+        // row 0. Then scale into the viewport's sub-rect of the colour target —
+        // sampling the full [0,1] would read past what was actually rendered.
+        vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * ubo.viewport.xy;
+        uv = clamp(uv, vec2(0.001), ubo.viewport.xy - vec2(0.001));
+
+        // Roughness picks the mip: a rough transmissive surface blurs what is
+        // behind it. Same idea as the prefiltered IBL chain, applied to scene
+        // colour instead of the environment.
+        float sceneLod = float(textureQueryLevels(sceneColor) - 1) * roughness;
+        vec3 transmitted = textureLod(sceneColor, uv, sceneLod).rgb;
+
+        // Volume absorption, Beer-Lambert: T(x) = attenuationColor^(x/distance).
+        // An infinite attenuation distance (the glTF default) means no
+        // absorption at all, so guard rather than divide by it.
+        if (attenuationDist > 0.0 && !isinf(attenuationDist)) {
+            vec3 sigma = -log(clamp(attenuationColor, vec3(1e-4), vec3(1.0))) / attenuationDist;
+            transmitted *= exp(-sigma * max(volumeThickness, 0.0));
+        }
+
+        // baseColor tints what passes through; metals absorb it entirely.
+        transmitted *= albedo;
+
+        // Transmission replaces the DIFFUSE lobe — the specular reflection off
+        // the surface stays. That is what makes glass read as glass rather than
+        // as a hole in the image.
+        vec3 diffuseTerm = (kd * albedo / PI) * vec3(3.0 * ubo.tone.z) * ndotl
+                         + diffuseIBL * ao;
+        vec3 transmissionTerm = transmitted * (1.0 - metallic);
+        color += (transmissionTerm - diffuseTerm) * transmissionFactor;
     }
 
     // ── KHR_materials_emissive_strength ──────────────────────────────────────

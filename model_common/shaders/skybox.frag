@@ -20,6 +20,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 lightDir;
     mat4 invViewProj;
     vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale
+    vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target
 } ubo;
 layout(set = 2, binding = 1) uniform samplerCube prefilteredMap;
 
