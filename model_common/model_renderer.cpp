@@ -251,6 +251,19 @@ bool ModelRenderer::createRenderTargets() {
     rpci.pDependencies = deps;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPass_) != VK_SUCCESS) return false;
 
+    // The transmissive pass runs after the scene-colour capture, so it must LOAD
+    // what the opaque pass wrote rather than clear it, and it starts from
+    // COLOR_ATTACHMENT_OPTIMAL (an explicit barrier brings the image back from
+    // the TRANSFER_SRC the first pass left it in). Depth is loaded too, so
+    // transmissive geometry still depth-tests against the opaque scene.
+    atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    atts[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    atts[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPassLoad_) != VK_SUCCESS) return false;
+
     return ensureTargets(width_, height_);
 }
 
@@ -265,6 +278,7 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (framebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
+    if (transmissionImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, transmissionImage_);
     width_ = w; height_ = h;
 
     colorImage_ = modelCreateImage2D(device_, physDevice_, w, h, colorFormat_,
@@ -291,10 +305,102 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
 
     VkImageView fbViews[2] = {colorImage_.view, depthImage_.view};
     VkFramebufferCreateInfo fbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    if (!createTransmissionTarget(w, h)) return false;
     fbci.renderPass = renderPass_; fbci.attachmentCount = 2; fbci.pAttachments = fbViews;
     fbci.width = w; fbci.height = h; fbci.layers = 1;
     if (vkCreateFramebuffer(device_, &fbci, nullptr, &framebuffer_) != VK_SUCCESS) return false;
     return true;
+}
+
+// The mipped scene-colour copy transmissive surfaces refract against. Mips give
+// roughness-blurred refraction for free (a rough transmissive surface should
+// scatter what's behind it), which is the whole reason to build a chain rather
+// than a flat copy.
+bool ModelRenderer::createTransmissionTarget(uint32_t w, uint32_t h) {
+    uint32_t mips = 1;
+    for (uint32_t d = std::max(w, h); d > 1; d >>= 1) ++mips;
+    transmissionMips_ = mips;
+
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = colorFormat_;
+    ici.extent = {w, h, 1}; ici.mipLevels = mips; ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device_, &ici, nullptr, &transmissionImage_.image) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(device_, transmissionImage_.image, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = modelFindMemoryType(physDevice_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device_, &ai, nullptr, &transmissionImage_.memory) != VK_SUCCESS) return false;
+    vkBindImageMemory(device_, transmissionImage_.image, transmissionImage_.memory, 0);
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = transmissionImage_.image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = colorFormat_;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
+    if (vkCreateImageView(device_, &vci, nullptr, &transmissionImage_.view) != VK_SUCCESS) return false;
+    transmissionImage_.width = w; transmissionImage_.height = h;
+
+    // The set-2 descriptor points at the old image after a resize; repoint it.
+    if (iblSet_ != VK_NULL_HANDLE) writeIblSet();
+    return true;
+}
+
+// Copy the opaque pass's colour into transmissionImage_ and build its mip chain.
+// colorImage_ arrives in TRANSFER_SRC_OPTIMAL (the first render pass's
+// finalLayout) and is left there — the caller barriers it back to
+// COLOR_ATTACHMENT_OPTIMAL before the transmissive pass.
+void ModelRenderer::captureSceneColor(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
+    auto barrier = [&](uint32_t mip, uint32_t count, VkImageLayout oldL, VkImageLayout newL,
+                       VkAccessFlags srcA, VkAccessFlags dstA,
+                       VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = oldL; b.newLayout = newL;
+        b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = transmissionImage_.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, count, 0, 1};
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    // NOTE: only the viewport sub-rect is copied, so the rest of each mip stays
+    // undefined. That is fine because the shader scales its UVs into the same
+    // sub-rect (ubo.viewport) — but it is exactly why sampling the full [0,1]
+    // range returned uninitialized memory before that scaling existed.
+    barrier(0, transmissionMips_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkImageCopy cp = {};
+    cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {w, h, 1};
+    vkCmdCopyImage(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   transmissionImage_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+
+    int32_t mw = (int32_t)w, mh = (int32_t)h;
+    for (uint32_t i = 1; i < transmissionMips_; ++i) {
+        barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        int32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
+        VkImageBlit bl = {};
+        bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+        bl.srcOffsets[1] = {mw, mh, 1};
+        bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        bl.dstOffsets[1] = {nw, nh, 1};
+        vkCmdBlitImage(cmd, transmissionImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       transmissionImage_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &bl, VK_FILTER_LINEAR);
+        barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        mw = nw; mh = nh;
+    }
+    barrier(transmissionMips_ - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 }
 
 bool ModelRenderer::createPipeline() {
@@ -329,16 +435,17 @@ bool ModelRenderer::createPipeline() {
     mlci.pBindings = mb;
     if (vkCreateDescriptorSetLayout(device_, &mlci, nullptr, &matSetLayout_) != VK_SUCCESS) return false;
 
-    // Set 2: IBL — irradiance cube, prefiltered cube, BRDF LUT (all fragment).
-    VkDescriptorSetLayoutBinding ib[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
+    // Set 2: IBL — irradiance cube, prefiltered cube, BRDF LUT, plus the mipped
+    // scene-colour copy transmissive surfaces refract against (all fragment).
+    VkDescriptorSetLayoutBinding ib[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
         ib[i].binding = i;
         ib[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         ib[i].descriptorCount = 1;
         ib[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo ilci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    ilci.bindingCount = 3;
+    ilci.bindingCount = 4;
     ilci.pBindings = ib;
     if (vkCreateDescriptorSetLayout(device_, &ilci, nullptr, &iblSetLayout_) != VK_SUCCESS) return false;
 
@@ -535,6 +642,12 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p3[3] = m.iridescenceIor;
         g.p4[0] = m.iridescenceThicknessMin;
         g.p4[1] = m.iridescenceThicknessMax;
+        g.p4[2] = m.transmissionFactor;
+        g.p4[3] = m.volumeThickness;
+        g.p5[0] = m.attenuationColor[0];
+        g.p5[1] = m.attenuationColor[1];
+        g.p5[2] = m.attenuationColor[2];
+        g.p5[3] = m.attenuationDistance;
         gpu.push_back(g);
     }
     if (gpu.empty()) {
@@ -546,6 +659,7 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p2[3] = 1.0f;
         g.p3[3] = 1.3f;                    // iridescenceIor
         g.p4[0] = 100.0f; g.p4[1] = 400.0f; // thickness min/max (nm)
+        g.p5[0] = g.p5[1] = g.p5[2] = 1.0f; // attenuationColor
         gpu.push_back(g);
     }
 
@@ -794,6 +908,9 @@ bool ModelRenderer::createIbl() {
     if (vkCreateSampler(device_, &sc, nullptr, &iblCubeSampler_) != VK_SUCCESS) return false;
     VkSamplerCreateInfo sl = sc; sl.maxLod = 0.0f;
     if (vkCreateSampler(device_, &sl, nullptr, &iblLutSampler_) != VK_SUCCESS) return false;
+    // Clamped so a refraction ray leaving the frame smears the edge rather than
+    // wrapping the opposite side of the scene into the glass.
+    if (vkCreateSampler(device_, &sc, nullptr, &transmissionSampler_) != VK_SUCCESS) return false;
 
     // The environment the cubes are baked FROM (set 0 of the generation passes).
     // Must exist before genCubeMap, which binds it.
@@ -833,27 +950,38 @@ bool ModelRenderer::createIbl() {
     if (!bakeIblCubes()) return false;
 
     // Descriptor set (set = 2).
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &ps;
     if (vkCreateDescriptorPool(device_, &dpci, nullptr, &iblPool_) != VK_SUCCESS) return false;
     VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = iblPool_; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &iblSetLayout_;
     if (vkAllocateDescriptorSets(device_, &dsai, &iblSet_) != VK_SUCCESS) return false;
-    VkDescriptorImageInfo ii[3] = {
-        {iblCubeSampler_, irradianceCube_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {iblCubeSampler_, prefilterCube_.view,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {iblLutSampler_,  brdfLut_.view,        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-    };
-    VkWriteDescriptorSet w[3];
-    for (uint32_t i = 0; i < 3; ++i) {
-        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w[i].dstSet = iblSet_; w[i].dstBinding = i; w[i].descriptorCount = 1;
-        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = &ii[i];
-    }
-    vkUpdateDescriptorSets(device_, 3, w, 0, nullptr);
+    writeIblSet();
     std::printf("ModelRenderer: IBL ready (irradiance 32, prefilter 128x%u, BRDF LUT 256)\n", prefilterCube_.mips);
     return true;
+}
+
+// Set 2 is written from several places — first bake, environment change, and
+// window resize (which recreates the transmission image). One function so the
+// four bindings can never drift out of step.
+void ModelRenderer::writeIblSet() {
+    VkDescriptorImageInfo ii[4] = {
+        {iblCubeSampler_,      irradianceCube_.view,    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {iblCubeSampler_,      prefilterCube_.view,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {iblLutSampler_,       brdfLut_.view,           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {transmissionSampler_, transmissionImage_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+    };
+    VkWriteDescriptorSet w[4];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (ii[i].imageView == VK_NULL_HANDLE) continue;   // not created yet
+        w[n] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[n].dstSet = iblSet_; w[n].dstBinding = i; w[n].descriptorCount = 1;
+        w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[n].pImageInfo = &ii[i];
+        ++n;
+    }
+    if (n) vkUpdateDescriptorSets(device_, n, w, 0, nullptr);
 }
 
 void ModelRenderer::destroyCubeMap(CubeMap& cube) {
@@ -1121,6 +1249,9 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
             modelTextures_[i] = uploadTexture(md.textures[i]);
 
     materials_ = std::move(md.materials);
+    hasTransmissive_ = false;
+    for (const ModelMaterial& m : materials_)
+        if (m.transmissionFactor > 0.0f) { hasTransmissive_ = true; break; }
     if (!uploadMaterialExtensions(materials_)) return false;
     primitives_ = std::move(md.primitives);
 
@@ -1350,6 +1481,9 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.tone[1] = (float)(int)toneCurve_;
     ub.tone[2] = envIsHdri_ ? 0.0f : 1.0f;
     ub.tone[3] = 0.0f;
+    ub.viewport[0] = (width_  > 0) ? (float)vpWidth_  / (float)width_  : 1.0f;
+    ub.viewport[1] = (height_ > 0) ? (float)vpHeight_ / (float)height_ : 1.0f;
+    ub.viewport[2] = ub.viewport[3] = 0.0f;
 
     void* mapped = nullptr;
     vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(UniformBlock), 0, &mapped);
@@ -1813,6 +1947,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // viewport — the viewport is set via renderArea/scissor each frame and is
     // always ≤ the framebuffer. Recreate only if the swapchain itself changes
     // size, so a window resize doesn't churn (destroy/recreate) the targets.
+    vpWidth_ = viewportWidth;
+    vpHeight_ = viewportHeight;
     if (imageWidth != width_ || imageHeight != height_) {
         if (!ensureTargets(imageWidth, imageHeight)) return;
     }
@@ -1877,7 +2013,12 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
     vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
 
-    for (const auto& p : primitives_) {
+    // Two passes when anything transmits (issue #70 tier 2): opaque first, then
+    // capture that colour, then the transmissive draws refract against it.
+    // Transmissive primitives are NOT sorted back-to-front — the extension
+    // explicitly says correct ordering isn't required of realtime renderers, and
+    // sorting would cost more than it buys for a material demo.
+    auto drawPrimitive = [&](const ModelPrimitive& p) {
         PushBlock pb{};
         ModelMaterial m;  // defaults if material == -1
         if (p.material >= 0 && p.material < (int)materials_.size()) m = materials_[p.material];
@@ -1916,6 +2057,54 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                                 1, 1, &matSet, 0, nullptr);
 
         vkCmdDrawIndexed(cmd, p.indexCount, 1, p.firstIndex, 0, 0);
+    };
+
+    auto transmits = [&](const ModelPrimitive& p) {
+        return p.material >= 0 && p.material < (int)materials_.size() &&
+               materials_[p.material].transmissionFactor > 0.0f;
+    };
+
+    for (const auto& p : primitives_) if (!transmits(p)) drawPrimitive(p);
+
+    if (hasTransmissive_ && !transparentBg) {
+        vkCmdEndRenderPass(cmd);
+        // colorImage_ is in TRANSFER_SRC_OPTIMAL here (pass-1 finalLayout),
+        // which is exactly what the copy wants.
+        captureSceneColor(cmd, viewportWidth, viewportHeight);
+
+        // Back to a colour attachment for pass 2.
+        VkImageMemoryBarrier toAtt = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toAtt.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toAtt.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toAtt.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toAtt.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toAtt.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toAtt.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toAtt.image = colorImage_.image;
+        toAtt.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &toAtt);
+
+        VkRenderPassBeginInfo rp2 = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rp2.renderPass = renderPassLoad_;
+        rp2.framebuffer = framebuffer_;
+        rp2.renderArea.offset = {0, 0};
+        rp2.renderArea.extent = {viewportWidth, viewportHeight};
+        vkCmdBeginRenderPass(cmd, &rp2, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdSetViewport(cmd, 0, 1, &vpRect);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
+        vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
+        for (const auto& p : primitives_) if (transmits(p)) drawPrimitive(p);
+    } else {
+        // Transparent-background mode has no opaque scene to refract, so the
+        // transmissive draws just join pass 1 and fall back to IBL-only glass.
+        for (const auto& p : primitives_) if (transmits(p)) drawPrimitive(p);
     }
 
     vkCmdEndRenderPass(cmd);
@@ -2049,6 +2238,9 @@ void ModelRenderer::cleanup() {
     if (jointSetLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, jointSetLayout_, nullptr); jointSetLayout_ = VK_NULL_HANDLE; }
     if (framebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
     if (renderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
+    if (renderPassLoad_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, renderPassLoad_, nullptr); renderPassLoad_ = VK_NULL_HANDLE; }
+    if (transmissionImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, transmissionImage_);
+    if (transmissionSampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, transmissionSampler_, nullptr); transmissionSampler_ = VK_NULL_HANDLE; }
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
     if (cmdPool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }

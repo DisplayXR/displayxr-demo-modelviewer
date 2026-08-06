@@ -166,7 +166,8 @@ private:
         float p1[4];   // specularColorFactor.rgb, sheenRoughness
         float p2[4];   // sheenColorFactor.rgb, emissiveStrength
         float p3[4];   // anisotropyStrength, anisotropyRotation, iridescenceFactor, iridescenceIor
-        float p4[4];   // iridescenceThicknessMin, iridescenceThicknessMax, unused x2
+        float p4[4];   // iridescenceThicknessMin/Max, transmissionFactor, volumeThickness
+        float p5[4];   // attenuationColor.rgb, attenuationDistance (0 = none)
     };
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag} + skybox.frag).
     struct UniformBlock {
@@ -176,6 +177,12 @@ private:
         float lightDir[4];     // .xyz = light direction, .w = clipFar (view-space; 0=off)
         float invViewProj[16]; // inverse(viewProj), for the skybox ray reconstruction
         float tone[4];         // x=exposure (2^EV), y=curve id, z=directional-light scale
+        // The internal colour target is the size of the whole SWAPCHAIN IMAGE,
+        // but each eye renders into only the top-left viewport of it. Scene-
+        // colour sampling (transmission) therefore has to scale clip-space UVs
+        // by the viewport's fraction of the image, or it reads past the region
+        // that was actually rendered. x,y = viewport/image ratio.
+        float viewport[4];
     };
 
     bool createRenderTargets();
@@ -214,6 +221,8 @@ private:
     uint32_t queueFamily_ = 0;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+    uint32_t vpWidth_ = 0;    // current eye's viewport within the target
+    uint32_t vpHeight_ = 0;
     bool initialized_ = false;
     bool modelLoaded_ = false;
     std::string loadedModelPath_;
@@ -233,7 +242,24 @@ private:
     ModelImage colorImage_;
     ModelImage depthImage_;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
+    // Second pass over the same attachments with LOAD instead of CLEAR, for the
+    // transmissive draws that have to come after the scene-colour capture.
+    VkRenderPass renderPassLoad_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+
+    // ── KHR_materials_transmission / _volume (issue #70 phase 2 tier 2) ──────
+    // A mipped copy of the opaque pass's colour, which transmissive surfaces
+    // refract against. This is the one extension whose cost is architectural
+    // rather than shader-local: the copy happens once per renderEye, i.e. once
+    // per view tile in the atlas, so it scales with view count — the reason
+    // transmission was scoped as its own milestone.
+    ModelImage transmissionImage_;
+    uint32_t   transmissionMips_ = 1;
+    VkSampler  transmissionSampler_ = VK_NULL_HANDLE;
+    bool       hasTransmissive_ = false;   // any loaded material transmits
+    bool createTransmissionTarget(uint32_t w, uint32_t h);
+    void captureSceneColor(VkCommandBuffer cmd, uint32_t w, uint32_t h);
+    void writeIblSet();                    // (re)write set 2, incl. the transmission image
 
     // ── Pipeline ──────────────────────────────────────────────────────────
     VkDescriptorSetLayout dsLayout_ = VK_NULL_HANDLE;
