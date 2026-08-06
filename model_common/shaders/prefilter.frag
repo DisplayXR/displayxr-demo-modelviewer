@@ -1,16 +1,17 @@
 // Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Prefiltered specular environment: GGX importance-sample the analytic sky for
-// the mip's roughness. One mip per roughness level (set via push constant).
+// Prefiltered specular environment: GGX importance-sample the environment
+// (loaded HDRI, else the analytic sky — see env.glsl) for the mip's roughness.
+// One mip per roughness level (set via push constant).
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "ibl_common.glsl"
-#include "sky.glsl"
+#include "env.glsl"
 
 layout(location = 0) in vec2 inUV;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform P { int face; float roughness; } pc;
+layout(push_constant) uniform P { int face; float roughness; float envIsHdri; } pc;
 
 void main() {
     vec3 N = dirForFace(pc.face, inUV);
@@ -25,7 +26,7 @@ void main() {
         vec3 L = normalize(2.0 * dot(V, H) * H - V);
         float NdotL = max(dot(N, L), 0.0);
         if (NdotL > 0.0) {
-            color += skyRadiance(L) * NdotL;
+            color += envRadiance(L, pc.envIsHdri) * NdotL;
             totalW += NdotL;
         }
     }

@@ -1,17 +1,18 @@
 // Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Diffuse irradiance cubemap: cosine-weighted integration of the analytic sky
-// over the hemisphere about each output direction. Stores E/π (the main pass
-// multiplies by albedo directly).
+// Diffuse irradiance cubemap: cosine-weighted integration of the environment
+// (loaded HDRI, else the analytic sky — see env.glsl) over the hemisphere about
+// each output direction. Stores E/π (the main pass multiplies by albedo
+// directly).
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "ibl_common.glsl"
-#include "sky.glsl"
+#include "env.glsl"
 
 layout(location = 0) in vec2 inUV;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform P { int face; float roughness; } pc;
+layout(push_constant) uniform P { int face; float roughness; float envIsHdri; } pc;
 
 void main() {
     vec3 N = dirForFace(pc.face, inUV);
@@ -28,7 +29,7 @@ void main() {
         float sinT = sqrt(Xi.y);
         vec3 l = vec3(cos(phi) * sinT, sin(phi) * sinT, cosT);
         vec3 wd = tx * l.x + ty * l.y + N * l.z;
-        irr += skyRadiance(wd);
+        irr += envRadiance(wd, pc.envIsHdri);
     }
     outColor = vec4(irr / float(NS), 1.0);
 }

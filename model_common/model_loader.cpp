@@ -80,8 +80,12 @@ bool model_loader_load(const char* path, ModelData& out) {
 bool model_validate_file(const std::string& path) {
     if (path.empty()) return false;
     const std::string ext = lowerExt(path);
-    static constexpr std::array<const char*, 9> kSupported = {
-        ".glb", ".gltf", ".stl", ".obj", ".fbx", ".usdz", ".usd", ".usda", ".usdc" };
+    // .hdr is not a model — it's an environment. It's accepted here so the
+    // existing open dialog / drag-drop paths can deliver one; ModelRenderer::
+    // loadModel routes it to setEnvironment instead of the mesh backends.
+    static constexpr std::array<const char*, 10> kSupported = {
+        ".glb", ".gltf", ".stl", ".obj", ".fbx", ".usdz", ".usd", ".usda", ".usdc",
+        ".hdr" };
     bool known = false;
     for (const char* e : kSupported) if (ext == e) { known = true; break; }
     if (!known) return false;

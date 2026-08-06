@@ -766,6 +766,23 @@ static void ApplyAutoFitForLoadedScene() {
     g_viewParams.scaleFactor = 1.0f;
 }
 
+// A bundled environment.hdr, when present next to the exe, becomes the IBL
+// source at startup (issue #70). Absent, the viewer keeps the procedural
+// analytic sky — purely additive, and the HUD/log names whichever is active so
+// a reference capture is self-documenting.
+static void TryAutoLoadBundledEnvironment() {
+    std::string dir = ExeDir();
+    if (dir.empty()) return;
+    std::string path = dir + "/environment.hdr";
+    if (!FileExists(path)) {
+        LOG_INFO("No bundled environment.hdr (using the procedural analytic sky)");
+        return;
+    }
+    if (g_modelRenderer.setEnvironment(path.c_str())) {
+        LOG_INFO("Environment: %s", g_modelRenderer.environmentName().c_str());
+    }
+}
+
 static void TryAutoLoadBundledScene() {
     std::string dir = ExeDir();
     if (dir.empty()) return;
@@ -866,6 +883,17 @@ static void PumpXEvents(AppXrSession& xr) {
             // Ctrl+O = open a model (uniform across demos + platforms, incl.
             // the mediaplayer). Strict: Ctrl must be held (bare O does nothing).
             if ((sym == XK_o || sym == XK_O) && (ev.xkey.state & ControlMask)) StartFilePicker();
+            // Viewing conditions (issue #70): [ / ] step exposure in quarter
+            // stops, G cycles the tone curve. Both are reported in the log so a
+            // reference capture records the grading it was taken under.
+            else if (sym == XK_bracketleft || sym == XK_bracketright) {
+                const float step = (sym == XK_bracketright) ? 0.25f : -0.25f;
+                g_modelRenderer.setExposureEV(g_modelRenderer.exposureEV() + step);
+                LOG_INFO("Exposure: %+.2f EV", g_modelRenderer.exposureEV());
+            } else if (sym == XK_g || sym == XK_G) {
+                g_modelRenderer.cycleToneCurve();
+                LOG_INFO("Tone curve: %s", g_modelRenderer.toneCurveName());
+            }
             break;
         }
         case ConfigureNotify:
@@ -963,6 +991,9 @@ int main() {
     }
     xr.currentRenderingMode = xr.renderingModeCount > 1 ? 1 : 0;
 
+    // Environment first: setEnvironment rebakes the IBL cubes, so doing it
+    // before the model means frame one is already lit correctly.
+    TryAutoLoadBundledEnvironment();
     TryAutoLoadBundledScene();
 
     LOG_INFO("=== Entering main loop ===");

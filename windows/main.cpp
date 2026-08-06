@@ -955,6 +955,27 @@ static bool IsClickOnAnimButton(int mouseX, int mouseY, int windowW, int windowH
 // common/atlas_capture* — see dxr_capture::MakeCaptureAtlasPrefix /
 // TriggerCaptureFlash / PostFlashRequest.
 
+// A bundled environment.hdr, when present next to the exe, becomes the IBL
+// source at startup (issue #70). Absent, the viewer keeps the procedural
+// analytic sky — purely additive, and the HUD names whichever is active so a
+// reference capture is self-documenting.
+static void TryAutoLoadBundledEnvironment() {
+    char exePath[MAX_PATH] = {0};
+    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return;
+    char* lastSlash = strrchr(exePath, '\\');
+    if (!lastSlash) lastSlash = strrchr(exePath, '/');
+    if (!lastSlash) return;
+    *(lastSlash + 1) = '\0';
+    const std::string path = std::string(exePath) + "environment.hdr";
+    if (!PathFileExistsA(path.c_str())) {
+        LOG_INFO("No bundled environment.hdr (using the procedural analytic sky)");
+        return;
+    }
+    if (g_modelRenderer.setEnvironment(path.c_str())) {
+        LOG_INFO("Environment: %s", g_modelRenderer.environmentName().c_str());
+    }
+}
+
 // Load a scene at startup. With an explicit path (first CLI arg) load that;
 // otherwise fall back to the bundled sample.glb next to the exe.
 static void TryAutoLoadBundledScene(const std::string& overridePath = std::string()) {
@@ -1202,6 +1223,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // I key = capture multi-view atlas
         if (wParam == 'I' || wParam == 'i') {
             g_captureAtlasRequested.store(true);
+        }
+        // Viewing conditions (issue #70): [ / ] step exposure in quarter stops,
+        // G cycles the tone curve. Both show in the HUD, so a screen capture
+        // records the grading it was taken under. (T is eye-tracking.)
+        if (wParam == VK_OEM_4 || wParam == VK_OEM_6) {   // '[' and ']'
+            const float step = (wParam == VK_OEM_6) ? 0.25f : -0.25f;
+            g_modelRenderer.setExposureEV(g_modelRenderer.exposureEV() + step);
+            LOG_INFO("Exposure: %+.2f EV", g_modelRenderer.exposureEV());
+            return 0;
+        }
+        if (wParam == 'G') {
+            g_modelRenderer.cycleToneCurve();
+            LOG_INFO("Tone curve: %s", g_modelRenderer.toneCurveName());
+            return 0;
         }
         // Dynamic-recenter pins: P arms, then X/Y/Z toggle that axis' pin.
         // onKey consumes P (arm) and X/Y/Z (while armed); otherwise it falls
@@ -2782,6 +2817,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                queueFamilyIndex, renderW, renderH)) {
             LOG_WARN("model renderer init failed - scene rendering will not be available");
         } else {
+            // Environment first: setEnvironment rebakes the IBL cubes, so doing
+            // it before the model means frame one is already lit correctly.
+            TryAutoLoadBundledEnvironment();
             TryAutoLoadBundledScene(cliModelPath);
         }
     }

@@ -41,6 +41,36 @@ struct ModelRenderer {
     const std::string& modelPath() const;
     uint32_t primitiveCount() const;
 
+    // ── Viewing conditions (issue #70 phase 0) ───────────────────────────────
+    // A material comparison against an authoring tool is only meaningful when
+    // the environment, the exposure and the tone curve are all pinned and
+    // written down. These are the knobs that pin them; the HUD reports the
+    // active values so a reference capture is self-documenting.
+
+    // Load an equirectangular HDRI (.hdr / .exr-as-float via stb) as the IBL
+    // source and rebake the irradiance + prefiltered cubes from it. Passing
+    // nullptr or an empty path reverts to the procedural analytic sky.
+    // Rebaking is a handful of blocking fullscreen passes (~100 ms), so call it
+    // off the frame loop — at startup or on an explicit user action.
+    // Returns false and KEEPS the current environment if the file won't decode.
+    bool setEnvironment(const char* hdriPath);
+    bool hasHdriEnvironment() const { return envIsHdri_; }
+    // Basename of the loaded HDRI, or "analytic sky" when none is set.
+    const std::string& environmentName() const { return envName_; }
+
+    // Exposure in stops; the shader multiplies linear radiance by 2^EV.
+    void  setExposureEV(float ev);
+    float exposureEV() const { return exposureEV_; }
+
+    enum class ToneCurve { Clamp = 0, PbrNeutral = 1, Aces = 2 };
+    // Default is PbrNeutral — it preserves authored hue/saturation up to the
+    // knee, which is what a "does this material look like it did in the
+    // authoring tool" comparison needs. See shaders/tonemap.glsl.
+    void      setToneCurve(ToneCurve c);
+    ToneCurve toneCurve() const { return toneCurve_; }
+    void      cycleToneCurve();
+    const char* toneCurveName() const;
+
     // Advance the active animation clip by dtSeconds and refresh per-primitive
     // model matrices. No-op (static fast-path) when the model has no animation.
     // Call once per frame, before renderEye. Frozen while paused (the pose is
@@ -109,20 +139,24 @@ private:
         float mrParams[4];   // x=metallic, y=roughness, z=isSkinned(0/1), w=jointBase
         float emissive[4];   // rgb
     };
-    // Set-0 uniform buffer (must match shaders/pbr.{vert,frag}).
+    // Set-0 uniform buffer (must match shaders/pbr.{vert,frag} + skybox.frag).
     struct UniformBlock {
         float viewProj[16];
         float view[16];        // Z-forward-adjusted view, for the foreground clip
         float cameraPos[4];
         float lightDir[4];     // .xyz = light direction, .w = clipFar (view-space; 0=off)
         float invViewProj[16]; // inverse(viewProj), for the skybox ray reconstruction
+        float tone[4];         // x=exposure (2^EV), y=curve id, z=directional-light scale
     };
 
     bool createRenderTargets();
     bool ensureTargets(uint32_t w, uint32_t h);   // (re)create color+depth+framebuffer at this size
     bool createPipeline();
     bool createSamplerAndDefaults();
-    bool createIbl();   // generate BRDF LUT + irradiance + prefiltered cubes from the analytic sky
+    bool createIbl();   // BRDF LUT + the env descriptor + the first cube bake
+    bool bakeIblCubes();  // (re)generate irradiance + prefiltered cubes from the active environment
+    bool createEnvDescriptor();          // set-0 sampler the generation passes read the HDRI from
+    void bindEnvEquirect(VkImageView v); // point that descriptor at an image (HDRI or the 1x1 dummy)
     ModelImage uploadTexture(const struct ModelTexture& tex);
     VkDescriptorSet makeMaterialSet(VkImageView baseColor, VkImageView mr,
                                     VkImageView normal, VkImageView occ,
@@ -198,10 +232,12 @@ private:
         uint32_t size = 0;
         uint32_t mips = 1;
     };
-    // Render the analytic sky into each cube face/mip with the given fragment
-    // SPIR-V; perMipRoughness pushes {face, roughness} (prefilter) vs {face} (irradiance).
+    // Render the active environment into each cube face/mip with the given
+    // fragment SPIR-V. The push block is {face, roughness, envIsHdri}; the
+    // generation passes bind envSet_ (the equirect HDRI) at set 0.
     bool genCubeMap(CubeMap& cube, uint32_t size, uint32_t mips,
                     const uint32_t* fragSpv, size_t fragSpvBytes, bool perMipRoughness);
+    void destroyCubeMap(CubeMap& cube);
     ModelImage brdfLut_;                 // 2D R16G16_SFLOAT
     CubeMap irradianceCube_;
     CubeMap prefilterCube_;
@@ -210,6 +246,23 @@ private:
     VkDescriptorSetLayout iblSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool iblPool_ = VK_NULL_HANDLE;
     VkDescriptorSet iblSet_ = VK_NULL_HANDLE;
+
+    // ── Environment source for the IBL bake (set = 0 of the generation passes) ─
+    // envEquirect_ holds the loaded HDRI; when none is loaded it stays empty and
+    // the descriptor points at envDummyTex_ (descriptors must be valid even
+    // though the analytic-sky branch never samples it).
+    ModelImage envEquirect_;
+    ModelImage envDummyTex_;             // 1x1, bound when no HDRI is active
+    VkSampler  envSampler_ = VK_NULL_HANDLE;   // REPEAT in u (equirect wraps), CLAMP in v
+    VkDescriptorSetLayout envSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool      envPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet       envSet_ = VK_NULL_HANDLE;
+    bool        envIsHdri_ = false;
+    std::string envName_ = "analytic sky";
+
+    // ── Grading (issue #70 phase 0) ──────────────────────────────────────────
+    float     exposureEV_ = 0.0f;
+    ToneCurve toneCurve_  = ToneCurve::PbrNeutral;
 
     // ── Skinning (set = 3: joint-matrix SSBO, vertex stage) ──────────────
     VkDescriptorSetLayout jointSetLayout_ = VK_NULL_HANDLE;
