@@ -125,6 +125,12 @@ confirm both vary monotonically with their sweep.
 
 Tracking issue: [#70 — OpenPBR reference scene and material interoperability](https://github.com/DisplayXR/displayxr-demo-modelviewer/issues/70).
 
+**Authoring in OpenPBR?** [`docs/openpbr-to-gltf.md`](docs/openpbr-to-gltf.md)
+records what survives the export, what arrives approximated, and what glTF has
+no slot for at all — so a difference between the authoring tool and the viewer
+can be attributed to the export, the format, or the renderer rather than guessed
+at. (Subsurface is the big one: nothing carries.)
+
 ### The material grid
 
 `assets/material_grid.glb` is the reference scene the matrix above is measured
