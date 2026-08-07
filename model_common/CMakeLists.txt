@@ -106,27 +106,16 @@ if(NOT GLSLANGVALIDATOR_COMMAND)
 endif()
 
 set(SHADER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
-# PBR raster shaders. Port the full set (BRDF-LUT, irradiance, prefiltered-env
-# generation) from Vulkan-glTF-PBR when wiring IBL; pbr.{vert,frag} is the
-# minimal lit pass to start from.
-set(SHADER_SOURCES
-    shaders/pbr.vert
-    shaders/pbr.frag
-    shaders/skybox.frag
-    shaders/fullscreen.vert
-    shaders/brdf_lut.frag
-    shaders/irradiance.frag
-    shaders/prefilter.frag
-    shaders/sheen_lut.frag
-)
-# GLSL #include dependencies (force recompile when these change).
-set(SHADER_INCLUDES
-    ${SHADER_INCLUDE_DIR}/sky.glsl
-    ${SHADER_INCLUDE_DIR}/env.glsl
-    ${SHADER_INCLUDE_DIR}/ibl_common.glsl
-    ${SHADER_INCLUDE_DIR}/tonemap.glsl
-    ${SHADER_INCLUDE_DIR}/sheen.glsl
-)
+# Shader list is shared with the Android build — see model_common/shaders.cmake.
+include(${CMAKE_CURRENT_SOURCE_DIR}/shaders.cmake)
+set(SHADER_SOURCES "")
+foreach(_n ${MV_SHADER_NAMES})
+    list(APPEND SHADER_SOURCES shaders/${_n})
+endforeach()
+set(SHADER_INCLUDES "")
+foreach(_n ${MV_SHADER_INCLUDE_NAMES})
+    list(APPEND SHADER_INCLUDES ${SHADER_INCLUDE_DIR}/${_n})
+endforeach()
 
 set(SHADER_HEADERS "")
 foreach(GLSL_REL ${SHADER_SOURCES})

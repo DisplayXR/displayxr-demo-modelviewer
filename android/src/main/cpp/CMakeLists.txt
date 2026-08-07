@@ -54,8 +54,15 @@ if(NOT GLSLANGVALIDATOR_COMMAND)
     message(FATAL_ERROR "glslangValidator required — install the Vulkan SDK on the build host")
 endif()
 set(SHADER_DIR "${MODEL_COMMON}/shaders")
-set(MV_SHADERS pbr.vert pbr.frag skybox.frag fullscreen.vert
-    brdf_lut.frag irradiance.frag prefilter.frag)
+# Shader list is shared with the desktop build — see model_common/shaders.cmake.
+# Do NOT re-list shaders here; adding one in only one place is how the Android
+# build broke with a missing generated header.
+include(${MODEL_COMMON}/shaders.cmake)
+set(MV_SHADERS ${MV_SHADER_NAMES})
+set(MV_SHADER_INCLUDE_PATHS "")
+foreach(_n ${MV_SHADER_INCLUDE_NAMES})
+    list(APPEND MV_SHADER_INCLUDE_PATHS ${SHADER_DIR}/${_n})
+endforeach()
 set(SHADER_HEADERS "")
 foreach(S ${MV_SHADERS})
     string(REPLACE "." "_" VN "${S}")          # pbr.vert -> pbr_vert
@@ -65,8 +72,7 @@ foreach(S ${MV_SHADERS})
         COMMAND ${GLSLANGVALIDATOR_COMMAND}
             -V --target-env vulkan1.2 -I${SHADER_DIR}
             ${SHADER_DIR}/${S} --vn ${VN}_data -o ${HDR}
-        DEPENDS ${SHADER_DIR}/${S}
-                ${SHADER_DIR}/ibl_common.glsl ${SHADER_DIR}/sky.glsl
+        DEPENDS ${SHADER_DIR}/${S} ${MV_SHADER_INCLUDE_PATHS}
         COMMENT "Compiling SPIR-V: ${S}")
     list(APPEND SHADER_HEADERS ${HDR})
 endforeach()
