@@ -14,6 +14,7 @@ layout(location = 1) in vec3  inNormal;
 layout(location = 2) in vec2  inUV;
 layout(location = 3) in uvec4 inJoints0;   // skin joint indices (u16×4)
 layout(location = 4) in vec4  inWeights0;  // skin blend weights
+layout(location = 5) in vec4  inTangent;   // glTF TANGENT: xyz + handedness w (0 = absent)
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;     // proj * Y-flipped view
@@ -40,6 +41,7 @@ layout(location = 0) out vec3 outWorldPos;
 layout(location = 1) out vec3 outNormal;
 layout(location = 2) out vec2 outUV;
 layout(location = 3) out float outViewZ;   // view-space forward distance
+layout(location = 4) out vec4  outTangent; // world-space tangent + handedness
 
 void main() {
     mat4 m = pc.model;
@@ -56,6 +58,10 @@ void main() {
     outWorldPos = world.xyz;
     outNormal = normalize(mat3(m) * inNormal);
     outUV = inUV;
+    // Skin the tangent with the same matrix as the normal so it stays in the
+    // surface after deformation. Handedness (w) is a per-vertex constant and is
+    // carried through untouched.
+    outTangent = vec4(mat3(m) * inTangent.xyz, inTangent.w);
     outViewZ = (ubo.view * world).z;
     gl_Position = ubo.viewProj * world;
 }

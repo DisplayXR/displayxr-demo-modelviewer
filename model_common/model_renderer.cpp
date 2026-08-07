@@ -488,17 +488,18 @@ bool ModelRenderer::createPipeline() {
     stages[1].pName = "main";
 
     VkVertexInputBindingDescription vib = {0, sizeof(ModelVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription via[5] = {
+    VkVertexInputAttributeDescription via[6] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT,    (uint32_t)offsetof(ModelVertex, pos)},
         {1, 0, VK_FORMAT_R32G32B32_SFLOAT,    (uint32_t)offsetof(ModelVertex, normal)},
         {2, 0, VK_FORMAT_R32G32_SFLOAT,       (uint32_t)offsetof(ModelVertex, uv)},
         {3, 0, VK_FORMAT_R16G16B16A16_UINT,   (uint32_t)offsetof(ModelVertex, joints0)},
         {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(ModelVertex, weights0)},
+        {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(ModelVertex, tangent)},
     };
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1;
     vi.pVertexBindingDescriptions = &vib;
-    vi.vertexAttributeDescriptionCount = 5;
+    vi.vertexAttributeDescriptionCount = 6;
     vi.pVertexAttributeDescriptions = via;
 
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
