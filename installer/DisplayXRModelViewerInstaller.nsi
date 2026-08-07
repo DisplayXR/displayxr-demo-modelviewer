@@ -190,6 +190,8 @@ Section "Model Viewer Demo" SecDemo
     SetOutPath "$INSTDIR"
     File "${BIN_DIR}\model_viewer_handle_vk_win.exe"
     File "${BIN_DIR}\sample.glb"
+    ; Material grid (#70) — opened from the file dialog, not auto-loaded.
+    File "${BIN_DIR}\material_grid.glb"
 
     ; OpenXR loader — an OpenXR app must carry its own openxr_loader.dll next
     ; to the exe. The runtime ships a copy in its install dir, but that dir is
@@ -322,6 +324,7 @@ Section "Uninstall"
     ; Remove install dir contents.
     Delete "$INSTDIR\model_viewer_handle_vk_win.exe"
     Delete "$INSTDIR\sample.glb"
+    Delete "$INSTDIR\material_grid.glb"
     Delete "$INSTDIR\openxr_loader.dll"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir "$INSTDIR"

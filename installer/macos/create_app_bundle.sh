@@ -90,6 +90,10 @@ cp "$ARTIFACT_DIR/bin/$BINARY_NAME" "$APP_BUNDLE/Contents/Resources/"
 if [ -f "$ARTIFACT_DIR/assets/sample.glb" ]; then
     cp "$ARTIFACT_DIR/assets/sample.glb" "$APP_BUNDLE/Contents/Resources/"
 fi
+# Material grid (#70): every material feature in one scene, for Open… not startup.
+if [ -f "$ARTIFACT_DIR/assets/material_grid.glb" ]; then
+    cp "$ARTIFACT_DIR/assets/material_grid.glb" "$APP_BUNDLE/Contents/Resources/"
+fi
 if [ -d "$ARTIFACT_DIR/displayxr" ]; then
     cp -R "$ARTIFACT_DIR/displayxr/." "$APP_BUNDLE/Contents/Resources/displayxr/"
 fi

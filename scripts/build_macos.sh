@@ -99,6 +99,9 @@ mkdir -p "$ARTIFACT_DIR/bin" "$ARTIFACT_DIR/lib" "$ARTIFACT_DIR/assets" "$ARTIFA
 cp "$BIN" "$ARTIFACT_DIR/bin/"
 
 # Bundled scene + manifest + icons live in the repo.
+if [ -f "$REPO_ROOT/assets/material_grid.glb" ]; then
+    cp "$REPO_ROOT/assets/material_grid.glb" "$ARTIFACT_DIR/assets/"
+fi
 if [ -f "$REPO_ROOT/macos/assets/sample.glb" ]; then
     cp "$REPO_ROOT/macos/assets/sample.glb" "$ARTIFACT_DIR/assets/"
 fi
