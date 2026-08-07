@@ -190,6 +190,22 @@ deliberately sampled from a high roughness mip: a sharp, high-contrast sky sits
 far from the display's zero-disparity plane, where it causes lightfield
 cross-talk. A soft background stays comfortable.
 
+**Deterministic capture.** Set `DXR_MODELVIEWER_DETERMINISTIC=1` to pin the idle
+auto-orbit off at startup. Reference renders are only comparable if nothing
+moves between them, and the viewer starts slowly rotating the scene ~10 s after
+the last input — long enough that a scripted *launch, wait, capture* sequence
+lands at an unpredictable angle. Measured on the material grid, two captures 12
+seconds apart:
+
+| | channels differing |
+|---|---|
+| `DXR_MODELVIEWER_DETERMINISTIC=1` | **0 of 1,382,400 (0.00 %)** |
+| default | 1,347,650 (97.49 %) |
+
+An environment variable rather than a flag because the macOS build is an `.app`
+bundle with no argv, and a capture harness needs to set this the same way
+everywhere. Windows and macOS only — Linux has no auto-orbit.
+
 None of this makes output identical across physical displays — panel
 calibration, brightness, gamut and 3D cross-talk are separate concerns.
 
