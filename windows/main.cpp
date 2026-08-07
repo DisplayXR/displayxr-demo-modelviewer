@@ -3042,10 +3042,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
     g_inputState.renderingModeCount = xr.renderingModeCount;
-    // Align runtime active rendering mode with app's default (mode 1 = first 3D mode).
-    // The main loop's dispatch picks this up on the first frame and calls
-    // xrRequestDisplayRenderingModeDXR(1); the runtime event drives xr.currentModeIndex.
-    g_inputState.absoluteRenderingModeRequested = 1;
+    // Render whatever mode the DISPLAY reports active (xr.currentModeIndex was
+    // set from the isActive flag at enumeration) rather than forcing mode 1, so
+    // the app is view-config agnostic — a 4-view Quad display renders 4 tiles,
+    // etc. The main loop's dispatch re-asserts it; the runtime event keeps it
+    // current. Falls back to mode 1 if nothing reported active.
+    g_inputState.absoluteRenderingModeRequested =
+        (xr.currentModeIndex < xr.renderingModeCount) ? (int)xr.currentModeIndex : 1;
     g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
     g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle
     {
