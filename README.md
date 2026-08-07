@@ -223,6 +223,14 @@ An environment variable rather than a flag because the macOS build is an `.app`
 bundle with no argv, and a capture harness needs to set this the same way
 everywhere. Windows and macOS only — Linux has no auto-orbit.
 
+**Reference renders.** `scripts/capture_reference.sh <asset.glb> [outdir]`
+captures the viewer's output and writes a sidecar recording the conditions it
+was taken under — asset, platform, viewer commit, active environment, and any
+extensions the asset declared that were ignored. The sidecar is scraped from the
+runtime's own log rather than restated, so it cannot drift from what the viewer
+actually did. A reference nobody can reproduce is a screenshot, not a reference;
+two independent runs of the script produce byte-identical PNGs.
+
 None of this makes output identical across physical displays — panel
 calibration, brightness, gamut and 3D cross-talk are separate concerns.
 
