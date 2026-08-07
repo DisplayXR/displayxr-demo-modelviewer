@@ -194,6 +194,24 @@ bool ModelRenderer::init(VkInstance instance,
     if (!createSamplerAndDefaults()) return false;
     if (!createIbl()) return false;
 
+    {
+        // Set 1 now binds MTEX_COUNT samplers and set 2 binds 5, so the fragment
+        // stage wants MTEX_COUNT+5. Vulkan only GUARANTEES 16 per stage; real
+        // desktop and mobile GPUs report far more, but a device at the minimum
+        // would fail with an opaque pipeline-layout error, so say so up front.
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physDevice_, &props);
+        const uint32_t need = (uint32_t)MTEX_COUNT + 5;
+        const uint32_t have = props.limits.maxPerStageDescriptorSampledImages;
+        if (have < need) {
+            std::printf("ModelRenderer: WARNING device allows %u sampled images per stage, "
+                        "this pipeline needs %u — material textures may fail to bind\n", have, need);
+        } else {
+            std::printf("ModelRenderer: sampled images per stage: need %u, device allows %u\n",
+                        need, have);
+        }
+    }
+
     initialized_ = true;
     std::printf("ModelRenderer: initialized (%ux%u)\n", width_, height_);
     return true;
@@ -424,15 +442,15 @@ bool ModelRenderer::createPipeline() {
     if (vkCreateDescriptorSetLayout(device_, &dlci, nullptr, &dsLayout_) != VK_SUCCESS) return false;
 
     // Set 1: per-material textures — base color, MR, normal, occlusion, emissive.
-    VkDescriptorSetLayoutBinding mb[5] = {};
-    for (uint32_t i = 0; i < 5; ++i) {
+    VkDescriptorSetLayoutBinding mb[MTEX_COUNT] = {};
+    for (uint32_t i = 0; i < MTEX_COUNT; ++i) {
         mb[i].binding = i;
         mb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         mb[i].descriptorCount = 1;
         mb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo mlci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    mlci.bindingCount = 5;
+    mlci.bindingCount = MTEX_COUNT;
     mlci.pBindings = mb;
     if (vkCreateDescriptorSetLayout(device_, &mlci, nullptr, &matSetLayout_) != VK_SUCCESS) return false;
 
@@ -1196,9 +1214,7 @@ const char* ModelRenderer::toneCurveName() const {
     }
 }
 
-VkDescriptorSet ModelRenderer::makeMaterialSet(VkImageView baseColor, VkImageView mr,
-                                               VkImageView normal, VkImageView occ,
-                                               VkImageView emissive) {
+VkDescriptorSet ModelRenderer::makeMaterialSet(const VkImageView views[MTEX_COUNT]) {
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = matPool_;
     ai.descriptorSetCount = 1;
@@ -1206,10 +1222,9 @@ VkDescriptorSet ModelRenderer::makeMaterialSet(VkImageView baseColor, VkImageVie
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(device_, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
 
-    VkImageView views[5] = {baseColor, mr, normal, occ, emissive};
-    VkDescriptorImageInfo infos[5];
-    VkWriteDescriptorSet writes[5];
-    for (uint32_t i = 0; i < 5; ++i) {
+    VkDescriptorImageInfo infos[MTEX_COUNT];
+    VkWriteDescriptorSet writes[MTEX_COUNT];
+    for (uint32_t i = 0; i < MTEX_COUNT; ++i) {
         infos[i] = {sampler_, views[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         writes[i].dstSet = set;
@@ -1218,7 +1233,7 @@ VkDescriptorSet ModelRenderer::makeMaterialSet(VkImageView baseColor, VkImageVie
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[i].pImageInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_, MTEX_COUNT, writes, 0, nullptr);
     return set;
 }
 
@@ -1334,7 +1349,7 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
 
     // Per-material descriptor sets (set = 1) + a default for material == -1.
     const uint32_t nSets = (uint32_t)materials_.size() + 1;
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * 5};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * MTEX_COUNT};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = nSets;
     dpci.poolSizeCount = 1;
@@ -1348,15 +1363,29 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     };
     materialSets_.reserve(materials_.size());
     for (const auto& m : materials_) {
-        materialSets_.push_back(makeMaterialSet(
-            viewOr(m.baseColorTex, whiteTex_.view),
-            viewOr(m.metallicRoughnessTex, whiteTex_.view),
-            viewOr(m.normalTex, flatNormalTex_.view),
-            viewOr(m.occlusionTex, whiteTex_.view),
-            viewOr(m.emissiveTex, whiteTex_.view)));
+        // White is the correct absent-texture default for every one of these:
+        // each sampled value MULTIPLIES its factor, so 1.0 is the identity.
+        const VkImageView v[MTEX_COUNT] = {
+            viewOr(m.baseColorTex,          whiteTex_.view),
+            viewOr(m.metallicRoughnessTex,  whiteTex_.view),
+            viewOr(m.normalTex,             flatNormalTex_.view),
+            viewOr(m.occlusionTex,          whiteTex_.view),
+            viewOr(m.emissiveTex,           whiteTex_.view),
+            viewOr(m.clearcoatTex,          whiteTex_.view),
+            viewOr(m.clearcoatRoughnessTex, whiteTex_.view),
+            viewOr(m.sheenColorTex,         whiteTex_.view),
+            viewOr(m.sheenRoughnessTex,     whiteTex_.view),
+            viewOr(m.specularTex,           whiteTex_.view),
+            viewOr(m.specularColorTex,      whiteTex_.view),
+            viewOr(m.transmissionTex,       whiteTex_.view),
+            viewOr(m.thicknessTex,          whiteTex_.view),
+        };
+        materialSets_.push_back(makeMaterialSet(v));
     }
-    defaultMatSet_ = makeMaterialSet(whiteTex_.view, whiteTex_.view, flatNormalTex_.view,
-                                     whiteTex_.view, whiteTex_.view);
+    VkImageView dflt[MTEX_COUNT];
+    for (uint32_t i = 0; i < MTEX_COUNT; ++i) dflt[i] = whiteTex_.view;
+    dflt[MTEX_NORMAL] = flatNormalTex_.view;
+    defaultMatSet_ = makeMaterialSet(dflt);
 
     modelLoaded_ = true;
     return true;

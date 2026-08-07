@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 
 namespace {
 
@@ -77,7 +78,19 @@ void extVec3(const tinygltf::Value& obj, const char* key, float out[3]) {
     }
 }
 
-void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm) {
+// Raw glTF texture index under `obj.<key>.index`, or -1. Extension texture refs
+// are nested textureInfo objects, so this digs one level deeper than the plain
+// factor accessors above.
+int extTexIndex(const tinygltf::Value& obj, const char* key) {
+    if (!obj.IsObject() || !obj.Has(key)) return -1;
+    const tinygltf::Value& ti = obj.Get(key);
+    if (!ti.IsObject() || !ti.Has("index")) return -1;
+    const tinygltf::Value& idx = ti.Get("index");
+    return idx.IsInt() ? idx.GetNumberAsInt() : -1;
+}
+
+void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
+                             const std::function<int(int)>& resolveTex) {
     auto ext = [&](const char* name) -> const tinygltf::Value* {
         auto it = mat.extensions.find(name);
         return it == mat.extensions.end() ? nullptr : &it->second;
@@ -87,14 +100,20 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm) {
     if (const tinygltf::Value* v = ext("KHR_materials_specular")) {
         mm.specularFactor = (float)extNumber(*v, "specularFactor", mm.specularFactor);
         extVec3(*v, "specularColorFactor", mm.specularColorFactor);
+        mm.specularTex      = resolveTex(extTexIndex(*v, "specularTexture"));
+        mm.specularColorTex = resolveTex(extTexIndex(*v, "specularColorTexture"));
     }
     if (const tinygltf::Value* v = ext("KHR_materials_clearcoat")) {
         mm.clearcoatFactor    = (float)extNumber(*v, "clearcoatFactor", mm.clearcoatFactor);
         mm.clearcoatRoughness = (float)extNumber(*v, "clearcoatRoughnessFactor", mm.clearcoatRoughness);
+        mm.clearcoatTex          = resolveTex(extTexIndex(*v, "clearcoatTexture"));
+        mm.clearcoatRoughnessTex = resolveTex(extTexIndex(*v, "clearcoatRoughnessTexture"));
     }
     if (const tinygltf::Value* v = ext("KHR_materials_sheen")) {
         extVec3(*v, "sheenColorFactor", mm.sheenColorFactor);
         mm.sheenRoughness = (float)extNumber(*v, "sheenRoughnessFactor", mm.sheenRoughness);
+        mm.sheenColorTex     = resolveTex(extTexIndex(*v, "sheenColorTexture"));
+        mm.sheenRoughnessTex = resolveTex(extTexIndex(*v, "sheenRoughnessTexture"));
     }
     if (const tinygltf::Value* v = ext("KHR_materials_emissive_strength"))
         mm.emissiveStrength = (float)extNumber(*v, "emissiveStrength", mm.emissiveStrength);
@@ -110,12 +129,15 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm) {
         mm.iridescenceThicknessMax =
             (float)extNumber(*v, "iridescenceThicknessMaximum", mm.iridescenceThicknessMax);
     }
-    if (const tinygltf::Value* v = ext("KHR_materials_transmission"))
+    if (const tinygltf::Value* v = ext("KHR_materials_transmission")) {
         mm.transmissionFactor = (float)extNumber(*v, "transmissionFactor", mm.transmissionFactor);
+        mm.transmissionTex    = resolveTex(extTexIndex(*v, "transmissionTexture"));
+    }
     if (const tinygltf::Value* v = ext("KHR_materials_volume")) {
         mm.volumeThickness = (float)extNumber(*v, "thicknessFactor", mm.volumeThickness);
         extVec3(*v, "attenuationColor", mm.attenuationColor);
         mm.attenuationDistance = (float)extNumber(*v, "attenuationDistance", mm.attenuationDistance);
+        mm.thicknessTex = resolveTex(extTexIndex(*v, "thicknessTexture"));
     }
 }
 
@@ -512,7 +534,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         mm.normalTex             = resolveTex(mat.normalTexture.index);
         mm.occlusionTex          = resolveTex(mat.occlusionTexture.index);
         mm.emissiveTex           = resolveTex(mat.emissiveTexture.index);
-        parseMaterialExtensions(mat, mm);
+        parseMaterialExtensions(mat, mm, resolveTex);
         out.materials.push_back(mm);
     }
 

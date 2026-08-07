@@ -194,9 +194,17 @@ private:
     bool createEnvDescriptor();          // set-0 sampler the generation passes read the HDRI from
     void bindEnvEquirect(VkImageView v); // point that descriptor at an image (HDRI or the 1x1 dummy)
     ModelImage uploadTexture(const struct ModelTexture& tex);
-    VkDescriptorSet makeMaterialSet(VkImageView baseColor, VkImageView mr,
-                                    VkImageView normal, VkImageView occ,
-                                    VkImageView emissive);
+// Set 1 is one combined-image-sampler per material texture slot: the five core
+    // glTF maps plus the texture-driven variants of the KHR_materials_* factors.
+    // Passed as an array rather than 13 positional parameters — the order is the
+    // binding order, and MaterialTexSlot names it.
+    enum MaterialTexSlot {
+        MTEX_BASE_COLOR = 0, MTEX_MR, MTEX_NORMAL, MTEX_OCCLUSION, MTEX_EMISSIVE,
+        MTEX_CLEARCOAT, MTEX_CLEARCOAT_ROUGH, MTEX_SHEEN_COLOR, MTEX_SHEEN_ROUGH,
+        MTEX_SPECULAR, MTEX_SPECULAR_COLOR, MTEX_TRANSMISSION, MTEX_THICKNESS,
+        MTEX_COUNT
+    };
+    VkDescriptorSet makeMaterialSet(const VkImageView views[MTEX_COUNT]);
     bool finalizeModel(struct ModelData& md);   // upload geometry+textures, build material sets
     // Override the load-time (bind-pose) AABB with one measured from the active
     // animation: sample the clip, skin the verts on the CPU, union the box. The

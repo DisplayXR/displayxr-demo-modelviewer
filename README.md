@@ -54,15 +54,15 @@ difference.
 | Normal map (tangent-free, no `TANGENT` attribute needed) | ✅ |
 | Occlusion, emissive | ✅ |
 | Image-based lighting (irradiance + prefiltered specular + BRDF LUT) | ✅ |
-| `KHR_materials_ior` | ✅ factor — drives dielectric f0 instead of the old hard-coded 0.04 |
-| `KHR_materials_specular` | ✅ factors (`specularFactor`, `specularColorFactor`) |
-| `KHR_materials_clearcoat` | ✅ factors — second GGX lobe, base attenuated by the coat's Fresnel. No `clearcoatNormalTexture` |
-| `KHR_materials_sheen` | ✅ factors — Charlie + Ashikhmin, with spec energy compensation |
+| `KHR_materials_ior` | ✅ — drives dielectric f0 instead of the old hard-coded 0.04 |
+| `KHR_materials_specular` | ✅ factors **+ textures** (`specularTexture` A, `specularColorTexture` RGB) |
+| `KHR_materials_clearcoat` | ✅ factors **+ textures** (`clearcoatTexture` R, `clearcoatRoughnessTexture` G). No `clearcoatNormalTexture` |
+| `KHR_materials_sheen` | ✅ factors **+ textures** (`sheenColorTexture` RGB, `sheenRoughnessTexture` A), Charlie + Ashikhmin with spec energy compensation |
 | `KHR_materials_emissive_strength` | ✅ |
 | `KHR_materials_anisotropy` | ⚠️ factors — spec D/V, **direct light only** (see below) |
 | `KHR_materials_iridescence` | ✅ factors — full thin-film model, no thickness texture |
-| `KHR_materials_transmission` | ✅ factor — refracts the rendered scene, roughness-blurred |
-| `KHR_materials_volume` | ✅ factors — thickness-driven refraction + Beer-Lambert attenuation |
+| `KHR_materials_transmission` | ✅ factor **+ `transmissionTexture`** (R) — refracts the rendered scene, roughness-blurred |
+| `KHR_materials_volume` | ✅ factors **+ `thicknessTexture`** (G) — thickness-driven refraction + Beer-Lambert attenuation |
 | `KHR_texture_transform`, Draco, KTX2/Basis | ❌ |
 
 **Sheen conserves energy.** The base layer is scaled by
@@ -72,11 +72,19 @@ pair the shader evaluates, baked into a 64² table at startup
 (`shaders/sheen_lut.frag`). Evaluator and integrand share `shaders/sheen.glsl`,
 so the table cannot drift from the BRDF it is meant to integrate.
 
-**Factors only.** The texture-driven variants of the implemented extensions
-(`clearcoatTexture`, `sheenColorTexture`, `specularTexture`, …) are not read; a
-material that varies clear coat across a surface renders with its uniform
-factor. This is a partial implementation, not a missing one, so it does **not**
-appear in the ignored-extension warning — check this table.
+**Texture-driven variants are read** for clear coat, sheen, specular,
+transmission and volume — each samples the channel its extension specifies and
+multiplies the corresponding factor. Absent maps bind to 1×1 white, the
+multiplicative identity, so a factors-only material behaves exactly as before.
+Still **not** read: `clearcoatNormalTexture`, `anisotropyTexture`,
+`iridescenceTexture` and `iridescenceThicknessTexture`. Those are partial
+implementations rather than missing ones, so they do **not** trip the
+ignored-extension warning — this table is the reference.
+
+Set 1 now binds 13 samplers and set 2 binds 5. Vulkan only *guarantees* 16 per
+stage, so the renderer logs its budget against the device's actual limit at
+startup (`sampled images per stage: need 18, device allows …`) rather than
+letting a constrained device fail with an opaque pipeline-layout error.
 
 **Transmission costs a scene-colour copy per view.** Refracting the *rendered
 scene* (rather than only the environment, which the spec calls out as falling
@@ -120,7 +128,8 @@ Tracking issue: [#70 — OpenPBR reference scene and material interoperability](
 ### The material grid
 
 `assets/material_grid.glb` is the reference scene the matrix above is measured
-against: 9 material families × a 7-step parameter sweep, 63 spheres.
+against: 9 material families × a 7-step parameter sweep, plus a textured row —
+70 spheres.
 
 | Row | Family | Sweep |
 |---|---|---|
@@ -133,6 +142,7 @@ against: 9 material families × a 7-step parameter sweep, 63 spheres.
 | 6 | specular / IOR | `specularFactor` 0 → 1, `ior` 1.0 → 2.0 |
 | 7 | transmission | `transmissionFactor` 0 → 1, `ior` 1.5, volume |
 | 8 | emissive | `emissiveStrength` 0 → 6 |
+| 9 | textured | one texture-driven property per column, all reading one ramp |
 
 **The grid is a progress meter as much as a test asset**: a row is flat while
 its extension is ignored and comes alive when the extension lands. All nine rows
@@ -156,6 +166,13 @@ The script can, and it regenerates byte-identical output. Materials are named
 
 The extensions are declared in `extensionsUsed`, never `extensionsRequired`, so
 a loader that implements none of them still opens the file — which is the point.
+
+Row 9 embeds a single 8×64 PNG whose **four channels all carry the same 0→1
+ramp**. The extensions read different channels (clear coat R, clearcoat
+roughness G, sheen roughness A, transmission R, thickness G…), so one image
+drives every one of them and each sphere shows a pole-to-pole sweep of its own
+property. If texture support regresses the row goes flat — the same tell the
+rest of the grid uses.
 
 ## Environment and grading
 

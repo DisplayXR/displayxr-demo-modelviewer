@@ -87,6 +87,18 @@ struct ModelMaterial {
     // glTF's default is +Infinity, i.e. no absorption. 0 is the sentinel for
     // that here so the shader can guard with a finite comparison.
     float attenuationDistance = 0.0f;
+
+    // Texture-driven variants of the factors above. Indices into
+    // ModelData::textures, or -1. Each samples the channel the extension
+    // specifies and MULTIPLIES the corresponding factor, per glTF.
+    int clearcoatTex = -1;           // R
+    int clearcoatRoughnessTex = -1;  // G
+    int sheenColorTex = -1;          // RGB (sRGB-encoded)
+    int sheenRoughnessTex = -1;      // A
+    int specularTex = -1;            // A
+    int specularColorTex = -1;       // RGB (sRGB-encoded)
+    int transmissionTex = -1;        // R
+    int thicknessTex = -1;           // G
 };
 
 struct ModelPrimitive {
