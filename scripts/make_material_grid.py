@@ -37,6 +37,7 @@ import json
 import math
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 # ── Geometry ────────────────────────────────────────────────────────────────
@@ -88,6 +89,35 @@ def uv_sphere(radius, lon, lat):
 
 def lerp(a, b, t):
     return a + (b - a) * t
+
+
+# ── The one texture the textured row shares ─────────────────────────────────
+# A vertical ramp with ALL FOUR channels carrying the same 0→1 gradient. The
+# extensions read different channels (clearcoat R, clearcoatRoughness G,
+# sheenRoughness A, specular A, transmission R, thickness G…), so one image
+# drives every one of them and each sphere shows a pole-to-pole sweep of its own
+# property. If texture support regresses, the row goes flat — which is the same
+# tell the rest of the grid uses.
+TEX_W, TEX_H = 8, 64
+
+
+def gradient_png():
+    px = bytearray()
+    for y in range(TEX_H):
+        v = int(round(255.0 * y / (TEX_H - 1)))
+        px += bytes((v, v, v, v)) * TEX_W
+    raw = b"".join(b"\x00" + bytes(px[y * TEX_W * 4:(y + 1) * TEX_W * 4])
+                   for y in range(TEX_H))
+
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body +
+                struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", TEX_W, TEX_H, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
 
 
 def pbr(base, metallic, roughness):
@@ -157,6 +187,49 @@ def m_emissive(t):
                 "emissiveStrength": lerp(0.0, 6.0, t)}}}
 
 
+# Row 9 — one sphere per texture-driven property, all reading the same ramp.
+TEXTURED = [
+    ("clearcoatTex", {"pbrMetallicRoughness": pbr((0.55, 0.06, 0.06), 0.0, 0.55),
+                      "extensions": {"KHR_materials_clearcoat": {
+                          "clearcoatFactor": 1.0, "clearcoatRoughnessFactor": 0.06,
+                          "clearcoatTexture": {"index": 0}}}}),
+    ("clearcoatRoughTex", {"pbrMetallicRoughness": pbr((0.55, 0.06, 0.06), 0.0, 0.55),
+                           "extensions": {"KHR_materials_clearcoat": {
+                               "clearcoatFactor": 1.0, "clearcoatRoughnessFactor": 1.0,
+                               "clearcoatRoughnessTexture": {"index": 0}}}}),
+    ("sheenColorTex", {"pbrMetallicRoughness": pbr((0.14, 0.20, 0.42), 0.0, 0.85),
+                       "extensions": {"KHR_materials_sheen": {
+                           "sheenColorFactor": [1.0, 0.95, 0.85],
+                           "sheenRoughnessFactor": 0.3,
+                           "sheenColorTexture": {"index": 0}}}}),
+    ("sheenRoughTex", {"pbrMetallicRoughness": pbr((0.14, 0.20, 0.42), 0.0, 0.85),
+                       "extensions": {"KHR_materials_sheen": {
+                           "sheenColorFactor": [1.0, 0.95, 0.85],
+                           "sheenRoughnessFactor": 1.0,
+                           "sheenRoughnessTexture": {"index": 0}}}}),
+    ("specularTex", {"pbrMetallicRoughness": pbr((0.72, 0.72, 0.75), 0.0, 0.20),
+                     "extensions": {"KHR_materials_specular": {
+                         "specularFactor": 1.0,
+                         "specularTexture": {"index": 0}}}}),
+    ("transmissionTex", {"pbrMetallicRoughness": pbr((1.0, 1.0, 1.0), 0.0, 0.05),
+                         "extensions": {
+                             "KHR_materials_transmission": {
+                                 "transmissionFactor": 1.0,
+                                 "transmissionTexture": {"index": 0}},
+                             "KHR_materials_ior": {"ior": 1.5},
+                             "KHR_materials_volume": {"thicknessFactor": 0.9}}}),
+    ("thicknessTex", {"pbrMetallicRoughness": pbr((1.0, 1.0, 1.0), 0.0, 0.05),
+                      "extensions": {
+                          "KHR_materials_transmission": {"transmissionFactor": 1.0},
+                          "KHR_materials_ior": {"ior": 1.5},
+                          "KHR_materials_volume": {
+                              "thicknessFactor": 1.6,
+                              "attenuationDistance": 0.6,
+                              "attenuationColor": [0.35, 0.75, 0.55],
+                              "thicknessTexture": {"index": 0}}}}),
+]
+
+
 ROWS = [
     ("dielectric",   "metallic 0, roughness 0.03 → 1.0",            m_dielectric),
     ("metal",        "metallic 1, roughness 0.03 → 1.0",            m_metal),
@@ -168,6 +241,9 @@ ROWS = [
     ("transmission", "transmissionFactor 0 → 1, ior 1.5, volume",   m_transmission),
     ("emissive",     "emissiveStrength 0 → 6",                      m_emissive),
 ]
+
+# Row 9 is built from TEXTURED rather than a sweep function.
+TEXTURED_ROW_LABEL = ("textured", "one texture-driven property per column")
 
 # Extensions this scene references. extensionsUsed ONLY — putting any of these
 # in extensionsRequired would make a conformant loader that lacks them refuse
@@ -194,7 +270,9 @@ def build_glb():
     tan_b = b"".join(struct.pack("<4f", *t) for t in tan)
     idx_b = b"".join(struct.pack("<H", i) for i in idx)
     assert len(idx_b) % 4 == 0, "index block must stay 4-byte aligned"
-    blob = pos_b + nrm_b + uv_b + tan_b + idx_b
+    png = gradient_png()
+    png_pad = b"\x00" * ((4 - len(png) % 4) % 4)
+    blob = pos_b + nrm_b + uv_b + tan_b + idx_b + png + png_pad
 
     pmin = [min(p[k] for p in pos) for k in range(3)]
     pmax = [max(p[k] for p in pos) for k in range(3)]
@@ -206,6 +284,9 @@ def build_glb():
         views.append({"buffer": 0, "byteOffset": off, "byteLength": len(data), "target": target})
         off += len(data)
 
+    png_view = len(views)
+    views.append({"buffer": 0, "byteOffset": off, "byteLength": len(png)})
+
     accessors = [
         {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3",
          "min": pmin, "max": pmax},
@@ -216,7 +297,7 @@ def build_glb():
     ]
 
     materials, meshes, nodes, layout = [], [], [], []
-    rows, cols = len(ROWS), STEPS
+    rows, cols = len(ROWS) + 1, STEPS   # +1 for the textured row
     for r, (name, doc, make) in enumerate(ROWS):
         for c in range(cols):
             t = c / (cols - 1)
@@ -233,6 +314,21 @@ def build_glb():
             nodes.append({"name": mat["name"], "mesh": mi, "translation": [x, y, 0.0]})
         layout.append(f"  row {r}  {name:<13} {doc}")
 
+    # Row 9: texture-driven variants, one property per column.
+    r = len(ROWS)
+    for c, (tname, mat) in enumerate(TEXTURED):
+        mat = dict(mat)
+        mat["name"] = f"{r:02d}_textured_{tname}"
+        mi = len(materials)
+        materials.append(mat)
+        meshes.append({"name": mat["name"], "primitives": [{
+            "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TANGENT": 3},
+            "indices": 4, "material": mi}]})
+        x = (c - (cols - 1) / 2.0) * SPACING
+        y = ((rows - 1) / 2.0 - r) * SPACING
+        nodes.append({"name": mat["name"], "mesh": mi, "translation": [x, y, 0.0]})
+    layout.append(f"  row {r}  {'textured':<13} one texture-driven property per column")
+
     gltf = {
         "asset": {"version": "2.0",
                   "generator": "DisplayXR model-viewer material grid "
@@ -246,6 +342,10 @@ def build_glb():
         "accessors": accessors,
         "bufferViews": views,
         "buffers": [{"byteLength": len(blob)}],
+        "images": [{"bufferView": png_view, "mimeType": "image/png"}],
+        "samplers": [{"magFilter": 9729, "minFilter": 9729,
+                      "wrapS": 33071, "wrapT": 33071}],
+        "textures": [{"source": 0, "sampler": 0}],
     }
 
     json_b = json.dumps(gltf, separators=(",", ":")).encode()

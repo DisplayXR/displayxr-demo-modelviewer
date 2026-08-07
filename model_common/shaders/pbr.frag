@@ -58,6 +58,18 @@ layout(set = 1, binding = 1) uniform sampler2D mrTex;
 layout(set = 1, binding = 2) uniform sampler2D normalTex;
 layout(set = 1, binding = 3) uniform sampler2D occlusionTex;
 layout(set = 1, binding = 4) uniform sampler2D emissiveTex;
+// Texture-driven variants of the KHR_materials_* factors. Each samples the
+// channel its extension specifies and MULTIPLIES the factor, per glTF. Absent
+// maps are bound to 1×1 white, which is the multiplicative identity — so the
+// factor-only path costs one extra tap and behaves identically.
+layout(set = 1, binding = 5)  uniform sampler2D clearcoatTex;        // R
+layout(set = 1, binding = 6)  uniform sampler2D clearcoatRoughTex;   // G
+layout(set = 1, binding = 7)  uniform sampler2D sheenColorTex;       // RGB, sRGB
+layout(set = 1, binding = 8)  uniform sampler2D sheenRoughTex;       // A
+layout(set = 1, binding = 9)  uniform sampler2D specularTex;         // A
+layout(set = 1, binding = 10) uniform sampler2D specularColorTex;    // RGB, sRGB
+layout(set = 1, binding = 11) uniform sampler2D transmissionTex;     // R
+layout(set = 1, binding = 12) uniform sampler2D thicknessTex;        // G
 
 // Set 2: image-based lighting (generated from the analytic sky).
 layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
@@ -288,9 +300,9 @@ void main() {
     float ior                = me.p0.x;
     float specularFactor     = me.p0.y;
     float clearcoatFactor    = me.p0.z;
-    float clearcoatRoughness = clamp(me.p0.w, 0.03, 1.0);
+    float clearcoatRoughness = me.p0.w;
     vec3  specularColor      = me.p1.rgb;
-    float sheenRoughness     = clamp(me.p1.w, 0.05, 1.0);
+    float sheenRoughness     = me.p1.w;
     vec3  sheenColor         = me.p2.rgb;
     float emissiveStrength   = me.p2.w;
     float anisoStrength      = clamp(me.p3.x, 0.0, 1.0);
@@ -302,6 +314,18 @@ void main() {
     float volumeThickness    = me.p4.w;
     vec3  attenuationColor   = me.p5.rgb;
     float attenuationDist    = me.p5.w;
+
+    // Fold the texture variants into the factors. sheenColor/specularColor are
+    // sRGB-encoded per spec; the rest are linear single channels.
+    clearcoatFactor    *= texture(clearcoatTex, inUV).r;
+    clearcoatRoughness  = clamp(clearcoatRoughness * texture(clearcoatRoughTex, inUV).g, 0.03, 1.0);
+    sheenColor         *= srgbToLinear(texture(sheenColorTex, inUV).rgb);
+    sheenRoughness      = clamp(sheenRoughness * texture(sheenRoughTex, inUV).a, 0.05, 1.0);
+    specularFactor     *= texture(specularTex, inUV).a;
+    specularColor      *= srgbToLinear(texture(specularColorTex, inUV).rgb);
+    transmissionFactor  = clamp(transmissionFactor * texture(transmissionTex, inUV).r, 0.0, 1.0);
+    volumeThickness    *= texture(thicknessTex, inUV).g;
+
 
     // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────
     // The dielectric reflectance is no longer hard-coded at 0.04. That constant
