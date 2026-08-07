@@ -34,6 +34,12 @@ struct ModelVertex {
     // (float or normalized int) is decoded to float at load.
     uint16_t joints0[4]  = {0, 0, 0, 0};
     float    weights0[4] = {0, 0, 0, 0};
+    // glTF TANGENT: xyz = tangent, w = bitangent handedness (±1). All-zero when
+    // the asset has none, which the shader treats as "fall back to the
+    // screen-space-derivative frame". A real tangent matters for anisotropy,
+    // whose whole direction is DEFINED in this frame — the derivative frame
+    // flips across UV seams and degenerates at poles (issue #70).
+    float    tangent[4]  = {0, 0, 0, 0};
 };
 
 // Decoded RGBA8 texture image. Indices below reference ModelData::textures.

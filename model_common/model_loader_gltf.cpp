@@ -259,14 +259,17 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
             if (itPos == prim.attributes.end()) continue;
             auto itNrm = prim.attributes.find("NORMAL");
             auto itUv  = prim.attributes.find("TEXCOORD_0");
+            auto itTan = prim.attributes.find("TANGENT");
             auto itJnt = prim.attributes.find("JOINTS_0");
             auto itWgt = prim.attributes.find("WEIGHTS_0");
 
-            std::vector<float> pos, nrm, uv, wgt;
+            std::vector<float> pos, nrm, uv, tan, wgt;
             std::vector<uint16_t> jnt;
             readVec(m, itPos->second, 3, pos);
             readVec(m, itNrm != prim.attributes.end() ? itNrm->second : -1, 3, nrm);
             readVec(m, itUv  != prim.attributes.end() ? itUv->second  : -1, 2, uv);
+            // TANGENT is VEC4 in glTF: xyz plus a ±1 bitangent handedness.
+            readVec(m, itTan != prim.attributes.end() ? itTan->second : -1, 4, tan);
             // A primitive is skinned only when the node has a skin AND carries
             // both joint + weight attributes.
             const bool skinned = node.skin >= 0 &&
@@ -286,6 +289,10 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
                 if (!nrm.empty()) { v.normal[0] = nrm[i*3+0]; v.normal[1] = nrm[i*3+1]; v.normal[2] = nrm[i*3+2]; }
                 else              { v.normal[0] = 0; v.normal[1] = 1; v.normal[2] = 0; }
                 if (!uv.empty())  { v.uv[0] = uv[i*2+0]; v.uv[1] = uv[i*2+1]; }
+                // Left all-zero when absent — the shader reads that as "no
+                // authored tangent" and falls back to the derivative frame.
+                if (tan.size() >= (i + 1) * 4)
+                    for (int c = 0; c < 4; ++c) v.tangent[c] = tan[i * 4 + c];
                 if (skinned && jnt.size() >= (i + 1) * 4 && wgt.size() >= (i + 1) * 4) {
                     for (int c = 0; c < 4; ++c) {
                         v.joints0[c]  = jnt[i * 4 + c];

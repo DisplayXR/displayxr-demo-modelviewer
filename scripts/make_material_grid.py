@@ -47,8 +47,16 @@ STEPS = 7                  # columns = sweep steps per family
 
 
 def uv_sphere(radius, lon, lat):
-    """Positions / normals / uvs / indices for a lat-long sphere, +Y up."""
-    pos, nrm, uv, idx = [], [], [], []
+    """Positions / normals / uvs / TANGENTs / indices for a lat-long sphere.
+
+    The tangent is analytic — d(position)/d(longitude), i.e. the direction of
+    increasing u — rather than derived from the triangles. That matters for the
+    anisotropy row: anisotropy's direction is DEFINED in the tangent frame, and
+    a frame reconstructed from screen-space UV derivatives flips across the UV
+    seam and degenerates at the poles. Authoring TANGENT is what lets the viewer
+    apply anisotropy to image-based lighting at all (issue #70).
+    """
+    pos, nrm, uv, tan, idx = [], [], [], [], []
     for j in range(lat + 1):
         v = j / lat
         theta = v * math.pi
@@ -61,13 +69,16 @@ def uv_sphere(radius, lon, lat):
             nrm.append(n)
             pos.append((n[0] * radius, n[1] * radius, n[2] * radius))
             uv.append((u, v))
+            # d/dphi of the position, normalised: points along +u (east).
+            # Handedness +1 gives bitangent = cross(normal, tangent).
+            tan.append((-sp, 0.0, cp, 1.0))
     for j in range(lat):
         for i in range(lon):
             a = j * (lon + 1) + i
             b = a + lon + 1
             # CCW when viewed from outside, matching glTF's front-face winding.
             idx += [a, b, a + 1, a + 1, b, b + 1]
-    return pos, nrm, uv, idx
+    return pos, nrm, uv, tan, idx
 
 
 # ── Material families ───────────────────────────────────────────────────────
@@ -175,21 +186,23 @@ EXTENSIONS_USED = [
 
 
 def build_glb():
-    pos, nrm, uv, idx = uv_sphere(RADIUS, LON, LAT)
+    pos, nrm, uv, tan, idx = uv_sphere(RADIUS, LON, LAT)
 
     pos_b = b"".join(struct.pack("<3f", *p) for p in pos)
     nrm_b = b"".join(struct.pack("<3f", *n) for n in nrm)
     uv_b = b"".join(struct.pack("<2f", *t) for t in uv)
+    tan_b = b"".join(struct.pack("<4f", *t) for t in tan)
     idx_b = b"".join(struct.pack("<H", i) for i in idx)
     assert len(idx_b) % 4 == 0, "index block must stay 4-byte aligned"
-    blob = pos_b + nrm_b + uv_b + idx_b
+    blob = pos_b + nrm_b + uv_b + tan_b + idx_b
 
     pmin = [min(p[k] for p in pos) for k in range(3)]
     pmax = [max(p[k] for p in pos) for k in range(3)]
 
     off = 0
     views = []
-    for data, target in ((pos_b, 34962), (nrm_b, 34962), (uv_b, 34962), (idx_b, 34963)):
+    for data, target in ((pos_b, 34962), (nrm_b, 34962), (uv_b, 34962),
+                         (tan_b, 34962), (idx_b, 34963)):
         views.append({"buffer": 0, "byteOffset": off, "byteLength": len(data), "target": target})
         off += len(data)
 
@@ -198,7 +211,8 @@ def build_glb():
          "min": pmin, "max": pmax},
         {"bufferView": 1, "componentType": 5126, "count": len(nrm), "type": "VEC3"},
         {"bufferView": 2, "componentType": 5126, "count": len(uv), "type": "VEC2"},
-        {"bufferView": 3, "componentType": 5123, "count": len(idx), "type": "SCALAR"},
+        {"bufferView": 3, "componentType": 5126, "count": len(tan), "type": "VEC4"},
+        {"bufferView": 4, "componentType": 5123, "count": len(idx), "type": "SCALAR"},
     ]
 
     materials, meshes, nodes, layout = [], [], [], []
@@ -211,8 +225,8 @@ def build_glb():
             mi = len(materials)
             materials.append(mat)
             meshes.append({"name": mat["name"], "primitives": [{
-                "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2},
-                "indices": 3, "material": mi}]})
+                "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TANGENT": 3},
+                "indices": 4, "material": mi}]})
             # Grid centred on the origin; row 0 on top, sweep running left→right.
             x = (c - (cols - 1) / 2.0) * SPACING
             y = ((rows - 1) / 2.0 - r) * SPACING

@@ -87,14 +87,25 @@ mode (where there is no opaque scene to refract, so glass falls back to IBL).
 
 **Documented limitation — anisotropy is direct-light only.** The extension's
 distribution and visibility terms are implemented verbatim, but anisotropy is
-not applied to image-based lighting. The usual trick (bending the IBL reflection
-vector toward the stretch direction) needs a dependable tangent frame, and this
-renderer synthesizes one from screen-space UV derivatives rather than reading
-the glTF `TANGENT` attribute. On a UV sphere that frame flips across the seam
-and degenerates at the poles, and the bent reflection then samples the dark
-ground hemisphere — black blotches that look exactly like a shading bug. Reading
-`TANGENT` is the prerequisite for doing this properly. Consequence: on a metal
-lit mostly by an environment, anisotropy is measurable but close to invisible.
+not applied to image-based lighting. The standard trick — bending the IBL
+reflection vector toward the stretch direction — is implemented and then
+deliberately disabled: it produces a hard vertical pinch on a sphere, and the
+distortion is *non-monotonic* (strength 0.17 looks far worse than 1.0). The
+cause is not the tangent frame; authoring `TANGENT` (which this viewer now
+reads) disproved that hypothesis. Bending the reflection swings it across the
+procedural sky's hard sky/ground horizon, and a two-tone environment turns a
+smooth stretch into a visible seam. Anisotropic IBL is not spec text, so given
+the choice between a visible artifact and an under-stated effect, a
+material-fidelity viewer takes the under-stated one. Worth revisiting under a
+real HDRI, which has no hard horizon for the bend to cross. Consequence: on a
+metal lit mostly by an environment, anisotropy is measurable but close to
+invisible.
+
+**`TANGENT` is read when present.** The glTF `TANGENT` attribute now feeds the
+shading frame, with the screen-space-derivative frame as the fallback for assets
+that ship none. This is the correct source for normal mapping as well — the
+derivative frame flips across UV seams and degenerates at poles — and the
+material grid authors analytic tangents for its spheres.
 
 **Both anisotropy and iridescence are subtle in the material grid**, and that is
 physical rather than a defect. Anisotropy for the reason above; iridescence

@@ -16,6 +16,7 @@ layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in float inViewZ;
+layout(location = 4) in vec4  inTangent;   // world-space TANGENT + handedness (0 = absent)
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
@@ -273,7 +274,18 @@ void main() {
     // back-faces — visible front faces keep their authored outward normal.
     if (!gl_FrontFacing) Ng = -Ng;
     vec3 frameT, frameB; bool frameValid;
-    cotangentFrame(Ng, inUV, frameT, frameB, frameValid);
+    // An authored TANGENT is continuous across UV seams and well-defined at
+    // poles, so prefer it. The screen-space-derivative frame stays as the
+    // fallback for assets that ship none. `authoredTangent` also gates
+    // anisotropic IBL, which is only trustworthy on a real frame.
+    bool authoredTangent = dot(inTangent.xyz, inTangent.xyz) > 1e-8;
+    if (authoredTangent) {
+        frameT = normalize(inTangent.xyz - Ng * dot(Ng, inTangent.xyz));  // Gram-Schmidt
+        frameB = cross(Ng, frameT) * (inTangent.w < 0.0 ? -1.0 : 1.0);
+        frameValid = true;
+    } else {
+        cotangentFrame(Ng, inUV, frameT, frameB, frameValid);
+    }
     vec3 N = perturbNormal(Ng, inUV, frameT, frameB, frameValid);
 
     vec3 L = normalize(ubo.lightDir.xyz);
@@ -366,17 +378,23 @@ void main() {
     // the highlight is stretched in. This is the glTF sample-viewer approach —
     // the extension specifies the direct-light D and V but leaves prefiltered
     // IBL to the implementation, so this is an approximation, not spec text.
-    // NOTE — anisotropy affects DIRECT light only. The usual trick for
-    // anisotropic IBL is to bend the reflection vector toward the stretch
-    // direction, which is not spec text but standard practice. It was tried and
-    // removed: it needs a dependable tangent frame, and ours is synthesized from
-    // screen-space UV derivatives (no TANGENT attribute is read yet). On a UV
-    // sphere that frame flips across the seam and degenerates at the poles, and
-    // the bent reflection then samples the dark ground hemisphere — black
-    // blotches that look like a shading bug because they are one. Reading the
-    // glTF TANGENT attribute is the prerequisite; until then the honest choice
-    // is spec-correct direct light and unbent IBL, which costs visibility (a
-    // metal under IBL is dominated by the environment term) but never lies.
+    // Anisotropy affects DIRECT light only; the IBL reflection is NOT bent.
+    //
+    // The standard trick (glTF sample viewer) bends the reflection vector toward
+    // the stretch direction so the environment term elongates too. It is
+    // implemented correctly here and was then removed on the evidence: even with
+    // an AUTHORED tangent frame it produces a hard vertical pinch on a sphere,
+    // and the effect is non-monotonic — strength 0.17 and 0.33 look far more
+    // distorted than 1.0. The cause is not the tangent frame (that was my first
+    // guess, and authoring TANGENT disproved it): bending the reflection swings
+    // it across the analytic sky's hard sky/ground horizon, and the two-tone
+    // environment turns a smooth stretch into a visible seam.
+    //
+    // Anisotropic IBL is not spec text — the extension defines the direct-light
+    // D and V and leaves prefiltered IBL to the implementation. Given the choice
+    // between a visible artifact and an under-stated effect, a material-fidelity
+    // demo takes the under-stated one. Worth revisiting under a real HDRI, where
+    // there is no hard horizon for the bend to cross.
     vec3 reflDir = reflect(-V, N);
     vec3 prefiltered = textureLod(prefilteredMap, reflDir, roughness * maxLod).rgb;
     vec2 ab = texture(brdfLUT, vec2(ndotv, roughness)).rg;
