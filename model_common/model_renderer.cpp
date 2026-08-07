@@ -37,6 +37,7 @@
 #include "brdf_lut.frag.h"
 #include "irradiance.frag.h"
 #include "prefilter.frag.h"
+#include "sheen_lut.frag.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -437,15 +438,15 @@ bool ModelRenderer::createPipeline() {
 
     // Set 2: IBL — irradiance cube, prefiltered cube, BRDF LUT, plus the mipped
     // scene-colour copy transmissive surfaces refract against (all fragment).
-    VkDescriptorSetLayoutBinding ib[4] = {};
-    for (uint32_t i = 0; i < 4; ++i) {
+    VkDescriptorSetLayoutBinding ib[5] = {};
+    for (uint32_t i = 0; i < 5; ++i) {
         ib[i].binding = i;
         ib[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         ib[i].descriptorCount = 1;
         ib[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo ilci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    ilci.bindingCount = 4;
+    ilci.bindingCount = 5;
     ilci.pBindings = ib;
     if (vkCreateDescriptorSetLayout(device_, &ilci, nullptr, &iblSetLayout_) != VK_SUCCESS) return false;
 
@@ -917,15 +918,18 @@ bool ModelRenderer::createIbl() {
     // Must exist before genCubeMap, which binds it.
     if (!createEnvDescriptor()) return false;
 
-    // BRDF LUT (2D R16G16) via a fullscreen pass.
-    brdfLut_ = modelCreateImage2D(device_, physDevice_, 256, 256, VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    if (brdfLut_.image == VK_NULL_HANDLE) return false;
-    {
-        FsPipe fp = makeFsPipe(device_, VK_FORMAT_R16G16_SFLOAT, brdf_lut_frag_data, sizeof(brdf_lut_frag_data), 0);
+    // The split-sum BRDF LUT and the sheen directional-albedo LUT are both
+    // "run one fullscreen pass into an R16G16 table once at startup", so they
+    // share a baker rather than two near-identical 25-line blocks.
+    auto bakeLut = [&](ModelImage& dst, uint32_t size,
+                       const uint32_t* spv, size_t spvBytes) -> bool {
+        dst = modelCreateImage2D(device_, physDevice_, size, size, VK_FORMAT_R16G16_SFLOAT,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        if (dst.image == VK_NULL_HANDLE) return false;
+        FsPipe fp = makeFsPipe(device_, VK_FORMAT_R16G16_SFLOAT, spv, spvBytes, 0);
         VkFramebufferCreateInfo fbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        fbci.renderPass = fp.rp; fbci.attachmentCount = 1; fbci.pAttachments = &brdfLut_.view;
-        fbci.width = 256; fbci.height = 256; fbci.layers = 1;
+        fbci.renderPass = fp.rp; fbci.attachmentCount = 1; fbci.pAttachments = &dst.view;
+        fbci.width = size; fbci.height = size; fbci.layers = 1;
         VkFramebuffer fb; vkCreateFramebuffer(device_, &fbci, nullptr, &fb);
         VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cai.commandPool = cmdPool_; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
@@ -934,9 +938,9 @@ bool ModelRenderer::createIbl() {
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &bi);
         VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-        rpbi.renderPass = fp.rp; rpbi.framebuffer = fb; rpbi.renderArea.extent = {256, 256};
+        rpbi.renderPass = fp.rp; rpbi.framebuffer = fb; rpbi.renderArea.extent = {size, size};
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-        VkViewport vpr = {0, 0, 256, 256, 0, 1}; VkRect2D scs = {{0, 0}, {256, 256}};
+        VkViewport vpr = {0, 0, (float)size, (float)size, 0, 1}; VkRect2D scs = {{0, 0}, {size, size}};
         vkCmdSetViewport(cmd, 0, 1, &vpr); vkCmdSetScissor(cmd, 0, 1, &scs);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fp.pipe);
         vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -946,12 +950,16 @@ bool ModelRenderer::createIbl() {
         vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
         vkDestroyFramebuffer(device_, fb, nullptr);
         destroyFsPipe(device_, fp);
-    }
+        return true;
+    };
+    if (!bakeLut(brdfLut_, 256, brdf_lut_frag_data, sizeof(brdf_lut_frag_data))) return false;
+    // 64² is plenty: E is smooth in both N·V and roughness.
+    if (!bakeLut(sheenLut_, 64, sheen_lut_frag_data, sizeof(sheen_lut_frag_data))) return false;
 
     if (!bakeIblCubes()) return false;
 
     // Descriptor set (set = 2).
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &ps;
     if (vkCreateDescriptorPool(device_, &dpci, nullptr, &iblPool_) != VK_SUCCESS) return false;
@@ -967,15 +975,16 @@ bool ModelRenderer::createIbl() {
 // window resize (which recreates the transmission image). One function so the
 // four bindings can never drift out of step.
 void ModelRenderer::writeIblSet() {
-    VkDescriptorImageInfo ii[4] = {
+    VkDescriptorImageInfo ii[5] = {
         {iblCubeSampler_,      irradianceCube_.view,    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {iblCubeSampler_,      prefilterCube_.view,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {iblLutSampler_,       brdfLut_.view,           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {transmissionSampler_, transmissionImage_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {iblLutSampler_,       sheenLut_.view,          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
     };
-    VkWriteDescriptorSet w[4];
+    VkWriteDescriptorSet w[5];
     uint32_t n = 0;
-    for (uint32_t i = 0; i < 4; ++i) {
+    for (uint32_t i = 0; i < 5; ++i) {
         if (ii[i].imageView == VK_NULL_HANDLE) continue;   // not created yet
         w[n] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[n].dstSet = iblSet_; w[n].dstBinding = i; w[n].descriptorCount = 1;
@@ -2214,6 +2223,7 @@ void ModelRenderer::cleanup() {
     if (iblCubeSampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, iblCubeSampler_, nullptr); iblCubeSampler_ = VK_NULL_HANDLE; }
     if (iblLutSampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, iblLutSampler_, nullptr); iblLutSampler_ = VK_NULL_HANDLE; }
     if (brdfLut_.image != VK_NULL_HANDLE) modelDestroyImage(device_, brdfLut_);
+    if (sheenLut_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sheenLut_);
 
     // Environment source (set 0 of the generation passes).
     if (envPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, envPool_, nullptr); envPool_ = VK_NULL_HANDLE; envSet_ = VK_NULL_HANDLE; }

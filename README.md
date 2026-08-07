@@ -57,7 +57,7 @@ difference.
 | `KHR_materials_ior` | ✅ factor — drives dielectric f0 instead of the old hard-coded 0.04 |
 | `KHR_materials_specular` | ✅ factors (`specularFactor`, `specularColorFactor`) |
 | `KHR_materials_clearcoat` | ✅ factors — second GGX lobe, base attenuated by the coat's Fresnel. No `clearcoatNormalTexture` |
-| `KHR_materials_sheen` | ⚠️ factors — Charlie + Ashikhmin. **No energy compensation** (see below) |
+| `KHR_materials_sheen` | ✅ factors — Charlie + Ashikhmin, with spec energy compensation |
 | `KHR_materials_emissive_strength` | ✅ |
 | `KHR_materials_anisotropy` | ⚠️ factors — spec D/V, **direct light only** (see below) |
 | `KHR_materials_iridescence` | ✅ factors — full thin-film model, no thickness texture |
@@ -65,16 +65,18 @@ difference.
 | `KHR_materials_volume` | ✅ factors — thickness-driven refraction + Beer-Lambert attenuation |
 | `KHR_texture_transform`, Draco, KTX2/Basis | ❌ |
 
+**Sheen conserves energy.** The base layer is scaled by
+`1 - max3(sheenColor) · E` before sheen is added, where `E` is the sheen
+directional albedo — the hemispherical integral of the *same* Charlie/Ashikhmin
+pair the shader evaluates, baked into a 64² table at startup
+(`shaders/sheen_lut.frag`). Evaluator and integrand share `shaders/sheen.glsl`,
+so the table cannot drift from the BRDF it is meant to integrate.
+
 **Factors only.** The texture-driven variants of the implemented extensions
 (`clearcoatTexture`, `sheenColorTexture`, `specularTexture`, …) are not read; a
 material that varies clear coat across a surface renders with its uniform
 factor. This is a partial implementation, not a missing one, so it does **not**
 appear in the ignored-extension warning — check this table.
-
-**Documented approximation — sheen energy.** The spec scales the base layer by
-the sheen directional albedo so sheen redistributes energy rather than adding
-it, which needs a lookup table this renderer doesn't generate. Sheen is
-therefore additive here: fabric reads slightly too bright at grazing angles.
 
 **Transmission costs a scene-colour copy per view.** Refracting the *rendered
 scene* (rather than only the environment, which the spec calls out as falling
