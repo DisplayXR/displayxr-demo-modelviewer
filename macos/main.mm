@@ -40,6 +40,7 @@
 #include <stdexcept>
 #include <string>
 #include <array>
+#include <cstdlib>   // getenv (deterministic-capture switch)
 #include <chrono>
 #include <utility>
 #include <vector>
@@ -2031,6 +2032,22 @@ static void ApplyAutoFitForLoadedScene() {
 // analytic sky — so this is purely additive and the demo still runs with no
 // environment asset at all. Either way the HUD names the active environment,
 // which is what makes a reference capture self-documenting.
+// Deterministic-capture switch (issue #70 phase 3). Reference renders are only
+// comparable if nothing moves between them, and this viewer's idle auto-orbit
+// starts rotating the scene ~10 s after the last input — long enough that a
+// scripted "launch, wait, capture" sequence lands at an unpredictable angle.
+// Every regression measurement taken during phases 0-2 needed auto-orbit
+// disabled by hand-editing the source, which is not a workflow anyone should
+// inherit. DXR_MODELVIEWER_DETERMINISTIC=1 pins it off at startup.
+//
+// An environment variable rather than a CLI flag because the macOS build is an
+// .app bundle with no argv to parse, and a capture harness has to be able to set
+// this identically on every platform.
+static bool DeterministicCaptureRequested() {
+    const char* v = getenv("DXR_MODELVIEWER_DETERMINISTIC");
+    return v && v[0] && v[0] != '0';
+}
+
 static void TryAutoLoadBundledEnvironment() {
     std::string dir = ExeDir();
     if (dir.empty()) return;
@@ -2194,6 +2211,11 @@ int main() {
 
     // Environment before model: setEnvironment rebakes the IBL cubes, and doing
     // it first means the model's first rendered frame is already lit correctly.
+    if (DeterministicCaptureRequested()) {
+        g_input.animateEnabled = false;
+        LOG_INFO("Deterministic capture: auto-orbit disabled (DXR_MODELVIEWER_DETERMINISTIC)");
+    }
+
     TryAutoLoadBundledEnvironment();
 
     // Try loading the bundled sample.glb model (copied next to the exe by CMake).

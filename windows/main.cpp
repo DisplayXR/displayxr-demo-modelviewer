@@ -959,6 +959,22 @@ static bool IsClickOnAnimButton(int mouseX, int mouseY, int windowW, int windowH
 // source at startup (issue #70). Absent, the viewer keeps the procedural
 // analytic sky — purely additive, and the HUD names whichever is active so a
 // reference capture is self-documenting.
+// Deterministic-capture switch (issue #70 phase 3). Reference renders are only
+// comparable if nothing moves between them, and this viewer's idle auto-orbit
+// starts rotating the scene ~10 s after the last input — long enough that a
+// scripted "launch, wait, capture" sequence lands at an unpredictable angle.
+// Every regression measurement taken during phases 0-2 needed auto-orbit
+// disabled by hand-editing the source, which is not a workflow anyone should
+// inherit. DXR_MODELVIEWER_DETERMINISTIC=1 pins it off at startup.
+//
+// An environment variable rather than a CLI flag because the macOS build is an
+// .app bundle with no argv to parse, and a capture harness has to be able to set
+// this identically on every platform.
+static bool DeterministicCaptureRequested() {
+    const char* v = getenv("DXR_MODELVIEWER_DETERMINISTIC");
+    return v && v[0] && v[0] != '0';
+}
+
 static void TryAutoLoadBundledEnvironment() {
     char exePath[MAX_PATH] = {0};
     if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return;
@@ -2819,6 +2835,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         } else {
             // Environment first: setEnvironment rebakes the IBL cubes, so doing
             // it before the model means frame one is already lit correctly.
+            if (DeterministicCaptureRequested()) {
+                g_inputState.animateEnabled = false;
+                LOG_INFO("Deterministic capture: auto-orbit disabled (DXR_MODELVIEWER_DETERMINISTIC)");
+            }
             TryAutoLoadBundledEnvironment();
             TryAutoLoadBundledScene(cliModelPath);
         }
