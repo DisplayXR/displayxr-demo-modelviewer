@@ -133,9 +133,24 @@ at. (Subsurface is the big one: nothing carries.)
 
 ### The material grid
 
-`assets/material_grid.glb` is the reference scene the matrix above is measured
-against: 9 material families × a 7-step parameter sweep, plus a textured row —
-70 spheres.
+`material_grid.glb` is the reference scene the matrix above is measured against:
+9 material families × a 7-step parameter sweep, plus a textured row — 70
+spheres.
+
+**It ships with the viewer.** The installers put it next to the executable on
+Windows, macOS and Linux, so it is one *File ▸ Open* (`Ctrl+O`, or drag-and-drop
+on macOS) away — no build required. It is deliberately **not** the startup
+scene; the bundled helmet stays the default. If you want to see everything this
+renderer does in one screen, open the grid:
+
+| Platform | Where it lands |
+|---|---|
+| Windows | next to `model_viewer_handle_vk_win.exe` in the install dir |
+| macOS | inside the `.app` bundle, `Contents/Resources/` |
+| Linux | next to the binary (`.deb` / tarball) |
+
+In a source tree it is `assets/material_grid.glb`, and the build copies it next
+to the executable alongside `sample.glb`.
 
 | Row | Family | Sweep |
 |---|---|---|

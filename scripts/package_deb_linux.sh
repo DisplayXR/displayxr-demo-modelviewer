@@ -34,9 +34,11 @@ ASSETS_SUBDIR=""                                    # repo dir to bundle under a
 # bundled model … (skipping)" and launches empty. Deliberately defaults-only
 # (no assets/ dir bundling): sample.glb = the canonical shared DamagedHelmet
 # (identical across windows/macos/android; no linux/ copy exists), plus Fox.glb
-# so the user can demo animation-clip switching via the file-open dialog.
+# so the user can demo animation-clip switching via the file-open dialog, plus
+# material_grid.glb (#70) which shows every supported material feature at once.
 # "repo-relative-src:installed-basename" pairs.
-DEFAULT_ASSETS=("windows/assets/sample.glb:sample.glb" "assets/Fox.glb:Fox.glb")
+DEFAULT_ASSETS=("windows/assets/sample.glb:sample.glb" "assets/Fox.glb:Fox.glb"
+                "assets/material_grid.glb:material_grid.glb")
 
 set -euo pipefail
 

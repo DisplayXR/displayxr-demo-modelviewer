@@ -133,6 +133,17 @@ if(EXISTS "${BUNDLED_MODEL}")
     )
 endif()
 
+# Material grid (issue #70): every supported material feature in one scene.
+# Shipped next to the binary so it is one File > Open away, but deliberately NOT
+# the startup scene — the bundled helmet stays the default.
+set(MATERIAL_GRID "${CMAKE_SOURCE_DIR}/assets/material_grid.glb")
+if(EXISTS "${MATERIAL_GRID}")
+    add_custom_command(TARGET model_viewer_handle_vk_win POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${MATERIAL_GRID}" "$<TARGET_FILE_DIR:model_viewer_handle_vk_win>/material_grid.glb"
+        COMMENT "Copying material_grid.glb next to exe"
+    )
+endif()
+
 # Copy the DisplayXR shell sidecar (.displayxr.json + icons) next to the exe
 # so the installer / shell scanner picks it up.
 displayxr_install_manifest(model_viewer_handle_vk_win
