@@ -1463,7 +1463,12 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
                     xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
                     xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
-                    if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = (int32_t)i;
+                    // Only a 3D mode is a candidate for the app's default. The
+                    // display commonly reports its 2D mode active at startup
+                    // (it stays 2D until something asks for 3D), and adopting
+                    // that would open this 3D demo in mono.
+                    if (modes[i].isActive == XR_TRUE && modes[i].hardwareDisplay3D == XR_TRUE)
+                        xr.activeRenderingMode = (int32_t)i;
                     LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
                         modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
                         modes[i].viewScaleX, modes[i].viewScaleY,
@@ -2169,12 +2174,14 @@ int main() {
         vkDestroyDevice(vkDevice, nullptr); vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr); return 1; }
 
-    // Render whatever mode the DISPLAY reports active (set from isActive during
-    // CreateSession's mode enumeration) rather than the SIM_DISPLAY_OUTPUT /
-    // default 2-view guess above — so the viewer is view-config agnostic (a
-    // 4-view Quad display renders a 4-tile atlas). Runtime/controller mode
-    // changes are then tracked via XrEventDataRenderingModeChangedDXR (already
-    // handled below).
+    // Adopt the display's active mode rather than assuming a view count, so a
+    // 4-view Quad display renders a 4-tile atlas instead of a hard-coded 2.
+    // Gated on the mode being 3D: sim_display (and a real panel) typically
+    // reports its 2D mode active at startup, and adopting that verbatim opened
+    // this 3D demo in mono — measured as a 1-tile atlas where the previous
+    // build produced 2. When nothing 3D is active the earlier default (first 3D
+    // mode) stands. Runtime/controller changes are tracked afterwards via
+    // XrEventDataRenderingModeChangedDXR (handled below).
     if (xr.activeRenderingMode >= 0)
         g_input.currentRenderingMode = (uint32_t)xr.activeRenderingMode;
 

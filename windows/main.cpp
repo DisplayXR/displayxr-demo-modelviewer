@@ -3042,13 +3042,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
     g_inputState.renderingModeCount = xr.renderingModeCount;
-    // Render whatever mode the DISPLAY reports active (xr.currentModeIndex was
-    // set from the isActive flag at enumeration) rather than forcing mode 1, so
-    // the app is view-config agnostic — a 4-view Quad display renders 4 tiles,
-    // etc. The main loop's dispatch re-asserts it; the runtime event keeps it
-    // current. Falls back to mode 1 if nothing reported active.
+    // Adopt the display's active mode rather than forcing mode 1, so a 4-view
+    // Quad display renders 4 tiles instead of a hard-coded 2. Gated on that mode
+    // being 3D: a display commonly reports its 2D mode active at startup (it
+    // stays 2D until something asks for 3D), and adopting it verbatim opens this
+    // 3D demo in mono — verified on macOS as a 1-tile atlas where the build
+    // before produced 2. Falls back to mode 1 (first 3D mode) otherwise. The
+    // main loop's dispatch re-asserts it; the runtime event keeps it current.
+    const bool activeIs3D =
+        xr.currentModeIndex < xr.renderingModeCount &&
+        xr.renderingModeDisplay3D[xr.currentModeIndex];
     g_inputState.absoluteRenderingModeRequested =
-        (xr.currentModeIndex < xr.renderingModeCount) ? (int)xr.currentModeIndex : 1;
+        activeIs3D ? (int)xr.currentModeIndex : 1;
     g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
     g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle
     {
