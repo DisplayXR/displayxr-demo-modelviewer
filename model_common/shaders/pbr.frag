@@ -11,6 +11,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "tonemap.glsl"
+#define SHEEN_PI 3.14159265359
+#include "sheen.glsl"
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -65,6 +67,9 @@ layout(set = 2, binding = 2) uniform sampler2D   brdfLUT;         // split-sum s
 // against. Mip level is chosen from roughness, so a rough transmissive surface
 // scatters what's behind it (KHR_materials_transmission, issue #70 tier 2).
 layout(set = 2, binding = 3) uniform sampler2D   sceneColor;
+// Sheen directional albedo E(N·V, sheenRoughness) — see sheen_lut.frag. Lets
+// sheen redistribute energy rather than add it.
+layout(set = 2, binding = 4) uniform sampler2D   sheenLUT;
 
 layout(location = 0) out vec4 outColor;
 
@@ -107,21 +112,6 @@ vec3 linearToSrgb(vec3 c) {
 // Fresnel with a roughness-aware ceiling (for ambient specular).
 vec3 F_SchlickRoughness(float cosT, vec3 f0, float rough) {
     return f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
-}
-
-// ── KHR_materials_sheen ─────────────────────────────────────────────────────
-// Charlie distribution + Ashikhmin visibility, as specified by the extension.
-// Models retroreflective fabric fuzz, which GGX cannot: the lobe peaks at
-// grazing angles rather than around the mirror direction.
-float D_Charlie(float ndoth, float sheenRough) {
-    float alpha = max(sheenRough * sheenRough, 1e-4);
-    float invAlpha = 1.0 / alpha;
-    float cos2h = ndoth * ndoth;
-    float sin2h = max(1.0 - cos2h, 1e-7);
-    return (2.0 + invAlpha) * pow(sin2h, invAlpha * 0.5) / (2.0 * PI);
-}
-float V_Ashikhmin(float ndotl, float ndotv) {
-    return clamp(1.0 / (4.0 * (ndotl + ndotv - ndotl * ndotv)), 0.0, 1.0);
 }
 
 // Tangent-free normal mapping (Christian Schüler). Builds a cotangent frame
@@ -410,7 +400,16 @@ void main() {
     // generate, so it is omitted — sheen here adds energy rather than
     // redistributing it. Documented as an approximation in the README; it shows
     // up as a fabric that is slightly too bright at grazing angles.
-    if (max(sheenColor.r, max(sheenColor.g, sheenColor.b)) > 0.0) {
+    float sheenMax = max(sheenColor.r, max(sheenColor.g, sheenColor.b));
+    if (sheenMax > 0.0) {
+        // Energy compensation, per spec: the base layer is scaled by
+        // 1 - max3(sheenColor)·E before sheen is added, so a sheened fabric
+        // never reflects more light than falls on it. E is the hemispherical
+        // integral of the very same D_Charlie/V_Ashikhmin pair evaluated below
+        // (shared via sheen.glsl), baked into sheenLUT at startup.
+        float E = texture(sheenLUT, vec2(ndotv, sheenRoughness)).r;
+        color *= (1.0 - sheenMax * E);
+
         float sheenD = D_Charlie(ndoth, sheenRoughness);
         float sheenV = V_Ashikhmin(ndotl, ndotv);
         color += sheenColor * sheenD * sheenV * 3.0 * ubo.tone.z * ndotl;

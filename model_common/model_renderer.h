@@ -300,6 +300,9 @@ private:
                     const uint32_t* fragSpv, size_t fragSpvBytes, bool perMipRoughness);
     void destroyCubeMap(CubeMap& cube);
     ModelImage brdfLut_;                 // 2D R16G16_SFLOAT
+    // Sheen directional albedo E(N·V, sheenRoughness) — the table that lets
+    // sheen redistribute energy instead of adding it (KHR_materials_sheen).
+    ModelImage sheenLut_;
     CubeMap irradianceCube_;
     CubeMap prefilterCube_;
     VkSampler iblCubeSampler_ = VK_NULL_HANDLE;

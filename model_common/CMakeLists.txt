@@ -117,6 +117,7 @@ set(SHADER_SOURCES
     shaders/brdf_lut.frag
     shaders/irradiance.frag
     shaders/prefilter.frag
+    shaders/sheen_lut.frag
 )
 # GLSL #include dependencies (force recompile when these change).
 set(SHADER_INCLUDES
@@ -124,6 +125,7 @@ set(SHADER_INCLUDES
     ${SHADER_INCLUDE_DIR}/env.glsl
     ${SHADER_INCLUDE_DIR}/ibl_common.glsl
     ${SHADER_INCLUDE_DIR}/tonemap.glsl
+    ${SHADER_INCLUDE_DIR}/sheen.glsl
 )
 
 set(SHADER_HEADERS "")
