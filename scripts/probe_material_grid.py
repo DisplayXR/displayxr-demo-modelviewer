@@ -137,21 +137,52 @@ def main():
 
     col_occupied = [any(is_fg(x, y) for y in range(0, h, 4)) for x in range(w)]
     sphere_cols = runs_of(lambda x: col_occupied[x], w)
-    tiles = [t for t in merge(sphere_cols, w // 20) if t[1] - t[0] > w // 40]
-    print(f"view tiles       {len(tiles)}")
+    tile_x_bands = [t for t in merge(sphere_cols, w // 20) if t[1] - t[0] > w // 40]
+    # Tiles tile the atlas as an M×N grid (2×1 SBS, 2×2 Quad, …). Detect tile
+    # ROWS the same way as tile columns — vertical content bands — so a 2×2
+    # atlas reads as four tiles, not two mis-detected ones (#70 4-view / Quad).
+    # Coarse gap (h//20) separates tiles; the per-tile pass below re-splits each
+    # tile's band into material-grid rows with a fine gap.
+    row_bands_occ = [any(is_fg(x, y) for x in range(0, w, 4)) for y in range(h)]
+    tile_y_bands = [t for t in merge(runs_of(lambda y: row_bands_occ[y], h), h // 20)
+                    if t[1] - t[0] > h // 40]
+    tiles = [(xb[0], xb[1], yb[0], yb[1]) for yb in tile_y_bands for xb in tile_x_bands]
+    print(f"view tiles       {len(tiles)}   ({len(tile_x_bands)} cols x {len(tile_y_bands)} rows)")
     if not tiles:
         raise SystemExit("no geometry found — was material_grid.glb actually loaded?")
 
     ROWS = ["dielectric", "metal", "clearcoat", "sheen", "anisotropy",
             "iridescence", "specular_ior", "transmission", "emissive", "textured"]
 
-    for ti, (tx0, tx1) in enumerate(tiles):
-        cols = [c for c in sphere_cols if c[0] >= tx0 and c[1] <= tx1]
-        row_occupied = [any(is_fg(x, y) for x in range(tx0, tx1, 3)) for y in range(h)]
-        rws = merge(runs_of(lambda y: row_occupied[y], h), 3)
-        tw = tx1 - tx0
-        print(f"\ntile {ti}   x[{tx0},{tx1}] w={tw}   "
-              f"columns detected {len(cols)}/7   rows detected {len(rws)}/{len(ROWS)}")
+    # Detect each tile's sphere-columns and material-row bands up front.
+    tile_data = []
+    for (tx0, tx1, ty0, ty1) in tiles:
+        tcols = [c for c in sphere_cols if c[0] >= tx0 and c[1] <= tx1]
+        # Material-grid rows within THIS tile's y-band (a lower tile's rows never
+        # merge with the upper tile's — 2×2 Quad).
+        row_occ = [any(is_fg(x, y) for x in range(tx0, tx1, 3)) for y in range(ty0, ty1)]
+        trws = [(a + ty0, b + ty0) for a, b in merge(runs_of(lambda y: row_occ[y], ty1 - ty0), 3)]
+        tile_data.append((tx0, tx1, ty0, ty1, tcols, trws))
+
+    # All tiles are the SAME grid at the same fractional positions, so the row
+    # layout is shared. Subtle rows (anisotropy/iridescence/specular_ior) can
+    # blur into the sky gradient in a tile and fail to separate; reuse the row
+    # fractions from whichever tile resolved the full set (falls back to each
+    # tile's own bands when none did).
+    ref = max(tile_data, key=lambda t: len(t[5]))
+    canon = None
+    if len(ref[5]) >= len(ROWS):
+        rty0, rty1 = ref[2], ref[3]; rth = rty1 - rty0
+        canon = [((a - rty0) / rth, (b - rty0) / rth) for a, b in ref[5][:len(ROWS)]]
+
+    for ti, (tx0, tx1, ty0, ty1, cols, rws) in enumerate(tile_data):
+        tw, th = tx1 - tx0, ty1 - ty0
+        raw_n = len(rws)
+        if canon is not None:
+            rws = [(int(ty0 + f0 * th), int(ty0 + f1 * th)) for f0, f1 in canon]
+        aligned = " (rows aligned to reference)" if (canon is not None and raw_n != len(ROWS)) else ""
+        print(f"\ntile {ti}   x[{tx0},{tx1}] y[{ty0},{ty1}] {tw}x{th}   "
+              f"columns detected {len(cols)}/7   rows detected {raw_n}/{len(ROWS)}{aligned}")
         if len(cols) != 7 or len(rws) != len(ROWS):
             print("  NOTE detection is off — the numbers below may be misaligned;"
                   " attach the PNG instead of trusting them")
@@ -199,10 +230,10 @@ def main():
         # Fractional probe coordinates, so a reading from one box is directly
         # comparable to another with a different resolution or window size.
         fx = [((c[0] + c[1]) / 2.0 - tx0) / tw for c in cols[:n_c]]
-        fy = [(rws[r][0] + (rws[r][1] - rws[r][0]) * 0.45) / h for r in range(n_r)]
+        fy = [((rws[r][0] + (rws[r][1] - rws[r][0]) * 0.45) - ty0) / th for r in range(n_r)]
         # (a second probe height at 0.72 of each row is also sampled)
         print("  probe x (fraction of tile): " + " ".join(f"{v:.3f}" for v in fx))
-        print("  probe y (fraction of atlas): " + " ".join(f"{v:.3f}" for v in fy))
+        print("  probe y (fraction of tile): " + " ".join(f"{v:.3f}" for v in fy))
 
     if len(tiles) > 1:
         print("\ntile agreement (mean abs difference of row luma, tile0 vs others):")
