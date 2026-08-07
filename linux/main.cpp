@@ -226,6 +226,11 @@ struct AppXrSession {
     uint32_t renderingModeTileColumns[8] = {};
     uint32_t renderingModeTileRows[8] = {};
     uint32_t currentRenderingMode = 1;
+    //! Array index of the mode the runtime reports isActive at enumeration
+    //! (-1 = none). The app renders whatever mode the DISPLAY is in — 2, 4, or
+    //! N views — instead of hard-coding a 2-view mode, so it is view-config
+    //! agnostic (a forced Quad display renders a 4-tile atlas, etc.).
+    int32_t activeRenderingMode = -1;
 
     uint32_t maxViewCount = 2;
 };
@@ -441,6 +446,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
                     xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
                     xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
+                    if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = (int32_t)i;
                     LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
                              modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
                              modes[i].viewScaleX, modes[i].viewScaleY,
@@ -526,6 +532,15 @@ static void PollEvents(AppXrSession& xr) {
                 xr.sessionRunning = false;
             } else if (ssc->state == XR_SESSION_STATE_EXITING) {
                 xr.exitRequested = true;
+            }
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
+            // Runtime / workspace controller switched rendering mode on us —
+            // follow it so the per-frame re-assert tracks the display's actual
+            // mode instead of fighting it (keeps the app view-config agnostic).
+            auto* rmc = (XrEventDataRenderingModeChangedDXR*)&event;
+            if (rmc->currentModeIndex < xr.renderingModeCount) {
+                xr.currentRenderingMode = rmc->currentModeIndex;
+                LOG_INFO("Rendering mode changed by runtime -> %u", rmc->currentModeIndex);
             }
         }
         event.type = XR_TYPE_EVENT_DATA_BUFFER;
@@ -989,7 +1004,13 @@ int main() {
         if (xr.displayPixelWidth > 0) g_windowW = xr.displayPixelWidth;
         if (xr.displayPixelHeight > 0) g_windowH = xr.displayPixelHeight;
     }
-    xr.currentRenderingMode = xr.renderingModeCount > 1 ? 1 : 0;
+    // Render whatever mode the DISPLAY reports active (respects the runtime
+    // default, SIM_DISPLAY_OUTPUT / SIM_DISPLAY_FORCE_MODE, and any workspace
+    // controller) rather than hard-coding a 2-view mode. Falls back to the first
+    // 3D mode (index 1) when the runtime advertises no active mode.
+    xr.currentRenderingMode = (xr.activeRenderingMode >= 0)
+        ? (uint32_t)xr.activeRenderingMode
+        : (xr.renderingModeCount > 1 ? 1 : 0);
 
     // Environment first: setEnvironment rebakes the IBL cubes, so doing it
     // before the model means frame one is already lit correctly.
