@@ -1013,6 +1013,9 @@ struct AppXrSession {
     bool renderingModeDisplay3D[8] = {};
     uint32_t renderingModeTileColumns[8] = {};  // atlas tile layout (v12)
     uint32_t renderingModeTileRows[8] = {};
+    //! Array index of the mode the runtime reports isActive at enumeration
+    //! (-1 = none) — the app renders whatever mode the display is in.
+    int32_t activeRenderingMode = -1;
 
     // Max views the runtime may return from xrLocateViews, taken from
     // xrEnumerateViewConfigurationViews at session init. Some runtimes (e.g.
@@ -1460,6 +1463,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
                     xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
                     xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
+                    if (modes[i].isActive == XR_TRUE) xr.activeRenderingMode = (int32_t)i;
                     LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
                         modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
                         modes[i].viewScaleX, modes[i].viewScaleY,
@@ -2164,6 +2168,15 @@ int main() {
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
         vkDestroyDevice(vkDevice, nullptr); vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr); return 1; }
+
+    // Render whatever mode the DISPLAY reports active (set from isActive during
+    // CreateSession's mode enumeration) rather than the SIM_DISPLAY_OUTPUT /
+    // default 2-view guess above — so the viewer is view-config agnostic (a
+    // 4-view Quad display renders a 4-tile atlas). Runtime/controller mode
+    // changes are then tracked via XrEventDataRenderingModeChangedDXR (already
+    // handled below).
+    if (xr.activeRenderingMode >= 0)
+        g_input.currentRenderingMode = (uint32_t)xr.activeRenderingMode;
 
     // Model-load paths can now flip the agent animation-tool registration
     // (XR_DXR_mcp_tools late registration, #22). Set before the bundled-scene
