@@ -359,6 +359,149 @@ def build_glb():
     return out, len(materials), rows, cols, layout
 
 
+# ── Transmission test scene ─────────────────────────────────────────────────
+# A uniform sky is the worst possible backdrop for verifying refraction: a glass
+# ball that samples the RIGHT region and one that samples the WRONG region both
+# come out sky-coloured, and one that is not drawn at all looks the same again.
+# (Windows found exactly this ambiguity.)
+#
+# So this scene puts a strong VERTICAL COLOUR GRADIENT behind the spheres — red
+# at the top, blue at the bottom — so that "refracts correctly", "samples the
+# wrong region" and "was never drawn" produce three visibly different pictures
+# instead of three identical sky-coloured ones.
+#
+# HONEST LIMITATION: this is an eyeball aid, not yet an automated check. I first
+# designed it around "a lens inverts, so (R-B) flips sign inside the sphere" —
+# then measured, and the flip is not reliably there. That is expected on
+# reflection: the renderer uses the glTF sample-viewer approximation (refract
+# once at the entry surface, walk thicknessFactor along that ray, project the
+# exit point) rather than tracing through the volume, so it displaces the sampled
+# region without necessarily producing a full optical inversion. Shipping a test
+# whose expected result I had not verified would be worse than shipping none, so
+# the automated discriminator is deliberately absent until someone validates what
+# the correct output actually looks like.
+#
+# Kept as its own asset rather than added to the grid: a full-frame backdrop
+# would make every pixel foreground and break the grid probe's contrast-based
+# tile/row detection.
+
+def gradient_backdrop_png():
+    """Vertical red -> blue ramp. Deliberately saturated: the discriminator is
+    the SIGN of (R-B), so the further from neutral, the harder it is to fake."""
+    w, h = 8, 64
+    px = bytearray()
+    for y in range(h):
+        t = y / (h - 1)
+        r = int(round(255 * (1.0 - t)))
+        b = int(round(255 * t))
+        px += bytes((r, 24, b, 255)) * w
+    raw = b"".join(b"\x00" + bytes(px[y * w * 4:(y + 1) * w * 4]) for y in range(h))
+
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body +
+                struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
+
+
+def build_transmission_test():
+    pos, nrm, uv, tan, idx = uv_sphere(RADIUS, LON, LAT)
+    nsv = len(pos)
+
+    # Backdrop quad, behind the spheres and wide enough to fill the frame.
+    BW, BH, BZ = 12.0, 7.0, -2.5
+    qpos = [(-BW / 2, BH / 2, BZ), (BW / 2, BH / 2, BZ),
+            (-BW / 2, -BH / 2, BZ), (BW / 2, -BH / 2, BZ)]
+    qnrm = [(0.0, 0.0, 1.0)] * 4
+    quv = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+    qtan = [(1.0, 0.0, 0.0, 1.0)] * 4
+    qidx = [0, 2, 1, 1, 2, 3]
+
+    pos_b = b"".join(struct.pack("<3f", *p) for p in pos + qpos)
+    nrm_b = b"".join(struct.pack("<3f", *n) for n in nrm + qnrm)
+    uv_b = b"".join(struct.pack("<2f", *t) for t in uv + quv)
+    tan_b = b"".join(struct.pack("<4f", *t) for t in tan + qtan)
+    idx_b = b"".join(struct.pack("<H", i) for i in idx)
+    qidx_b = b"".join(struct.pack("<H", i + nsv) for i in qidx)
+    png = gradient_backdrop_png()
+    pad = lambda d: d + b"\x00" * ((4 - len(d) % 4) % 4)
+    blob = pos_b + nrm_b + uv_b + tan_b + pad(idx_b) + pad(qidx_b) + png
+
+    off, views = 0, []
+    for data, target in ((pos_b, 34962), (nrm_b, 34962), (uv_b, 34962), (tan_b, 34962),
+                         (pad(idx_b), 34963), (pad(qidx_b), 34963), (png, None)):
+        v = {"buffer": 0, "byteOffset": off, "byteLength": len(data)}
+        if target:
+            v["target"] = target
+        views.append(v)
+        off += len(data)
+
+    allp = pos + qpos
+    accessors = [
+        {"bufferView": 0, "componentType": 5126, "count": len(allp), "type": "VEC3",
+         "min": [min(p[k] for p in allp) for k in range(3)],
+         "max": [max(p[k] for p in allp) for k in range(3)]},
+        {"bufferView": 1, "componentType": 5126, "count": len(allp), "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5126, "count": len(allp), "type": "VEC2"},
+        {"bufferView": 3, "componentType": 5126, "count": len(allp), "type": "VEC4"},
+        {"bufferView": 4, "componentType": 5123, "count": len(idx), "type": "SCALAR"},
+        {"bufferView": 5, "componentType": 5123, "count": len(qidx), "type": "SCALAR"},
+    ]
+
+    materials, meshes, nodes = [], [], []
+    # Backdrop: rough, non-metal, so it reads as its texture rather than a mirror.
+    materials.append({"name": "backdrop",
+                      "pbrMetallicRoughness": {
+                          "baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0.0,
+                          "roughnessFactor": 0.9,
+                          "baseColorTexture": {"index": 0}}})
+    meshes.append({"name": "backdrop", "primitives": [{
+        "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TANGENT": 3},
+        "indices": 5, "material": 0}]})
+    nodes.append({"name": "backdrop", "mesh": 0, "translation": [0.0, 0.0, 0.0]})
+
+    for c in range(STEPS):
+        t = c / (STEPS - 1)
+        mat = m_transmission(t)
+        mat["name"] = f"glass_{t:.2f}"
+        # Thicker than the grid's so the lens inversion is unambiguous.
+        mat["extensions"]["KHR_materials_volume"]["thicknessFactor"] = 1.2
+        mi = len(materials)
+        materials.append(mat)
+        meshes.append({"name": mat["name"], "primitives": [{
+            "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TANGENT": 3},
+            "indices": 4, "material": mi}]})
+        nodes.append({"name": mat["name"], "mesh": mi,
+                      "translation": [(c - (STEPS - 1) / 2.0) * 1.15, 0.0, 0.0]})
+
+    gltf = {
+        "asset": {"version": "2.0",
+                  "generator": "DisplayXR transmission test (issue #70)"},
+        "extensionsUsed": ["KHR_materials_transmission", "KHR_materials_ior",
+                           "KHR_materials_volume"],
+        "scene": 0,
+        "scenes": [{"name": "transmission_test", "nodes": list(range(len(nodes)))}],
+        "nodes": nodes, "meshes": meshes, "materials": materials,
+        "accessors": accessors, "bufferViews": views,
+        "buffers": [{"byteLength": len(blob)}],
+        "images": [{"bufferView": 6, "mimeType": "image/png"}],
+        "samplers": [{"magFilter": 9729, "minFilter": 9729, "wrapS": 33071, "wrapT": 33071}],
+        "textures": [{"source": 0, "sampler": 0}],
+    }
+    jb = json.dumps(gltf, separators=(",", ":")).encode()
+    jb += b" " * ((4 - len(jb) % 4) % 4)
+    blob += b"\x00" * ((4 - len(blob) % 4) % 4)
+    total = 12 + 8 + len(jb) + 8 + len(blob)
+    out = struct.pack("<III", 0x46546C67, 2, total)
+    out += struct.pack("<II", len(jb), 0x4E4F534A) + jb
+    out += struct.pack("<II", len(blob), 0x004E4942) + blob
+    return out
+
+
 def main():
     dest = Path(sys.argv[1]) if len(sys.argv) > 1 else \
         Path(__file__).resolve().parent.parent / "assets" / "material_grid.glb"
@@ -368,6 +511,13 @@ def main():
     print(f"wrote {dest} ({len(glb):,} bytes)")
     print(f"{rows} families x {cols} steps = {nmat} materials, sweep runs left to right:")
     print("\n".join(layout))
+
+    tdest = dest.parent / "transmission_test.glb"
+    tdest.write_bytes(build_transmission_test())
+    print(f"wrote {tdest} ({tdest.stat().st_size:,} bytes)")
+    print("  7 glass spheres, transmissionFactor 0 -> 1, over a red(top)->blue(bottom)")
+    print("  backdrop. A lens INVERTS: refracting correctly flips the sign of (R-B)")
+    print("  inside the sphere versus the backdrop behind it.")
 
 
 if __name__ == "__main__":
