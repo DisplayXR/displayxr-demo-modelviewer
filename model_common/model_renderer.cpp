@@ -233,7 +233,12 @@ bool ModelRenderer::createRenderTargets() {
     atts[1].format = depthFormat_;
     atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
     atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // STORE, not DONT_CARE: the transmissive pass (renderPassLoad_ below) does
+    // LOAD_OP_LOAD on this same depth attachment so glass depth-tests against the
+    // opaque scene. DONT_CARE makes those contents undefined between the passes —
+    // tolerated on drivers that leave depth resident, but on a driver that honours
+    // the discard the transmissive draws fail the depth test and vanish entirely.
+    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
