@@ -1629,8 +1629,12 @@ static void RenderThreadFunc(
                 g_inputState.viewParams = inputSnapshot.viewParams;
                 // Auto-orbit always on; reset only clears the in-flight
                 // transition. The shared UpdateCameraMovement may set
-                // animateEnabled=false on Space — re-assert true here.
-                g_inputState.animateEnabled = true;
+                // animateEnabled=false on Space — re-assert true here. Except
+                // under DXR_MODELVIEWER_DETERMINISTIC: loading a scene requests a
+                // reset (TryAutoLoadBundledScene), so an unconditional true here
+                // restarted the orbit on every launch and no two captures framed
+                // the model the same way.
+                g_inputState.animateEnabled = !DeterministicCaptureRequested();
                 g_inputState.transitioning = false;
             }
         }
@@ -3055,7 +3059,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_inputState.absoluteRenderingModeRequested =
         activeIs3D ? (int)xr.currentModeIndex : 1;
     g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
-    g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle
+    // Auto-orbit on after 10 s idle — unless a deterministic capture asked for it
+    // off. This runs AFTER the renderer-init block that honours
+    // DXR_MODELVIEWER_DETERMINISTIC, so an unconditional true here silently undid
+    // the pin and every capture came out at a different rotation.
+    g_inputState.animateEnabled = !DeterministicCaptureRequested();
     {
         using namespace std::chrono;
         g_inputState.lastInputTimeSec = (double)duration_cast<microseconds>(
