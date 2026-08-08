@@ -91,9 +91,14 @@ def main():
     # majority of every row — and compare in RGB rather than luminance: several
     # of the grid's spheres are pale enough to match the sky's brightness while
     # differing clearly in hue.
+    # Sampling strides scale with the image so cost stays roughly constant from
+    # a 1920-wide atlas to a 4K one — a fixed stride makes the pure-Python scan
+    # take minutes at 3840x2160. ~200 samples is far more than a median needs.
+    sx = max(1, w // 200)
+    sy = max(1, h // 400)
     bg_row = []
     for y in range(h):
-        cols = [px(rows, ch, x, y) for x in range(0, w, 8)]
+        cols = [px(rows, ch, x, y) for x in range(0, w, sx)]
         bg_row.append(tuple(sorted(c[k] for c in cols)[len(cols) // 2] for k in range(3)))
 
     def is_fg(x, y):
@@ -103,7 +108,7 @@ def main():
 
     # 1. Uninitialized-memory signature. Cheap, and the single most diagnostic
     #    number here: it is what the viewport-scaling bug looked like.
-    magenta = sum(1 for y in range(0, h, 2) for x in range(0, w, 2)
+    magenta = sum(1 for y in range(0, h, max(1, sy // 2)) for x in range(0, w, max(1, sx // 2))
                   if (lambda p: p[0] > 200 and p[1] < 70 and p[2] > 200)(px(rows, ch, x, y)))
     print(f"magenta pixels   {magenta}   <- MUST be 0 (uninitialized VRAM signature)")
 
@@ -135,7 +140,7 @@ def main():
                 out.append([a, b])
         return [tuple(t) for t in out]
 
-    col_occupied = [any(is_fg(x, y) for y in range(0, h, 4)) for x in range(w)]
+    col_occupied = [any(is_fg(x, y) for y in range(0, h, sy)) for x in range(w)]
     sphere_cols = runs_of(lambda x: col_occupied[x], w)
     tile_x_bands = [t for t in merge(sphere_cols, w // 20) if t[1] - t[0] > w // 40]
     # Tiles tile the atlas as an M×N grid (2×1 SBS, 2×2 Quad, …). Detect tile
