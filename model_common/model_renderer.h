@@ -176,7 +176,8 @@ private:
         float cameraPos[4];
         float lightDir[4];     // .xyz = light direction, .w = clipFar (view-space; 0=off)
         float invViewProj[16]; // inverse(viewProj), for the skybox ray reconstruction
-        float tone[4];         // x=exposure (2^EV), y=curve id, z=directional-light scale
+        float tone[4];         // x=exposure (2^EV), y=curve id, z=directional-light scale,
+                               // w=transmission probe (issue #75; 0 = normal shading)
         // The internal colour target is the size of the whole SWAPCHAIN IMAGE,
         // but each eye renders into only the top-left viewport of it. Scene-
         // colour sampling (transmission) therefore has to scale clip-space UVs
@@ -247,7 +248,23 @@ private:
     // ── Render targets (internal; blitted to the swapchain viewport) ─────
     VkFormat colorFormat_ = VK_FORMAT_R8G8B8A8_UNORM;
     VkFormat depthFormat_ = VK_FORMAT_D32_SFLOAT;
+    // Scene-linear radiance — a SECOND colour attachment written alongside
+    // colorImage_ by every pass, holding what the shader had *before*
+    // applyToneMapping and the conditional sRGB encode. Transmission samples
+    // this, not colorImage_ (issue #75): colorImage_ is display-referred, so
+    // compositing it into a pre-tone-map `color` sent the transmitted light
+    // through the curve twice and — on a UNORM swapchain — through the sRGB
+    // encode twice, which is what washed the glass out.
+    //
+    // 16F, not a packed small float: the acceptance test for #75 requires a
+    // transmissive surface to reproduce the pixels behind it to within 1/255,
+    // and B10G11R11_UFLOAT's ~6-bit mantissa (relative error ~1.5%) cannot
+    // meet that. R16G16B16A16_SFLOAT is ~0.05% and is a Vulkan mandatory
+    // format for every feature this needs (colour attachment, blit src/dst,
+    // linear-filtered sampling), so no capability fallback is required.
+    VkFormat sceneLinearFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
     ModelImage colorImage_;
+    ModelImage sceneLinearImage_;
     ModelImage depthImage_;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     // Second pass over the same attachments with LOAD instead of CLEAR, for the
@@ -265,6 +282,15 @@ private:
     uint32_t   transmissionMips_ = 1;
     VkSampler  transmissionSampler_ = VK_NULL_HANDLE;
     bool       hasTransmissive_ = false;   // any loaded material transmits
+    // DXR_MODELVIEWER_TRANSMISSION_PROBE=1 — the issue #75 acceptance test.
+    // Forces thickness 0 (sample straight behind the fragment) and mip 0, then
+    // outputs the sampled scene radiance through the shader's own display
+    // transform instead of shading. Every transmissive surface must then
+    // reproduce the backdrop behind it and visually vanish; anything else means
+    // the sample is in the wrong colour space or the UV mapping is wrong.
+    // Reusing the shader's own tone/encode tail is deliberate — a probe with a
+    // hand-copied display transform can drift away from the one it is testing.
+    bool       transmissionProbe_ = false;
     bool createTransmissionTarget(uint32_t w, uint32_t h);
     void captureSceneColor(VkCommandBuffer cmd, uint32_t w, uint32_t h);
     void writeIblSet();                    // (re)write set 2, incl. the transmission image

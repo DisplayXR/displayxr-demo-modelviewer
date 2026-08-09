@@ -25,6 +25,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <vector>
@@ -189,6 +190,36 @@ bool ModelRenderer::init(VkInstance instance,
         return false;
     }
 
+    {
+        // Issue #75 acceptance probe — see transmissionProbe_. Off unless the
+        // env var is explicitly 1, so a stray empty value can't enable it.
+        const char* probe = std::getenv("DXR_MODELVIEWER_TRANSMISSION_PROBE");
+        transmissionProbe_ = (probe && probe[0] == '1' && probe[1] == '\0');
+        if (transmissionProbe_)
+            std::printf("ModelRenderer: TRANSMISSION PROBE on — transmissive surfaces "
+                        "show their raw scene sample, not shading (issue #75)\n");
+    }
+
+    {
+        // The scene-linear attachment (issue #75) needs to be a colour
+        // attachment, be blit-able both ways (the transmission mip chain is
+        // built by successive vkCmdBlitImage) and be linear-filterable when
+        // sampled. All four are mandatory for R16G16B16A16_SFLOAT in optimal
+        // tiling, so this is a diagnostic, not a fallback — if it ever fires,
+        // transmission is what breaks, and silently is the wrong way to find out.
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(physDevice_, sceneLinearFormat_, &fp);
+        const VkFormatFeatureFlags need =
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+            VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        if ((fp.optimalTilingFeatures & need) != need) {
+            std::printf("ModelRenderer: WARNING scene-linear format %d lacks features "
+                        "0x%x (has 0x%x) — transmission may be wrong\n",
+                        (int)sceneLinearFormat_, (unsigned)(need & ~fp.optimalTilingFeatures),
+                        (unsigned)fp.optimalTilingFeatures);
+        }
+    }
+
     if (!createRenderTargets()) return false;
     if (!createPipeline()) return false;
     if (!createSamplerAndDefaults()) return false;
@@ -220,7 +251,15 @@ bool ModelRenderer::init(VkInstance instance,
 bool ModelRenderer::createRenderTargets() {
     // Render pass (format-only; size-independent). Clears colour+depth, leaves
     // colour in TRANSFER_SRC for the per-eye viewport blit.
-    VkAttachmentDescription atts[2] = {};
+    //
+    // Attachment 1 is the scene-linear copy of attachment 0 — same geometry,
+    // same pixels, but pre-tone-map and pre-encode. It exists so transmission
+    // can sample scene radiance instead of display-referred pixels (issue #75);
+    // see sceneLinearImage_. It is written unconditionally rather than only for
+    // models that contain glass, because the render pass and the pipelines are
+    // built at init while hasTransmissive_ is only known after a model loads
+    // (and models are loaded and swapped at runtime via L / drag-drop).
+    VkAttachmentDescription atts[3] = {};
     atts[0].format = colorFormat_;
     atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
     atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -230,26 +269,32 @@ bool ModelRenderer::createRenderTargets() {
     atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     atts[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
-    atts[1].format = depthFormat_;
-    atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
-    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[1] = atts[0];
+    atts[1].format = sceneLinearFormat_;
+
+    atts[2].format = depthFormat_;
+    atts[2].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     // STORE, not DONT_CARE: the transmissive pass (renderPassLoad_ below) does
     // LOAD_OP_LOAD on this same depth attachment so glass depth-tests against the
     // opaque scene. DONT_CARE makes those contents undefined between the passes —
     // tolerated on drivers that leave depth resident, but on a driver that honours
     // the discard the transmissive draws fail the depth test and vanish entirely.
-    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    atts[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[2].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-    VkAttachmentReference colorRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkAttachmentReference depthRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference colorRefs[2] = {
+        {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+        {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+    };
+    VkAttachmentReference depthRef = {2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub = {};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &colorRef;
+    sub.colorAttachmentCount = 2;
+    sub.pColorAttachments = colorRefs;
     sub.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency deps[2] = {};
@@ -267,7 +312,7 @@ bool ModelRenderer::createRenderTargets() {
     deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
     VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpci.attachmentCount = 2;
+    rpci.attachmentCount = 3;
     rpci.pAttachments = atts;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &sub;
@@ -283,7 +328,9 @@ bool ModelRenderer::createRenderTargets() {
     atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     atts[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    atts[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    atts[1].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    atts[2].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    atts[2].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPassLoad_) != VK_SUCCESS) return false;
@@ -301,6 +348,7 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
     if (framebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
+    if (sceneLinearImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearImage_);
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
     if (transmissionImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, transmissionImage_);
     width_ = w; height_ = h;
@@ -308,6 +356,12 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     colorImage_ = modelCreateImage2D(device_, physDevice_, w, h, colorFormat_,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (colorImage_.image == VK_NULL_HANDLE) return false;
+
+    // The scene-linear twin. TRANSFER_SRC because captureSceneColor copies THIS
+    // (not colorImage_) into the mipped image transmission samples.
+    sceneLinearImage_ = modelCreateImage2D(device_, physDevice_, w, h, sceneLinearFormat_,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (sceneLinearImage_.image == VK_NULL_HANDLE) return false;
 
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D; ici.format = depthFormat_;
@@ -327,10 +381,10 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (vkCreateImageView(device_, &vci, nullptr, &depthImage_.view) != VK_SUCCESS) return false;
     depthImage_.width = w; depthImage_.height = h;
 
-    VkImageView fbViews[2] = {colorImage_.view, depthImage_.view};
+    VkImageView fbViews[3] = {colorImage_.view, sceneLinearImage_.view, depthImage_.view};
     VkFramebufferCreateInfo fbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     if (!createTransmissionTarget(w, h)) return false;
-    fbci.renderPass = renderPass_; fbci.attachmentCount = 2; fbci.pAttachments = fbViews;
+    fbci.renderPass = renderPass_; fbci.attachmentCount = 3; fbci.pAttachments = fbViews;
     fbci.width = w; fbci.height = h; fbci.layers = 1;
     if (vkCreateFramebuffer(device_, &fbci, nullptr, &framebuffer_) != VK_SUCCESS) return false;
     return true;
@@ -340,13 +394,19 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
 // roughness-blurred refraction for free (a rough transmissive surface should
 // scatter what's behind it), which is the whole reason to build a chain rather
 // than a flat copy.
+//
+// It carries sceneLinearFormat_, not colorFormat_ — it is a copy of
+// sceneLinearImage_ (issue #75). That also makes the mip chain correct rather
+// than merely plausible: box-filtering display-referred pixels averages in a
+// non-linear space, so a blurred refraction of a bright/dark edge came out at
+// the wrong mean brightness even before the double tone map is accounted for.
 bool ModelRenderer::createTransmissionTarget(uint32_t w, uint32_t h) {
     uint32_t mips = 1;
     for (uint32_t d = std::max(w, h); d > 1; d >>= 1) ++mips;
     transmissionMips_ = mips;
 
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = colorFormat_;
+    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = sceneLinearFormat_;
     ici.extent = {w, h, 1}; ici.mipLevels = mips; ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -360,7 +420,7 @@ bool ModelRenderer::createTransmissionTarget(uint32_t w, uint32_t h) {
     if (vkAllocateMemory(device_, &ai, nullptr, &transmissionImage_.memory) != VK_SUCCESS) return false;
     vkBindImageMemory(device_, transmissionImage_.image, transmissionImage_.memory, 0);
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vci.image = transmissionImage_.image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = colorFormat_;
+    vci.image = transmissionImage_.image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = sceneLinearFormat_;
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
     if (vkCreateImageView(device_, &vci, nullptr, &transmissionImage_.view) != VK_SUCCESS) return false;
     transmissionImage_.width = w; transmissionImage_.height = h;
@@ -370,10 +430,17 @@ bool ModelRenderer::createTransmissionTarget(uint32_t w, uint32_t h) {
     return true;
 }
 
-// Copy the opaque pass's colour into transmissionImage_ and build its mip chain.
-// colorImage_ arrives in TRANSFER_SRC_OPTIMAL (the first render pass's
-// finalLayout) and is left there — the caller barriers it back to
+// Copy the opaque pass's SCENE-LINEAR colour into transmissionImage_ and build
+// its mip chain. sceneLinearImage_ arrives in TRANSFER_SRC_OPTIMAL (the first
+// render pass's finalLayout) and is left there — the caller barriers it back to
 // COLOR_ATTACHMENT_OPTIMAL before the transmissive pass.
+//
+// Issue #75: this used to copy colorImage_, which the shader had already
+// tone-mapped and (on a UNORM swapchain) sRGB-encoded. The transmissive pass
+// then composited that display-referred value into a still-linear `color` that
+// went through both again — the washed-out glass. The source is now the
+// pre-tone-map attachment, so the sample and the surface it is composited into
+// are in the same space and the tail of pbr.frag runs exactly once.
 void ModelRenderer::captureSceneColor(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     auto barrier = [&](uint32_t mip, uint32_t count, VkImageLayout oldL, VkImageLayout newL,
                        VkAccessFlags srcA, VkAccessFlags dstA,
@@ -399,7 +466,7 @@ void ModelRenderer::captureSceneColor(VkCommandBuffer cmd, uint32_t w, uint32_t 
     cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     cp.extent = {w, h, 1};
-    vkCmdCopyImage(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdCopyImage(cmd, sceneLinearImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    transmissionImage_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
 
     int32_t mw = (int32_t)w, mh = (int32_t)h;
@@ -547,13 +614,18 @@ bool ModelRenderer::createPipeline() {
     ds.depthWriteEnable = VK_TRUE;
     ds.depthCompareOp = VK_COMPARE_OP_LESS;
 
-    VkPipelineColorBlendAttachmentState cba = {};
-    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    cba.blendEnable = VK_FALSE;
+    // Two colour attachments: 0 = display-referred output, 1 = the scene-linear
+    // twin transmission samples (issue #75). Same state for both — no blending,
+    // full write mask. The count MUST match the subpass's colorAttachmentCount.
+    VkPipelineColorBlendAttachmentState cba[2] = {};
+    for (VkPipelineColorBlendAttachmentState& a : cba) {
+        a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        a.blendEnable = VK_FALSE;
+    }
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 1;
-    cb.pAttachments = &cba;
+    cb.attachmentCount = 2;
+    cb.pAttachments = cba;
 
     VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dyn = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
@@ -1524,7 +1596,7 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.tone[0] = std::pow(2.0f, exposureEV_);
     ub.tone[1] = (float)(int)toneCurve_;
     ub.tone[2] = envIsHdri_ ? 0.0f : 1.0f;
-    ub.tone[3] = 0.0f;
+    ub.tone[3] = transmissionProbe_ ? 1.0f : 0.0f;
     ub.viewport[0] = (width_  > 0) ? (float)vpWidth_  / (float)width_  : 1.0f;
     ub.viewport[1] = (height_ > 0) ? (float)vpHeight_ / (float)height_ : 1.0f;
     ub.viewport[2] = ub.viewport[3] = 0.0f;
@@ -2015,17 +2087,23 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
 
-    VkClearValue clears[2];
+    VkClearValue clears[3];
     if (transparentBg) clears[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
     else               clears[0].color = {{0.05f, 0.05f, 0.06f, 1.0f}};
-    clears[1].depthStencil = {1.0f, 0};
+    // Scene-linear attachment. The clear value is never observed by anything
+    // that matters: transmission only samples this image in opaque mode, where
+    // the fullscreen skybox overwrites every pixel of the render area before a
+    // single model triangle is drawn. (Transparent mode has no opaque scene to
+    // refract, so it never runs the capture at all.)
+    clears[1].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    clears[2].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = renderPass_;
     rpbi.framebuffer = framebuffer_;
     rpbi.renderArea.offset = {0, 0};
     rpbi.renderArea.extent = {viewportWidth, viewportHeight};
-    rpbi.clearValueCount = 2;
+    rpbi.clearValueCount = 3;
     rpbi.pClearValues = clears;
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -2112,23 +2190,29 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     if (hasTransmissive_ && !transparentBg) {
         vkCmdEndRenderPass(cmd);
-        // colorImage_ is in TRANSFER_SRC_OPTIMAL here (pass-1 finalLayout),
-        // which is exactly what the copy wants.
+        // sceneLinearImage_ is in TRANSFER_SRC_OPTIMAL here (pass-1
+        // finalLayout), which is exactly what the copy wants.
         captureSceneColor(cmd, viewportWidth, viewportHeight);
 
-        // Back to a colour attachment for pass 2.
-        VkImageMemoryBarrier toAtt = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toAtt.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        toAtt.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        toAtt.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        toAtt.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        toAtt.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toAtt.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toAtt.image = colorImage_.image;
-        toAtt.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        // Both colour attachments back to COLOR_ATTACHMENT_OPTIMAL for pass 2 —
+        // renderPassLoad_ declares that as the initialLayout of each, and the
+        // transmissive draws write both.
+        VkImageMemoryBarrier toAtt[2] = {};
+        for (VkImageMemoryBarrier& b : toAtt) {
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        }
+        toAtt[0].image = colorImage_.image;
+        toAtt[1].image = sceneLinearImage_.image;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &toAtt);
+                             0, 0, nullptr, 0, nullptr, 2, toAtt);
 
         VkRenderPassBeginInfo rp2 = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rp2.renderPass = renderPassLoad_;
@@ -2287,6 +2371,7 @@ void ModelRenderer::cleanup() {
     if (transmissionImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, transmissionImage_);
     if (transmissionSampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, transmissionSampler_, nullptr); transmissionSampler_ = VK_NULL_HANDLE; }
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
+    if (sceneLinearImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearImage_);
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
     if (cmdPool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
 
