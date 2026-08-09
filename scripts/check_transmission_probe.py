@@ -21,31 +21,45 @@ Sphere 0 (transmissionFactor 0) transmits nothing, is unaffected by the probe,
 and stays fully visible. It is the control: a run where sphere 0 ALSO vanishes
 is not a pass, it is a capture of an empty frame or a mislocated geometry fit.
 
-WHY THIS SCRIPT DERIVES GEOMETRY FROM THE BACKDROP, NOT FROM THE SPHERES
-------------------------------------------------------------------------
-Every wrong answer in the #75 thread came from a contaminated reference, not
-from arithmetic. Segmenting the sphere row to find the spheres cannot work here
-by construction: a passing run has six of seven spheres invisible, so there is
-nothing to segment. Taking a per-row median across the whole plate does not work
-either — on the sphere row the spheres span more than half the plate's width, so
-a failing run drags the "reference" toward the very thing being measured and
-understates the defect by about an order of magnitude.
+LOCATING THE SPHERES IS THE HARD PART, AND IT FAILS SILENTLY
+------------------------------------------------------------
+Every wrong answer in the #75 thread came from a contaminated or mislocated
+reference, not from arithmetic — and both failure modes look like a pass.
 
-So the backdrop plate is located instead (it is a saturated red->blue ramp
-against a pale sky — high contrast, and present whether or not the spheres
-render), and the sphere centres are derived from it using the generator's own
-constants: the plate is BACKDROP_W units wide and centred on x = 0, the spheres
-sit at (i - 3) * SPACING with radius RADIUS. The baseline for a given row comes
-from the outer margins of the plate, which are sphere-free by construction
-(spheres reach +-3.9 units, the plate +-6.0) and carry the identical gradient
-value, since the ramp is a function of row only.
+The row baseline must come from the plate's sphere-free outer margins. A per-row
+median across the whole plate is contaminated: on the sphere row the spheres
+span more than half the plate's width, so a failing run drags the "reference"
+toward the very thing being measured and understates the defect by about an
+order of magnitude. See transmission_test_scene.row_baseline().
+
+The sphere CENTRES cannot simply be projected from the plate. The spheres sit at
+z = 0 and the plate at z = -2.5, so they are magnified against it (measured
+x1.063 on macOS/sim_display, x1.068 on Windows/Leia) and, under a tracked
+off-axis viewer, the near row does not project to the far plate's centre at all
+(measured 25 px low on macOS, 50 px low on Windows — comparable to a sphere
+radius). Sampling on plate-projected centres therefore measures plate against
+plate, which matches the baseline trivially and reads as a clean PASS on a
+completely unfixed build. See transmission_test_scene for how the row is
+actually located.
+
+Two guards exist because that failure is silent:
+  - the opaque control must clear CONTROL_MIN in absolute terms (a grossly
+    mislocated fit collapses it — 3.6/255 measured on a real DP);
+  - the located disc must be geometrically self-consistent, since radius and
+    pitch both live in the z = 0 plane and are therefore locked to each other.
+The first alone is not enough: a fit can be off by most of a radius, keep enough
+overlap to hold the control in the hundreds, and still have the transmissive
+discs straddling plate. That is precisely what happened on macOS and it is why
+the second guard is not optional.
 
 Usage:
     python3 scripts/check_transmission_probe.py <atlas.png> [--views N]
                                                 [--tol 1.0] [--dump-rows]
 
 Exit status is 0 only if every transmissive sphere is within --tol (in 0-255
-units) of the backdrop AND the opaque control is not.
+units) of the backdrop. A control that fails its guard RAISES rather than
+returning a verdict — a table built on a mislocated fit is not a failing
+measurement, it is not a measurement.
 """
 
 import argparse
@@ -60,6 +74,11 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from transmission_test_scene import STEPS, locate   # noqa: E402
+
+# Floor for the opaque control's residual, in 0-255 units. Well under the
+# 189-243 a correctly located control measures, well over the single digits a
+# mislocated one produces. See the guard in check_tile().
+CONTROL_MIN = 30.0
 
 
 def check_tile(tile, tol, dump_rows, what):
@@ -95,7 +114,27 @@ def check_tile(tile, tol, dump_rows, what):
         print("  plate x %d..%d y %d..%d  |  %.2f px/unit  |  r %.1f px  |  centre y %.1f"
               % (g.x0, g.x1, g.y0, g.y1, g.ppu, g.r_px, g.cy))
 
-    ok = rows[0][3] > tol and all(r[3] <= tol for r in rows[1:])
+    # The control guard is ABSOLUTE, not "> tol". Sphere 0 is fully opaque
+    # against a saturated red->blue ramp, so a correctly located sample reads in
+    # the hundreds — 189-243 measured on Windows/Leia and macOS/sim_display. A
+    # control that comes back small does not mean the render changed; it means
+    # the sample disc is not on the sphere, and every OTHER row in the table is
+    # then measuring plate-against-plate, which matches the baseline trivially
+    # and reads as a clean pass on a completely unfixed build.
+    #
+    # `> tol` was the original rule and it is useless for this: a mislocated fit
+    # measured at 3.6 on a real DP clears a threshold of 1.0 comfortably. It was
+    # caught by a human noticing that 3.6 is impossible for an opaque sphere,
+    # which is exactly the job this line is supposed to be doing.
+    if rows[0][3] < CONTROL_MIN:
+        raise SystemExit(
+            "%s: opaque control (sphere 0) reads only %.1f/255 against the backdrop, "
+            "but it is fully opaque and must read >= %.0f. The sample discs are not "
+            "on the spheres — this is a MISLOCATED FIT, not a passing render, and the "
+            "rest of the table is meaningless. Do not read it as a pass."
+            % (what, rows[0][3], CONTROL_MIN))
+
+    ok = all(r[3] <= tol for r in rows[1:])
     return ok, rows
 
 
