@@ -65,11 +65,99 @@ class Geometry(object):
         self.plate_w = x1 - x0 + 1
         self.plate_h = y1 - y0 + 1
         self.ppu = self.plate_w / BACKDROP_W          # pixels per world unit
+        # Nominal row placement, refined by refine_row() below. These values are
+        # the plate's own projection applied to the sphere row, which is only
+        # correct for geometry COPLANAR with the plate. The spheres are not — see
+        # refine_row's docstring — so treat these as a starting estimate, not as
+        # where the spheres are.
         self.cy = y0 + self.plate_h / 2.0             # spheres sit at world y = 0
         self.r_px = RADIUS * self.ppu
         cx0 = x0 + self.plate_w / 2.0                 # world x = 0
         self.centres = [cx0 + (i - (STEPS - 1) / 2.0) * SPACING * self.ppu
                         for i in range(STEPS)]
+
+    def refine_row(self, tile, what="capture"):
+        """Replace the nominal row placement with one measured off the image.
+
+        The nominal placement puts the sphere row at the plate's centre, at the
+        plate's pixels-per-unit. Both are wrong, because the spheres sit at world
+        z = 0 and the plate at z = -2.5:
+
+          * DEPTH MAGNIFICATION. Both project through the same frustum, so the
+            nearer row is magnified against the farther plate by a fixed ratio.
+            Measured x1.063 on macOS/sim_display and x1.068 on Windows/Leia — and
+            the pitch ratio and the radius ratio agree to within 0.3%, which is
+            the mechanism's signature: spacing and radius lie in the same plane
+            and must scale together. Purely geometric, so it is present on every
+            platform and at every eye position.
+          * OFF-AXIS EYE. A viewer that is not on the optical axis displaces the
+            near row against the far plate. Additive on top of the magnification:
+            25.5 px low on macOS with a fixed nominal eye, 50.5 px low on Windows
+            with a live-tracked one.
+
+        Sampling the nominal positions therefore lands partly or wholly on plate.
+        That does not raise — it quietly returns residuals near zero, because
+        plate matches the plate baseline by definition, which reads as a PASS on
+        a build that has not been fixed. Both platforms hit this; macOS retained
+        just enough overlap to keep the control's guard satisfied, Windows missed
+        the spheres almost entirely and reported an opaque sphere at 3.6/255.
+
+        So measure the row instead of predicting it. Spheres are the only thing
+        inside the plate's bounds that departs from the per-row baseline, which
+        makes them findable without segmenting on any material property — the
+        approach that could not work here, since the spheres under test are the
+        ones designed to be invisible.
+
+        The acceptance capture is the awkward case: when the fix works, spheres
+        1..STEPS-1 vanish by design and only the opaque control remains, so the
+        pitch cannot be measured directly. Recover it from that one disc's
+        RADIUS, which carries the same depth magnification.
+        """
+        base = self.row_baseline(tile)
+        dev = np.abs(tile - base[:, None, :]).sum(axis=2)
+        inside = np.zeros(dev.shape, dtype=bool)
+        inside[self.y0 + 3:self.y1 - 2, self.x0 + 3:self.x1 - 2] = True
+        # 40/255 summed over three channels: well above the plate's own dither
+        # and JPEG-free PNG noise, well below any sphere's departure from it.
+        blob = inside & (dev > 40.0)
+        if blob.sum() < 200:
+            raise SystemExit(
+                "%s: found no geometry on the backdrop plate (%d departing pixels) — "
+                "the opaque control sphere is never invisible, so an empty plate means "
+                "the model did not load or the capture is not transmission_test."
+                % (what, int(blob.sum())))
+
+        rows = np.where(blob.sum(axis=1) > 3)[0]
+        cy = (rows.min() + rows.max()) / 2.0
+        half = max(4, int((rows.max() - rows.min()) * 0.6))
+        band = blob[max(0, int(cy) - half):int(cy) + half + 1]
+
+        cols = np.where(band.sum(axis=0) > 3)[0]
+        runs, start, prev = [], cols[0], cols[0]
+        for x in cols[1:]:
+            if x - prev > 4:
+                runs.append((start, prev))
+                start = x
+            prev = x
+        runs.append((start, prev))
+        runs = [r for r in runs if r[1] - r[0] > 12]
+        if not runs:
+            raise SystemExit(
+                "%s: located a sphere row at y %.0f but could not resolve any disc in "
+                "it — the row is there but not disc-shaped." % (what, cy))
+
+        r_px = max(r[1] - r[0] for r in runs) / 2.0
+        centres = [(r[0] + r[1]) / 2.0 for r in runs]
+        if len(centres) >= STEPS:
+            # Fix pitch and origin from the extremes, which averages out any
+            # single mis-segmented disc.
+            pitch = (centres[-1] - centres[0]) / (STEPS - 1)
+        else:
+            # Acceptance capture: derive the pitch from the visible disc's radius.
+            pitch = SPACING * self.ppu * (r_px / (RADIUS * self.ppu))
+        self.cy, self.r_px = cy, r_px
+        self.centres = [centres[0] + i * pitch for i in range(STEPS)]
+        return self
 
     def aspect_error(self):
         """How far the plate's measured aspect is from the asset's, as a ratio.
@@ -129,4 +217,7 @@ def locate(tile, what="capture"):
             "capture has non-square pixels."
             % (what, g.plate_w, g.plate_h, g.plate_w / g.plate_h,
                BACKDROP_W, BACKDROP_H, BACKDROP_W / BACKDROP_H))
-    return g
+
+    # The plate fixes the frame of reference; it does not fix where the spheres
+    # land in it, because they are not coplanar with it.
+    return g.refine_row(tile, what)
