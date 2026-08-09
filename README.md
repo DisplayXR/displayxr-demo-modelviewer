@@ -95,6 +95,24 @@ driving a multiview 3D display genuinely changes the renderer's budget. It is
 skipped entirely when no loaded material transmits, and in transparent-background
 mode (where there is no opaque scene to refract, so glass falls back to IBL).
 
+**What is captured is scene-linear radiance, not the displayed image.** The
+opaque pass writes two colour attachments: the one that reaches the swapchain
+(tone-mapped, and sRGB-encoded when the swapchain is UNORM) and a 16F twin
+holding the same shading *before* the tone curve and the encode. Transmission
+mips a copy of the twin. Capturing the displayed image instead — which is what
+the renderer did up to v0.19.1 — put an already-graded value into a still-linear
+`color` that then ran the whole grade again, so glass rendered washed out and
+desaturated (issue #75). Sampling in radiance also means the `baseColorFactor`
+tint, Beer-Lambert absorption and the diffuse-lobe replacement act on radiance,
+which is the only space in which any of them means anything, and makes the
+roughness mip chain a linear box filter rather than an average of encoded values.
+
+To check it, run with `DXR_MODELVIEWER_TRANSMISSION_PROBE=1`: every transmissive
+surface then outputs its raw scene sample through the shader's own display
+transform instead of shading, so on `assets/transmission_test.glb` all six
+transmissive spheres must reproduce the backdrop behind them and vanish, leaving
+only the opaque control. `scripts/check_transmission_probe.py` measures that.
+
 **Documented limitation — anisotropy is direct-light only.** The extension's
 distribution and visibility terms are implemented verbatim, but anisotropy is
 not applied to image-based lighting. The standard trick — bending the IBL

@@ -49,6 +49,7 @@ units) of the backdrop AND the opaque control is not.
 """
 
 import argparse
+import os
 import sys
 
 try:
@@ -57,88 +58,33 @@ try:
 except ImportError:
     raise SystemExit("needs numpy and pillow:  python3 -m pip install numpy pillow")
 
-# Scene constants — must match scripts/make_material_grid.py:build_transmission_test.
-BACKDROP_W = 12.0     # plate width in world units, centred on x = 0
-SPACING = 1.15        # sphere pitch
-RADIUS = 0.45
-STEPS = 7             # sphere count; index 0 is the opaque control
-MARGIN_FRAC = 0.10    # outer fraction of the plate used as the row baseline
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from transmission_test_scene import STEPS, locate   # noqa: E402
 
 
-def plate_mask(tile):
-    """Boolean mask of backdrop-plate pixels.
-
-    Discriminates on GREEN SUPPRESSION, not on saturation. The plate texture is
-    generated as (R, 24, B) with R and B ramping 0..255, so green sits far below
-    the brighter of the two everywhere on it; the analytic sky is a pale blue
-    whose green lands BETWEEN its red and blue. Measured on a macOS capture:
-    plate 0.02-0.10, sky 0.74 — three-quarters of the range apart, and the
-    ordering survives exposure and either tone curve because it is a property of
-    the asset rather than of the grade.
-
-    Saturation was the obvious first choice and is the wrong one: the sky is a
-    strong blue and scored 0.37 against a 0.30 threshold, so the "plate" swallowed
-    the entire frame and the geometry derived from it was silently garbage.
-    """
-    mx = np.maximum(tile[:, :, 0], tile[:, :, 2])
-    green_ratio = tile[:, :, 1] / np.maximum(mx, 1.0)
-    return (green_ratio < 0.35) & (mx > 20)
-
-
-def find_backdrop(tile):
-    """Bounding box of the backdrop plate: (y0, y1, x0, x1) inclusive."""
-    ys, xs = np.where(plate_mask(tile))
-    if len(ys) < 1000:
-        raise SystemExit(
-            "could not locate the backdrop plate (%d matching pixels) — is this a "
-            "transmission_test capture, and did the model actually load?" % len(ys))
-    return int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
-
-
-def check_tile(tile, tol, dump_rows):
+def check_tile(tile, tol, dump_rows, what):
     """Measure every sphere against the backdrop. Returns (ok, list of rows)."""
-    y0, y1, x0, x1 = find_backdrop(tile)
+    g = locate(tile, what)
     h, w = tile.shape[0], tile.shape[1]
-    plate_w, plate_h = x1 - x0 + 1, y1 - y0 + 1
+    ref = g.row_baseline(tile)
 
-    # A plate clipped by the frame edge would make the units-per-pixel scale
-    # below wrong, and every sphere centre with it. Say so rather than measure
-    # confidently in the wrong place — that is the failure mode this whole file
-    # exists to avoid.
-    if x0 <= 1 or y0 <= 1 or x1 >= w - 2 or y1 >= h - 2:
-        raise SystemExit(
-            "backdrop plate touches the frame edge (x %d..%d of %d, y %d..%d of %d) — "
-            "it is cropped, so sphere positions cannot be derived from it. Reframe "
-            "the window so the whole plate is visible." % (x0, x1, w, y0, y1, h))
-
-    ppu = plate_w / BACKDROP_W               # pixels per world unit
-    cx0 = x0 + plate_w / 2.0                 # world x = 0
-    cy = y0 + plate_h / 2.0                  # spheres sit at world y = 0
-    r_px = RADIUS * ppu
-
-    # Row baseline from the plate's outer margins — sphere-free by construction.
-    # Odd width so the median is a real sample rather than the mean of two, which
-    # otherwise puts a spurious 0.5/255 floor under every residual.
-    mw = max(3, int(plate_w * MARGIN_FRAC) | 1)
-    left = tile[:, x0 + 2:x0 + 2 + mw]
-    right = tile[:, x1 - 1 - mw:x1 - 1]
-    ref = np.median(np.concatenate([left, right], axis=1), axis=1)   # (h, 3) per row
-
-    # Sanity: the two margins must agree, or the plate is not a pure vertical
-    # ramp in this capture (a shadow, an overlay, or a mislocated plate).
-    band = slice(int(cy - 2 * r_px), int(cy + 2 * r_px) + 1)
-    skew = np.abs(np.median(left[band], axis=1) - np.median(right[band], axis=1)).max()
+    # Sanity: the two margins must agree on the sphere row, or the plate is not a
+    # pure vertical ramp in this capture (a shadow, an overlay, a mislocated
+    # plate) and the baseline is not trustworthy.
+    band = slice(int(g.cy - 2 * g.r_px), int(g.cy + 2 * g.r_px) + 1)
+    mw = max(3, int(g.plate_w * 0.10) | 1)
+    skew = np.abs(np.median(tile[band, g.x0 + 2:g.x0 + 2 + mw], axis=1)
+                  - np.median(tile[band, g.x1 - 1 - mw:g.x1 - 1], axis=1)).max()
     if skew > 2.0:
         print("  WARNING: left/right plate margins differ by %.1f/255 on the sphere "
               "row — the baseline may not be trustworthy" % skew)
 
     rows = []
     yy, xx = np.mgrid[0:h, 0:w]
-    for i in range(STEPS):
-        cx = cx0 + (i - (STEPS - 1) / 2.0) * SPACING * ppu
+    for i, cx in enumerate(g.centres):
         # 70% of the radius: away from the silhouette, where a one-pixel error in
         # the derived centre would mix in sky or plate and manufacture a residual.
-        disc = ((xx - cx) ** 2 + (yy - cy) ** 2) <= (0.70 * r_px) ** 2
+        disc = ((xx - cx) ** 2 + (yy - g.cy) ** 2) <= (0.70 * g.r_px) ** 2
         px = tile[disc]
         base = ref[yy[disc]]
         d = np.abs(px - base).max(axis=1)
@@ -147,7 +93,7 @@ def check_tile(tile, tol, dump_rows):
 
     if dump_rows:
         print("  plate x %d..%d y %d..%d  |  %.2f px/unit  |  r %.1f px  |  centre y %.1f"
-              % (x0, x1, y0, y1, ppu, r_px, cy))
+              % (g.x0, g.x1, g.y0, g.y1, g.ppu, g.r_px, g.cy))
 
     ok = rows[0][3] > tol and all(r[3] <= tol for r in rows[1:])
     return ok, rows
@@ -179,7 +125,7 @@ def main():
     for v in range(a.views):
         tile = full[:, v * tw:(v + 1) * tw]
         print("\nview %d" % v)
-        ok, rows = check_tile(tile, a.tol, a.dump_rows)
+        ok, rows = check_tile(tile, a.tol, a.dump_rows, "view %d" % v)
         if a.report:
             print("  sphere  transmission   sphere - backdrop (R, G, B)")
             for i, n, mean, mx, sg in rows:
