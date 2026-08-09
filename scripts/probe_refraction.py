@@ -62,6 +62,7 @@ Usage:
            confound: watch sphere 0, which transmits nothing, score anyway.
 """
 
+import os
 import sys
 
 try:
@@ -69,6 +70,9 @@ try:
     from PIL import Image
 except ImportError:
     raise SystemExit("needs numpy and pillow:  python3 -m pip install numpy pillow")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from transmission_test_scene import STEPS, locate   # noqa: E402
 
 
 def load_tile(path):
@@ -79,44 +83,24 @@ def load_tile(path):
 
 
 def find_spheres(tile):
-    """Locate the sphere row. Returns (cy, radius, [centre_x, ...])."""
-    h, w = tile.shape[0], tile.shape[1]
-    lum = 0.2126 * tile[:, :, 0] + 0.7152 * tile[:, :, 1] + 0.0722 * tile[:, :, 2]
-    mx, mn = tile.max(axis=2), tile.min(axis=2)
-    sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1), 0)
-    ys, xs = np.where(sat > 0.30)                    # the plane; the sky around it is pale
-    if len(ys) == 0:
-        raise SystemExit("no backdrop plane found — is this a transmission_test capture?")
-    py0, py1, px0, px1 = ys.min(), ys.max(), xs.min(), xs.max()
+    """Locate the sphere row. Returns (cy, radius, [centre_x, ...], Geometry).
 
-    bglum = np.array([np.median(lum[y, px0:px1 + 1]) for y in range(h)])
-    dev = np.abs(lum - bglum[:, None])
-    dev[:, :px0] = 0
-    dev[:, px1 + 1:] = 0
-    rows = (dev > 10).sum(axis=1)
-    band = np.where(rows > rows.max() * 0.30)[0]
-    cy = (band.min() + band.max()) / 2.0
+    Derived from the BACKDROP plate, not segmented out of the sphere row — see
+    transmission_test_scene. The old segmentation thresholded the sphere row's
+    luminance, kept the blobs wider than 60 px, and extrapolated a pitch from the
+    first two. Every constant in that sentence was tuned on a 1000x1440 window;
+    on a 2560x720 macOS atlas the spheres are ~64 px wide, so `> 60` kept almost
+    nothing and five of six spheres came back `nan` / `ambiguous` — a wrong
+    answer wearing a measurement's clothes. It also got structurally harder once
+    issue #75 landed, because correctly-composited glass departs from the plate
+    LESS than the double-tone-mapped version it replaced.
+    """
+    g = locate(tile, "probe_refraction")
+    return g.cy, g.r_px, list(g.centres), g
 
-    # Segment on the OPAQUE spheres and extrapolate: the transmissive ones barely
-    # depart from the backdrop (the point of the test), so any threshold either
-    # drops or merges them. The row is regular, so two clean centres give the pitch.
-    prof = lum[int(cy)] - np.median(lum[int(cy), px0 + 20:px1 - 20])
-    xs = np.where(prof > 6)[0]
-    xs = xs[(xs > px0 + 20) & (xs < px1 - 20)]
-    groups, s, p = [], xs[0], xs[0]
-    for x in xs[1:]:
-        if x - p > 6:
-            groups.append((s, p))
-            s = x
-        p = x
-    groups.append((s, p))
-    solid = [g for g in groups if g[1] - g[0] > 60]
-    if len(solid) < 2:
-        raise SystemExit(f"found {len(solid)} segmentable spheres, need 2 to set the pitch")
-    rad = (solid[0][1] - solid[0][0]) / 2.0
-    c0 = (solid[0][0] + solid[0][1]) / 2.0
-    pitch = (solid[1][0] + solid[1][1]) / 2.0 - c0
-    return cy, rad, [c0 + i * pitch for i in range(7)], (px0, px1)
+
+K_SWEEP = np.arange(0.05, 3.01, 0.05)
+K_MAX = float(K_SWEEP[-1])
 
 
 def fit(interior, bg, ds, cy, height):
@@ -124,7 +108,7 @@ def fit(interior, bg, ds, cy, height):
     out = {}
     for sign, name in ((+1, "upright"), (-1, "inverted")):
         errs = []
-        for k in np.arange(0.05, 3.01, 0.05):
+        for k in K_SWEEP:
             ref = np.array([bg[int(np.clip(cy + sign * k * d, 0, height - 1))] for d in ds])
             if ref.std() < 1e-6 or interior.std() < 1e-6:
                 continue
@@ -142,8 +126,13 @@ def main():
     tile = load_tile(args[0])
     h = tile.shape[0]
     chroma = tile[:, :, 0] - tile[:, :, 2]          # monotonic along the backdrop gradient
-    cy, rad, centres, (px0, px1) = find_spheres(tile)
-    bg = np.array([np.median(chroma[y, px0:px1 + 1]) for y in range(h)])
+    cy, rad, centres, geom = find_spheres(tile)
+    # Background reference per row from the plate's OUTER MARGINS. A median
+    # across the full plate row is contaminated: on the sphere row the spheres
+    # span more than half the plate's width, so the "reference" is dragged toward
+    # the thing being measured. That is the trap issue #75 kept falling into.
+    bg = geom.row_baseline(tile)
+    bg = bg[:, 0] - bg[:, 2]                        # same chroma axis as `chroma`
     ds = np.arange(-0.55 * rad, 0.55 * rad, 1.0)
     print(f"tile {tile.shape[1]}x{h}   sphere row cy {cy:.0f}   radius {rad:.0f}")
 
@@ -154,20 +143,26 @@ def main():
     base = interior(centres[0])                     # transmissionFactor = 0
     print("\ntransmitted component only (sphere i minus the opaque control)")
     print(f"{'sph':<5}{'trans':>7}{'amplitude':>11}{'upright':>10}{'inverted':>10}{'k':>7}   verdict")
-    for i in range(1, 7):
+    for i in range(1, STEPS):
         d_i = interior(centres[i]) - base
         r = fit(d_i - d_i.mean(), bg, ds, cy, h)
         ue, uk = r["upright"]
         ie, ik = r["inverted"]
         v = ("INVERTED" if ie < ue * 0.85 else "UPRIGHT" if ue < ie * 0.85 else "ambiguous")
-        print(f"{i:<5}{i / 6.0:7.2f}{d_i.max() - d_i.min():11.1f}"
-              f"{ue:10.2f}{ie:10.2f}{(ik if v == 'INVERTED' else uk):7.2f}   {v}")
+        k = ik if v == "INVERTED" else uk
+        # A k that lands on the top of the sweep did not find a minimum — the
+        # interior spans more backdrop than the sweep can reach, so the reported
+        # error is whatever the boundary happened to give and the verdict beside
+        # it is not evidence. Say that instead of printing it like a result.
+        note = "  (k railed at %.2f — fit unreliable)" % K_MAX if k >= K_MAX - 1e-9 else ""
+        print(f"{i:<5}{i / (STEPS - 1):7.2f}{d_i.max() - d_i.min():11.1f}"
+              f"{ue:10.2f}{ie:10.2f}{k:7.2f}   {v}{note}")
 
     if raw_too:
         print("\n--raw: un-differenced fit. Sphere 0 transmits NOTHING, so its verdict")
         print("is the confound, not a measurement - see the module docstring.")
         print(f"{'sph':<5}{'upright':>10}{'inverted':>10}   verdict")
-        for i in range(7):
+        for i in range(STEPS):
             ivals = interior(centres[i])
             r = fit(ivals - ivals.mean(), bg, ds, cy, h)
             ue, _ = r["upright"]

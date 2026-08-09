@@ -153,8 +153,23 @@ dispatch `versions-bump` to displayxr-runtime). So every PR is build-checked on
 both platforms — keep it that way.
 
 ## Self-verifying a render (no 3D display needed)
-Pass a model path as the first CLI arg to skip auto-load:
-`model_viewer_handle_vk_win.exe <path.glb>`. Then press **`I`** to dump the
+**Transmission colour-space probe (#75).** `DXR_MODELVIEWER_TRANSMISSION_PROBE=1`
+makes every transmissive surface output its raw scene sample through the
+shader's own display transform instead of shading it (thickness forced to 0, mip
+0). On `assets/transmission_test.glb` all six transmissive spheres must then
+reproduce the backdrop and vanish, leaving only the opaque control (sphere 0).
+`scripts/check_transmission_probe.py <atlas.png>` asserts it (exit 0/1);
+`--report` runs the same measurement on a normally-shaded capture and prints the
+signed per-channel sphere-minus-backdrop table. Both it and
+`scripts/probe_refraction.py` locate geometry via `scripts/transmission_test_scene.py`,
+which derives sphere positions from the **backdrop plate** — never by segmenting
+the sphere row (the spheres this asset exists to measure are the invisible ones)
+and never against a full-row median (on the sphere row the spheres span >50% of
+the plate, so that reference is contaminated — the trap that produced every
+wrong number in #75). Always capture with `DXR_MODELVIEWER_DETERMINISTIC=1`.
+
+Pass a model path as the first CLI arg to skip auto-load
+(`model_viewer_handle_vk_win.exe <path.glb>`), then press **`I`** to dump the
 multi-view atlas to `%USERPROFILE%\Pictures\DisplayXR\<model>-<cols>_<rows>x<n>.png`
 (skipped for 1×1 mono layouts) — readable to eyeball geometry/shading/framing
 without a glasses-free display. To drive it headlessly, launch the exe then
