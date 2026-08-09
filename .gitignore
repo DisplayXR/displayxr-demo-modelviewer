@@ -15,3 +15,7 @@ android/.cxx/
 # Android signing keystores — never commit (CI uses GitHub secrets)
 *.jks
 *.keystore
+
+# Python bytecode caches (compiled artifacts; go stale against .py edits)
+__pycache__/
+*.py[cod]

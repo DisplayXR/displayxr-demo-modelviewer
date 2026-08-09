@@ -148,13 +148,46 @@ class Geometry(object):
 
         r_px = max(r[1] - r[0] for r in runs) / 2.0
         centres = [(r[0] + r[1]) / 2.0 for r in runs]
-        if len(centres) >= STEPS:
+        if len(centres) == STEPS:
             # Fix pitch and origin from the extremes, which averages out any
             # single mis-segmented disc.
             pitch = (centres[-1] - centres[0]) / (STEPS - 1)
+            exact = True
         else:
-            # Acceptance capture: derive the pitch from the visible disc's radius.
+            # Fewer: the acceptance capture, where spheres 1..6 have vanished by
+            # design and only the opaque control remains. More: something split a
+            # disc or the plate carries something that is not a sphere — in which
+            # case centres[-1] is NOT sphere 6 and the extremes fit would silently
+            # divide the wrong span by STEPS-1. Both fall back to deriving the
+            # pitch from the visible disc's RADIUS, which carries the same depth
+            # magnification (see the ratio agreement in the docstring above).
+            if len(centres) > STEPS:
+                print("  WARNING: resolved %d discs on the sphere row, expected %d — "
+                      "deriving pitch from radius instead of from the extremes"
+                      % (len(centres), STEPS))
             pitch = SPACING * self.ppu * (r_px / (RADIUS * self.ppu))
+            exact = False
+
+        # GUARD: radius and pitch are locked by the scene. Both lie in the z = 0
+        # plane, so whatever magnification the row carries against the plate
+        # scales them identically and pitch / r_px must equal SPACING / RADIUS.
+        # A fit that has picked up something which is not the sphere row — a
+        # merged pair, an overlay, a reflection — generally breaks that ratio
+        # even when it produces plausible-looking centres.
+        #
+        # Only meaningful on the extremes fit: in the radius-derived branch the
+        # ratio holds by construction and the check is vacuous. That branch is
+        # covered instead by the opaque control's absolute guard in
+        # check_transmission_probe.py, and by the fact that a capture with only
+        # one visible disc has, by definition, no other sphere to mislocate onto.
+        ratio = (pitch / r_px) / (SPACING / RADIUS)
+        if exact and abs(ratio - 1.0) > 0.10:
+            raise SystemExit(
+                "%s: sphere row is not self-consistent — pitch %.1f px against radius "
+                "%.1f px is a ratio of %.2f, but the scene locks it at %.2f (%+.0f%%). "
+                "Whatever was located is not the sphere row."
+                % (what, pitch, r_px, pitch / r_px, SPACING / RADIUS, (ratio - 1.0) * 100))
+
         self.cy, self.r_px = cy, r_px
         self.centres = [centres[0] + i * pitch for i in range(STEPS)]
         return self
