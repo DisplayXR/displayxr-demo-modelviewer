@@ -26,7 +26,8 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 cameraPos;
     vec4 lightDir;     // .xyz = light dir, .w = clipFar (view-space; 0=off)
     mat4 invViewProj;  // (skybox only)
-    vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale
+    vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale,
+                       // w=transmission probe (issue #75; 0 = normal shading)
     vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target
 } ubo;
 
@@ -75,15 +76,27 @@ layout(set = 1, binding = 12) uniform sampler2D thicknessTex;        // G
 layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
 layout(set = 2, binding = 1) uniform samplerCube prefilteredMap;  // specular (roughness mips)
 layout(set = 2, binding = 2) uniform sampler2D   brdfLUT;         // split-sum scale/bias
-// Mipped copy of the opaque pass's colour — what transmissive surfaces refract
-// against. Mip level is chosen from roughness, so a rough transmissive surface
-// scatters what's behind it (KHR_materials_transmission, issue #70 tier 2).
+// Mipped copy of the opaque pass's SCENE-LINEAR colour — what transmissive
+// surfaces refract against. Mip level is chosen from roughness, so a rough
+// transmissive surface scatters what's behind it (KHR_materials_transmission,
+// issue #70 tier 2).
+//
+// This holds pre-tone-map, pre-encode radiance (issue #75). It is a copy of the
+// second colour attachment this shader writes below, NOT of the displayed
+// image: sampling the displayed image put an already-tone-mapped (and, on a
+// UNORM swapchain, already-sRGB-encoded) value into a linear `color` that then
+// ran the whole tail again, which is what made glass render washed out.
 layout(set = 2, binding = 3) uniform sampler2D   sceneColor;
 // Sheen directional albedo E(N·V, sheenRoughness) — see sheen_lut.frag. Lets
 // sheen redistribute energy rather than add it.
 layout(set = 2, binding = 4) uniform sampler2D   sheenLUT;
 
 layout(location = 0) out vec4 outColor;
+// Scene-linear twin of outColor: the same shaded radiance BEFORE exposure, the
+// tone curve and the sRGB encode. Transmission samples a mipped copy of this
+// attachment (issue #75) so the transmitted light is composited in the space it
+// was captured in and reaches the display transform exactly once.
+layout(location = 1) out vec4 outSceneLinear;
 
 const float PI = 3.14159265359;
 
@@ -470,6 +483,24 @@ void main() {
     // that exit point to screen space and read the already-rendered scene there.
     // This is why transmission needed its own milestone: it consumes a copy of
     // the frame, and that copy is per view tile in the atlas.
+    //
+    // The sample is scene-linear radiance (see the sceneColor declaration), so
+    // everything below — Beer-Lambert absorption, the baseColor tint, and the
+    // diffuse-lobe replacement — operates on radiance, which is the only space
+    // in which any of them is physically meaningful. That is the substantive
+    // argument for capturing a linear copy rather than decoding the displayed
+    // one: an inverse tone curve would hand this block an approximation of
+    // radiance that is unrecoverably clipped wherever the scene exceeded
+    // display white.
+    //
+    // ubo.tone.w is the issue #75 acceptance probe. It forces thickness 0 (so
+    // the ray degenerates to the fragment's own screen position) and mip 0, and
+    // makes the surface output its raw sample instead of shading it — the
+    // display transform at the end of main() is still applied, unchanged and
+    // exactly once, so a correct sample makes every transmissive surface
+    // reproduce the pixels behind it and visually vanish. Enable with
+    // DXR_MODELVIEWER_TRANSMISSION_PROBE=1.
+    bool probe = ubo.tone.w > 0.5;
     if (transmissionFactor > 0.0) {
         // Ray through the volume. thickness 0 (a thin surface) degenerates to
         // sampling straight behind the fragment, which is the correct
@@ -484,8 +515,9 @@ void main() {
                                length(pc.model[1].xyz),
                                length(pc.model[2].xyz));
         vec3 refracted = refract(-V, N, 1.0 / max(ior, 1.0001));
-        vec3 exitPos = inWorldPos + normalize(refracted) * volumeThickness
-                                  * max(max(modelScale.x, modelScale.y), modelScale.z);
+        vec3 exitPos = probe ? inWorldPos
+                             : inWorldPos + normalize(refracted) * volumeThickness
+                                          * max(max(modelScale.x, modelScale.y), modelScale.z);
 
         vec4 clip = ubo.viewProj * vec4(exitPos, 1.0);
         vec2 ndc = clip.xy / max(clip.w, 1e-5);
@@ -499,38 +531,50 @@ void main() {
         // Roughness picks the mip: a rough transmissive surface blurs what is
         // behind it. Same idea as the prefiltered IBL chain, applied to scene
         // colour instead of the environment.
-        float sceneLod = float(textureQueryLevels(sceneColor) - 1) * roughness;
+        float sceneLod = probe ? 0.0 : float(textureQueryLevels(sceneColor) - 1) * roughness;
         vec3 transmitted = textureLod(sceneColor, uv, sceneLod).rgb;
 
-        // Volume absorption, Beer-Lambert: T(x) = attenuationColor^(x/distance).
-        // An infinite attenuation distance (the glTF default) means no
-        // absorption at all, so guard rather than divide by it.
-        if (attenuationDist > 0.0 && !isinf(attenuationDist)) {
-            vec3 sigma = -log(clamp(attenuationColor, vec3(1e-4), vec3(1.0))) / attenuationDist;
-            transmitted *= exp(-sigma * max(volumeThickness, 0.0));
+        if (probe) {
+            // Acceptance probe: hand the raw sample to the display transform.
+            color = transmitted;
+        } else {
+            // Volume absorption, Beer-Lambert: T(x) = attenuationColor^(x/distance).
+            // An infinite attenuation distance (the glTF default) means no
+            // absorption at all, so guard rather than divide by it.
+            if (attenuationDist > 0.0 && !isinf(attenuationDist)) {
+                vec3 sigma = -log(clamp(attenuationColor, vec3(1e-4), vec3(1.0))) / attenuationDist;
+                transmitted *= exp(-sigma * max(volumeThickness, 0.0));
+            }
+
+            // baseColor tints what passes through; metals absorb it entirely.
+            transmitted *= albedo;
+
+            // Transmission replaces the DIFFUSE lobe — the specular reflection
+            // off the surface stays. That is what makes glass read as glass
+            // rather than as a hole in the image.
+            vec3 diffuseTerm = (kd * albedo / PI) * vec3(3.0 * ubo.tone.z) * ndotl
+                             + diffuseIBL * ao;
+            vec3 transmissionTerm = transmitted * (1.0 - metallic);
+            color += (transmissionTerm - diffuseTerm) * transmissionFactor;
         }
-
-        // baseColor tints what passes through; metals absorb it entirely.
-        transmitted *= albedo;
-
-        // Transmission replaces the DIFFUSE lobe — the specular reflection off
-        // the surface stays. That is what makes glass read as glass rather than
-        // as a hole in the image.
-        vec3 diffuseTerm = (kd * albedo / PI) * vec3(3.0 * ubo.tone.z) * ndotl
-                         + diffuseIBL * ao;
-        vec3 transmissionTerm = transmitted * (1.0 - metallic);
-        color += (transmissionTerm - diffuseTerm) * transmissionFactor;
     }
 
     // ── KHR_materials_emissive_strength ──────────────────────────────────────
     // A plain multiplier on the emissive term, which is exactly what lets an
     // emissive surface exceed 1.0 and actually reach the tone curve's shoulder.
-    color += emissive * emissiveStrength;
+    if (!probe || transmissionFactor <= 0.0) color += emissive * emissiveStrength;
+
+    // Scene-linear radiance, captured for transmission BEFORE the display
+    // transform below (issue #75).
+    vec3 sceneLinear = color;
 
     // Exposure + tone curve, THEN the transfer function. Tone mapping runs on
     // both swapchain paths — only the sRGB *encode* is conditional (an sRGB
-    // swapchain format gets that from the blit's hardware write).
+    // swapchain format gets that from the blit's hardware write). This runs
+    // exactly once per pixel per pass, and the transmitted contribution folded
+    // into `color` above has not been through it before.
     color = applyToneMapping(color, ubo.tone);
     if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);
     outColor = vec4(color, baseSample.a * pc.baseColorFactor.a);
+    outSceneLinear = vec4(sceneLinear, baseSample.a * pc.baseColorFactor.a);
 }

@@ -25,6 +25,11 @@ layout(set = 0, binding = 0) uniform UBO {
 layout(set = 2, binding = 1) uniform samplerCube prefilteredMap;
 
 layout(location = 0) out vec4 outColor;
+// Scene-linear twin of outColor — see pbr.frag (issue #75). The sky MUST write
+// it: it is the backdrop most transmissive surfaces actually sample, and the
+// subpass declares two colour attachments, so a shader that writes only
+// location 0 leaves the linear attachment undefined wherever it draws.
+layout(location = 1) out vec4 outSceneLinear;
 
 // Inverse sRGB EOTF (accurate piecewise). Must match pbr.frag so the sky and
 // the model encode identically. Gated by ubo.cameraPos.w (1 = encode, 0 = skip).
@@ -43,7 +48,12 @@ void main() {
     float lod = float(textureQueryLevels(prefilteredMap) - 1) * 0.6;
     // Same exposure + curve as pbr.frag — the background and the model must be
     // graded identically or the model reads as pasted onto the environment.
-    vec3 color = applyToneMapping(textureLod(prefilteredMap, dir, lod).rgb, ubo.tone);
+    // The pre-curve radiance is what pbr.frag's `color` holds at the same point
+    // (exposure is applied inside applyToneMapping), so the two shaders agree
+    // on what "scene-linear" means and transmission composites like with like.
+    vec3 sceneLinear = textureLod(prefilteredMap, dir, lod).rgb;
+    vec3 color = applyToneMapping(sceneLinear, ubo.tone);
     if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);
     outColor = vec4(color, 1.0);
+    outSceneLinear = vec4(sceneLinear, 1.0);
 }
