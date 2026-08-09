@@ -370,16 +370,27 @@ def build_glb():
 # wrong region" and "was never drawn" produce three visibly different pictures
 # instead of three identical sky-coloured ones.
 #
-# HONEST LIMITATION: this is an eyeball aid, not yet an automated check. I first
-# designed it around "a lens inverts, so (R-B) flips sign inside the sphere" —
-# then measured, and the flip is not reliably there. That is expected on
-# reflection: the renderer uses the glTF sample-viewer approximation (refract
-# once at the entry surface, walk thicknessFactor along that ray, project the
-# exit point) rather than tracing through the volume, so it displaces the sampled
-# region without necessarily producing a full optical inversion. Shipping a test
-# whose expected result I had not verified would be worse than shipping none, so
-# the automated discriminator is deliberately absent until someone validates what
-# the correct output actually looks like.
+# EXPECTED RESULT: the sphere interiors are UPRIGHT and MAGNIFIED. Not inverted.
+#
+# This was originally built around "a thick glass ball is a lens, and a lens
+# inverts", and that premise was wrong for this renderer. Measured on macOS,
+# Linux and Windows independently: upright wins decisively on all three, and the
+# magnification factor grows monotonically with transmissionFactor (~0.45 at
+# transmission 0 to ~1.45 at transmission 1).
+#
+# The reason is structural, not a bug. We sample the scene at the refracted ray's
+# EXIT POINT projected to screen: refract once at the entry surface, walk
+# thicknessFactor along that ray, project. The refracted ray is dominated by its
+# into-the-screen component, so projecting it pulls the sample toward the
+# vanishing point — magnification — while the small transverse bend merely shifts
+# it. A real ball inverts because rays CROSS inside it: two refractions plus
+# propagation. A single-sample screen-space displacement has one refraction, no
+# exit interface and no crossing, so it can distort and magnify but never flip.
+#
+# Physical optics says a ball of this radius and IOR, with the backdrop well
+# outside its ~0.68-unit focal length, must invert. That is true of glass and
+# not of this shader. Do not "fix" the upright result — it is the approximation
+# behaving as specified.
 #
 # Kept as its own asset rather than added to the grid: a full-frame backdrop
 # would make every pixel foreground and break the grid probe's contrast-based
@@ -421,18 +432,29 @@ def build_transmission_test():
     qtan = [(1.0, 0.0, 0.0, 1.0)] * 4
     qidx = [0, 2, 1, 1, 2, 3]
 
-    pos_b = b"".join(struct.pack("<3f", *p) for p in pos + qpos)
-    nrm_b = b"".join(struct.pack("<3f", *n) for n in nrm + qnrm)
-    uv_b = b"".join(struct.pack("<2f", *t) for t in uv + quv)
-    tan_b = b"".join(struct.pack("<4f", *t) for t in tan + qtan)
+    # Sphere and backdrop get SEPARATE position/normal/uv/tangent accessors.
+    # Sharing one position accessor is legal — an accessor's min/max must cover
+    # all of its own data — but it makes every primitive's bounds resolve to the
+    # merged box (a 0.9-unit sphere reporting 12 units wide), which misleads
+    # anything deriving per-primitive bounds: culling, and this viewer's auto-fit.
+    pos_b = b"".join(struct.pack("<3f", *p) for p in pos)
+    nrm_b = b"".join(struct.pack("<3f", *n) for n in nrm)
+    uv_b = b"".join(struct.pack("<2f", *t) for t in uv)
+    tan_b = b"".join(struct.pack("<4f", *t) for t in tan)
+    qpos_b = b"".join(struct.pack("<3f", *p) for p in qpos)
+    qnrm_b = b"".join(struct.pack("<3f", *n) for n in qnrm)
+    quv_b = b"".join(struct.pack("<2f", *t) for t in quv)
+    qtan_b = b"".join(struct.pack("<4f", *t) for t in qtan)
     idx_b = b"".join(struct.pack("<H", i) for i in idx)
-    qidx_b = b"".join(struct.pack("<H", i + nsv) for i in qidx)
+    qidx_b = b"".join(struct.pack("<H", i) for i in qidx)   # own accessor -> no +nsv
     png = gradient_backdrop_png()
     pad = lambda d: d + b"\x00" * ((4 - len(d) % 4) % 4)
-    blob = pos_b + nrm_b + uv_b + tan_b + pad(idx_b) + pad(qidx_b) + png
+    blob = (pos_b + nrm_b + uv_b + tan_b + qpos_b + qnrm_b + quv_b + qtan_b
+            + pad(idx_b) + pad(qidx_b) + png)
 
     off, views = 0, []
     for data, target in ((pos_b, 34962), (nrm_b, 34962), (uv_b, 34962), (tan_b, 34962),
+                         (qpos_b, 34962), (qnrm_b, 34962), (quv_b, 34962), (qtan_b, 34962),
                          (pad(idx_b), 34963), (pad(qidx_b), 34963), (png, None)):
         v = {"buffer": 0, "byteOffset": off, "byteLength": len(data)}
         if target:
@@ -440,16 +462,23 @@ def build_transmission_test():
         views.append(v)
         off += len(data)
 
-    allp = pos + qpos
     accessors = [
-        {"bufferView": 0, "componentType": 5126, "count": len(allp), "type": "VEC3",
-         "min": [min(p[k] for p in allp) for k in range(3)],
-         "max": [max(p[k] for p in allp) for k in range(3)]},
-        {"bufferView": 1, "componentType": 5126, "count": len(allp), "type": "VEC3"},
-        {"bufferView": 2, "componentType": 5126, "count": len(allp), "type": "VEC2"},
-        {"bufferView": 3, "componentType": 5126, "count": len(allp), "type": "VEC4"},
-        {"bufferView": 4, "componentType": 5123, "count": len(idx), "type": "SCALAR"},
-        {"bufferView": 5, "componentType": 5123, "count": len(qidx), "type": "SCALAR"},
+        # 0-3 sphere: bounds are the SPHERE's, not the merged scene's.
+        {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3",
+         "min": [min(p[k] for p in pos) for k in range(3)],
+         "max": [max(p[k] for p in pos) for k in range(3)]},
+        {"bufferView": 1, "componentType": 5126, "count": len(nrm), "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5126, "count": len(uv), "type": "VEC2"},
+        {"bufferView": 3, "componentType": 5126, "count": len(tan), "type": "VEC4"},
+        # 4-7 backdrop quad.
+        {"bufferView": 4, "componentType": 5126, "count": len(qpos), "type": "VEC3",
+         "min": [min(p[k] for p in qpos) for k in range(3)],
+         "max": [max(p[k] for p in qpos) for k in range(3)]},
+        {"bufferView": 5, "componentType": 5126, "count": len(qnrm), "type": "VEC3"},
+        {"bufferView": 6, "componentType": 5126, "count": len(quv), "type": "VEC2"},
+        {"bufferView": 7, "componentType": 5126, "count": len(qtan), "type": "VEC4"},
+        {"bufferView": 8, "componentType": 5123, "count": len(idx), "type": "SCALAR"},
+        {"bufferView": 9, "componentType": 5123, "count": len(qidx), "type": "SCALAR"},
     ]
 
     materials, meshes, nodes = [], [], []
@@ -460,8 +489,8 @@ def build_transmission_test():
                           "roughnessFactor": 0.9,
                           "baseColorTexture": {"index": 0}}})
     meshes.append({"name": "backdrop", "primitives": [{
-        "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TANGENT": 3},
-        "indices": 5, "material": 0}]})
+        "attributes": {"POSITION": 4, "NORMAL": 5, "TEXCOORD_0": 6, "TANGENT": 7},
+        "indices": 9, "material": 0}]})
     nodes.append({"name": "backdrop", "mesh": 0, "translation": [0.0, 0.0, 0.0]})
 
     for c in range(STEPS):
@@ -474,7 +503,7 @@ def build_transmission_test():
         materials.append(mat)
         meshes.append({"name": mat["name"], "primitives": [{
             "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TANGENT": 3},
-            "indices": 4, "material": mi}]})
+            "indices": 8, "material": mi}]})
         nodes.append({"name": mat["name"], "mesh": mi,
                       "translation": [(c - (STEPS - 1) / 2.0) * 1.15, 0.0, 0.0]})
 
@@ -488,7 +517,7 @@ def build_transmission_test():
         "nodes": nodes, "meshes": meshes, "materials": materials,
         "accessors": accessors, "bufferViews": views,
         "buffers": [{"byteLength": len(blob)}],
-        "images": [{"bufferView": 6, "mimeType": "image/png"}],
+        "images": [{"bufferView": 10, "mimeType": "image/png"}],
         "samplers": [{"magFilter": 9729, "minFilter": 9729, "wrapS": 33071, "wrapT": 33071}],
         "textures": [{"source": 0, "sampler": 0}],
     }
@@ -516,8 +545,8 @@ def main():
     tdest.write_bytes(build_transmission_test())
     print(f"wrote {tdest} ({tdest.stat().st_size:,} bytes)")
     print("  7 glass spheres, transmissionFactor 0 -> 1, over a red(top)->blue(bottom)")
-    print("  backdrop. A lens INVERTS: refracting correctly flips the sign of (R-B)")
-    print("  inside the sphere versus the backdrop behind it.")
+    print("  backdrop. Expect the interior to be UPRIGHT and MAGNIFIED, not inverted —")
+    print("  see the docstring: screen-space refraction cannot flip an image.")
 
 
 if __name__ == "__main__":

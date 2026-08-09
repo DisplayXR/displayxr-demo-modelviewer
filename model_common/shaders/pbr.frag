@@ -474,8 +474,18 @@ void main() {
         // Ray through the volume. thickness 0 (a thin surface) degenerates to
         // sampling straight behind the fragment, which is the correct
         // "infinitely thin" behaviour the transmission spec describes.
+        // thicknessFactor is expressed in the material's LOCAL space, so the ray
+        // has to be scaled by the model matrix before it is walked in world
+        // space — Khronos' getVolumeTransmissionRay does the same. Without it a
+        // scaled model refracts by the wrong distance, and this viewer auto-fits
+        // every scene it loads, so scaled models are the norm rather than the
+        // exception. Scale is the length of the model matrix's basis columns.
+        vec3 modelScale = vec3(length(pc.model[0].xyz),
+                               length(pc.model[1].xyz),
+                               length(pc.model[2].xyz));
         vec3 refracted = refract(-V, N, 1.0 / max(ior, 1.0001));
-        vec3 exitPos = inWorldPos + normalize(refracted) * volumeThickness;
+        vec3 exitPos = inWorldPos + normalize(refracted) * volumeThickness
+                                  * max(max(modelScale.x, modelScale.y), modelScale.z);
 
         vec4 clip = ubo.viewProj * vec4(exitPos, 1.0);
         vec2 ndc = clip.xy / max(clip.w, 1e-5);
