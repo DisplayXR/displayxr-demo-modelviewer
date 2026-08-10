@@ -157,7 +157,7 @@ spheres.
 
 **It ships with the viewer.** The installers put it next to the executable on
 Windows, macOS and Linux, so it is one *File ▸ Open* (`Ctrl+O`, or drag-and-drop
-on macOS) away — no build required. It is deliberately **not** the startup
+on Windows and macOS) away — no build required. It is deliberately **not** the startup
 scene; the bundled helmet stays the default. If you want to see everything this
 renderer does in one screen, open the grid:
 
@@ -223,7 +223,8 @@ in the HUD, so a screenshot records the conditions it was taken under.
 
 **Environment.** By default the IBL is baked from a procedural analytic sky, so
 the viewer runs with no environment asset at all. Drop an equirectangular
-`.hdr` on the window (or `Ctrl+O` it, or ship one as `environment.hdr` next to
+`.hdr` on the window (Windows/macOS; or `Ctrl+O` it anywhere, or ship one as
+`environment.hdr` next to
 the executable to have it load at startup) and the irradiance + prefiltered
 cubes are rebaked from it. Loading an HDRI also **switches the analytic key
 light off** — a real capture already contains its own sun, and keeping both
@@ -283,8 +284,8 @@ calibration, brightness, gamut and 3D cross-talk are separate concerns.
 | `-` / `=` | Decrease / increase depth + IPD together (10 %–100 %) |
 | `M` | Auto-orbit: slow turntable rotation when idle |
 | `V` | Cycle rendering modes advertised by the display runtime |
-| `L` or top-bar **Open…** | Load a different model (glTF / STL / OBJ / FBX / USD) — or an `.hdr` environment |
-| Drag-and-drop (macOS) | Load a supported model, or an `.hdr` environment, dropped onto the window |
+| `Ctrl+O` or top-bar **Open…** | Load a different model (glTF / STL / OBJ / FBX / USD) — or an `.hdr` environment |
+| Drag-and-drop (Windows, macOS) | Load a supported model, or an `.hdr` environment, dropped onto the window |
 | `[` / `]` | Exposure down / up, in quarter stops |
 | `G` | Cycle the tone curve (PBR Neutral → ACES → none) |
 | Space | Reset pose, zoom, depth |

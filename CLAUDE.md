@@ -31,7 +31,8 @@ Apps load the runtime via the registry-resolved manifest (no `XR_RUNTIME_JSON`).
 ```
 windows/main.cpp, macos/main.mm  — platform entry: window, OpenXR session,
                                     input/HUD, per-frame view/projection, atlas
-                                    capture ('I'), file load (L / drag-drop)
+                                    capture ('I'), file load (Ctrl+O / drag-drop --
+                                    drag-drop is Windows + macOS, not Linux)
 model_common/                     — the renderer (vendor-neutral, analog of
                                     3dgs_common in the gaussiansplat demo):
   model_loader.{h,cpp}            — format dispatcher (by extension) + path
