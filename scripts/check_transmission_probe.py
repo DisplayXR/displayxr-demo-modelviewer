@@ -34,8 +34,8 @@ order of magnitude. See transmission_test_scene.row_baseline().
 
 The sphere CENTRES cannot simply be projected from the plate. The spheres sit at
 z = 0 and the plate at z = -2.5, so they are magnified against it (measured
-x1.063 on macOS/sim_display, x1.068 on Windows/Leia) and, under a tracked
-off-axis viewer, the near row does not project to the far plate's centre at all
+x1.063 on macOS/sim_display, x1.068 on Windows with a hardware DP) and, under a
+tracked off-axis viewer, the near row does not project to the far plate's centre
 (measured 25 px low on macOS, 50 px low on Windows — comparable to a sphere
 radius). Sampling on plate-projected centres therefore measures plate against
 plate, which matches the baseline trivially and reads as a clean PASS on a
@@ -116,8 +116,9 @@ def check_tile(tile, tol, dump_rows, what):
 
     # The control guard is ABSOLUTE, not "> tol". Sphere 0 is fully opaque
     # against a saturated red->blue ramp, so a correctly located sample reads in
-    # the hundreds — 189-243 measured on Windows/Leia and macOS/sim_display. A
-    # control that comes back small does not mean the render changed; it means
+    # the hundreds — 189-243 measured on Windows/hardware DP and on
+    # macOS/sim_display. A control that comes back small does not mean the
+    # render changed; it means
     # the sample disc is not on the sphere, and every OTHER row in the table is
     # then measuring plate-against-plate, which matches the baseline trivially
     # and reads as a clean pass on a completely unfixed build.

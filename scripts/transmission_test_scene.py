@@ -85,8 +85,9 @@ class Geometry(object):
 
           * DEPTH MAGNIFICATION. Both project through the same frustum, so the
             nearer row is magnified against the farther plate by a fixed ratio.
-            Measured x1.063 on macOS/sim_display and x1.068 on Windows/Leia — and
-            the pitch ratio and the radius ratio agree to within 0.3%, which is
+            Measured x1.063 on macOS/sim_display and x1.068 on Windows with a
+            hardware DP — and the pitch ratio and the radius ratio agree to
+            within 0.3%, which is
             the mechanism's signature: spacing and radius lie in the same plane
             and must scale together. Purely geometric, so it is present on every
             platform and at every eye position.
