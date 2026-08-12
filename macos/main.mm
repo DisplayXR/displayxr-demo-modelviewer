@@ -2106,10 +2106,16 @@ int main() {
     {
         const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
         if (mode_str) {
-            if (strcmp(mode_str, "anaglyph") == 0) g_input.currentRenderingMode = 1;
+            // "2d" selects the single-view mode. It used to fall through to the
+            // anaglyph default, so there was NO value of this variable that could ask
+            // for one view — which matters for measurement: a material capture wants a
+            // single un-composited tile, and anaglyph combines the views per colour
+            // channel, i.e. it destroys exactly the thing being measured.
+            if (strcmp(mode_str, "2d") == 0) g_input.currentRenderingMode = 0;
+            else if (strcmp(mode_str, "anaglyph") == 0) g_input.currentRenderingMode = 1;
             else if (strcmp(mode_str, "sbs") == 0) g_input.currentRenderingMode = 2;
             else if (strcmp(mode_str, "blend") == 0) g_input.currentRenderingMode = 3;
-            else g_input.currentRenderingMode = 1; // default to anaglyph
+            else g_input.currentRenderingMode = 1; // unrecognised → the first 3D mode
         }
     }
 

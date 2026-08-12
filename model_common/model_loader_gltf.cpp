@@ -139,6 +139,16 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
         mm.attenuationDistance = (float)extNumber(*v, "attenuationDistance", mm.attenuationDistance);
         mm.thicknessTex = resolveTex(extTexIndex(*v, "thicknessTexture"));
     }
+    // KHR_materials_scatter (draft; issue #79). Must be read AFTER volume: the
+    // spec selects thin-walled vs volumetric mode on thicknessFactor, and the
+    // shader needs both to have landed before it can decide.
+    if (const tinygltf::Value* v = ext("KHR_materials_scatter")) {
+        mm.scatterStrength   = (float)extNumber(*v, "scatterStrengthFactor", mm.scatterStrength);
+        extVec3(*v, "multiscatterColorFactor", mm.multiscatterColor);
+        mm.scatterAnisotropy = (float)extNumber(*v, "scatterAnisotropy", mm.scatterAnisotropy);
+        mm.scatterStrengthTex   = resolveTex(extTexIndex(*v, "scatterStrengthTexture"));
+        mm.multiscatterColorTex = resolveTex(extTexIndex(*v, "multiscatterColorTexture"));
+    }
 }
 
 // Compose a node's local transform: explicit matrix if present, else T*R*S.
@@ -458,6 +468,11 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
             "KHR_materials_iridescence",
             "KHR_materials_transmission",
             "KHR_materials_volume",
+            // Draft extension (issue #79). Volumetric mode is approximated with
+            // the thin-walled model, which the spec explicitly permits for
+            // renderers without full volumetric transport — so this counts as
+            // implemented rather than ignored, but see the README matrix.
+            "KHR_materials_scatter",
             nullptr
         };
         for (const std::string& ext : model.extensionsUsed) {

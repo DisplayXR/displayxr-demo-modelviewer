@@ -745,6 +745,11 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p5[1] = m.attenuationColor[1];
         g.p5[2] = m.attenuationColor[2];
         g.p5[3] = m.attenuationDistance;
+        g.p6[0] = m.scatterStrength;
+        g.p6[1] = m.scatterAnisotropy;
+        g.p7[0] = m.multiscatterColor[0];
+        g.p7[1] = m.multiscatterColor[1];
+        g.p7[2] = m.multiscatterColor[2];
         gpu.push_back(g);
     }
     if (gpu.empty()) {
@@ -757,6 +762,7 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p3[3] = 1.3f;                    // iridescenceIor
         g.p4[0] = 100.0f; g.p4[1] = 400.0f; // thickness min/max (nm)
         g.p5[0] = g.p5[1] = g.p5[2] = 1.0f; // attenuationColor
+        g.p7[0] = g.p7[1] = g.p7[2] = 1.0f; // multiscatterColor (scatterStrength 0 = off)
         gpu.push_back(g);
     }
 
@@ -1456,6 +1462,8 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
             viewOr(m.specularColorTex,      whiteTex_.view),
             viewOr(m.transmissionTex,       whiteTex_.view),
             viewOr(m.thicknessTex,          whiteTex_.view),
+            viewOr(m.scatterStrengthTex,    whiteTex_.view),
+            viewOr(m.multiscatterColorTex,  whiteTex_.view),
         };
         materialSets_.push_back(makeMaterialSet(v));
     }

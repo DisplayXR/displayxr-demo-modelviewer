@@ -88,6 +88,14 @@ struct ModelMaterial {
     // that here so the shader can guard with a finite comparison.
     float attenuationDistance = 0.0f;
 
+    // KHR_materials_scatter (draft; issue #79). Subsurface / multiple scattering,
+    // the extension that closes the SSS gap. Defaults are the spec's: strength 0
+    // means the material is unaffected, so an asset without the extension shades
+    // exactly as it did before.
+    float scatterStrength = 0.0f;             // [0,1]; 0 = no scattering
+    float multiscatterColor[3] = {1, 1, 1};   // multi-scatter albedo (linear)
+    float scatterAnisotropy = 0.0f;           // (-1,1) Henyey-Greenstein g
+
     // Texture-driven variants of the factors above. Indices into
     // ModelData::textures, or -1. Each samples the channel the extension
     // specifies and MULTIPLIES the corresponding factor, per glTF.
@@ -99,6 +107,8 @@ struct ModelMaterial {
     int specularColorTex = -1;       // RGB (sRGB-encoded)
     int transmissionTex = -1;        // R
     int thicknessTex = -1;           // G
+    int scatterStrengthTex = -1;     // A (KHR_materials_scatter)
+    int multiscatterColorTex = -1;   // RGB (sRGB-encoded)
 };
 
 struct ModelPrimitive {

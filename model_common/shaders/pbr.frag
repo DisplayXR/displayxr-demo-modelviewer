@@ -48,6 +48,8 @@ struct MatExt {
     vec4 p3;   // anisotropyStrength, anisotropyRotation, iridescenceFactor, iridescenceIor
     vec4 p4;   // iridescenceThicknessMin, iridescenceThicknessMax, transmissionFactor, thicknessFactor
     vec4 p5;   // attenuationColor.rgb, attenuationDistance
+    vec4 p6;   // scatterStrength, scatterAnisotropy, -, -   (KHR_materials_scatter)
+    vec4 p7;   // multiscatterColor.rgb, -
 };
 layout(set = 0, binding = 1, std430) readonly buffer MatExtBuf {
     MatExt materials[];
@@ -71,6 +73,8 @@ layout(set = 1, binding = 9)  uniform sampler2D specularTex;         // A
 layout(set = 1, binding = 10) uniform sampler2D specularColorTex;    // RGB, sRGB
 layout(set = 1, binding = 11) uniform sampler2D transmissionTex;     // R
 layout(set = 1, binding = 12) uniform sampler2D thicknessTex;        // G
+layout(set = 1, binding = 13) uniform sampler2D scatterStrengthTex;  // A
+layout(set = 1, binding = 14) uniform sampler2D multiscatterColorTex;// RGB, sRGB
 
 // Set 2: image-based lighting (generated from the analytic sky).
 layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
@@ -338,6 +342,11 @@ void main() {
     specularColor      *= srgbToLinear(texture(specularColorTex, inUV).rgb);
     transmissionFactor  = clamp(transmissionFactor * texture(transmissionTex, inUV).r, 0.0, 1.0);
     volumeThickness    *= texture(thicknessTex, inUV).g;
+    // KHR_materials_scatter (draft; issue #79). Strength rides the texture's
+    // ALPHA channel, the multi-scatter colour its RGB (sRGB-encoded), per spec.
+    float scatterStrength = clamp(me.p6.x * texture(scatterStrengthTex, inUV).a, 0.0, 1.0);
+    float scatterG        = clamp(me.p6.y, -0.99, 0.99);
+    vec3  multiscatterColor = me.p7.rgb * srgbToLinear(texture(multiscatterColorTex, inUV).rgb);
 
 
     // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────
@@ -514,10 +523,11 @@ void main() {
         vec3 modelScale = vec3(length(pc.model[0].xyz),
                                length(pc.model[1].xyz),
                                length(pc.model[2].xyz));
+        float worldThickness = volumeThickness
+                             * max(max(modelScale.x, modelScale.y), modelScale.z);
         vec3 refracted = refract(-V, N, 1.0 / max(ior, 1.0001));
         vec3 exitPos = probe ? inWorldPos
-                             : inWorldPos + normalize(refracted) * volumeThickness
-                                          * max(max(modelScale.x, modelScale.y), modelScale.z);
+                             : inWorldPos + normalize(refracted) * worldThickness;
 
         vec4 clip = ubo.viewProj * vec4(exitPos, 1.0);
         vec2 ndc = clip.xy / max(clip.w, 1e-5);
@@ -548,6 +558,69 @@ void main() {
 
             // baseColor tints what passes through; metals absorb it entirely.
             transmitted *= albedo;
+
+            // ── KHR_materials_scatter (draft; issue #79) ─────────────────────
+            // The spec's thin-walled model mixes the specular BTDF toward a
+            // diffuse scatter lobe:
+            //
+            //   mix(specular_btdf(a) * baseColor,
+            //       scatter_bsdf(multiscatterColor, g),
+            //       scatterStrength)
+            //
+            // and splits that lobe's energy by anisotropy: (1+g)/2 forward
+            // through the surface, (1-g)/2 backward as reflection. g=+1 is a
+            // pure Lambertian BTDF, g=-1 a pure Lambertian BRDF (opaque).
+            //
+            // VOLUMETRIC MODE USES THIS SAME PATH. The spec explicitly allows
+            // it — "it is acceptable to approximate volumetric mode using
+            // thin-walled mode behavior" for dense subsurface materials — and
+            // full transport (Kulla-Conty multi->single albedo remap driving a
+            // Henyey-Greenstein walk) has no place in a forward raster pass.
+            // Dense is exactly the regime these conformance assets sit in:
+            // attenuationDistance 0.01 against thicknessFactor 8.9.
+            //
+            // Substituting the lobe also side-steps the absorption above, which
+            // is the whole point of the extension: in a dense volume Beer-
+            // Lambert removes essentially all the transmitted light, and
+            // scattering is what puts it back. Rendered without scatter these
+            // materials go nearly black, which is exactly what we measured.
+            // How MUCH of the light actually undergoes multiple scattering. This
+            // is the term that makes attenuationDistance matter: optical depth
+            // tau = thickness / attenuationDistance, so a sparse volume (long
+            // attenuation distance) barely scatters and stays a mostly-clear
+            // specular BTDF showing the backdrop, while a dense one is fully
+            // diffused into the scatter lobe.
+            //
+            // Getting this wrong is not subtle. Mixing on scatterStrength alone
+            // discards the Beer-Lambert result above, and since every asset in
+            // the conformance set sets scatterStrengthFactor = 1 that collapses
+            // to "always fully scattered" — the 4x4 density grid then renders
+            // four IDENTICAL rows, which is how the bug was caught.
+            //
+            // Thin-walled mode has no volume to be optically deep, so it scatters
+            // on strength alone, which is what the spec's thin-walled BSDF says.
+            float opticalDepth = (attenuationDist > 0.0 && !isinf(attenuationDist))
+                               ? max(worldThickness, 0.0) / attenuationDist
+                               : 0.0;
+            float density = (volumeThickness > 0.0) ? (1.0 - exp(-opticalDepth)) : 1.0;
+            float scatterMix = scatterStrength * density;
+            if (scatterMix > 0.0) {
+                // Backward half: a Lambertian reflection lobe of multi-scatter
+                // albedo. Same shape as the diffuse lobe, different albedo.
+                vec3 scatterBack = (multiscatterColor / PI) * vec3(3.0 * ubo.tone.z) * ndotl
+                                 + texture(irradianceMap, N).rgb * multiscatterColor * ao;
+                // Forward half: what lies behind, fully diffused. The top mip of
+                // the scene chain is the most-blurred copy available, which is
+                // the closest stand-in for a diffuse transmission lobe.
+                float diffuseLod = float(textureQueryLevels(sceneColor) - 1);
+                vec3 scatterFwd = textureLod(sceneColor, uv, diffuseLod).rgb * multiscatterColor;
+
+                float fwd = 0.5 * (1.0 + scatterG);
+                float bwd = 0.5 * (1.0 - scatterG);
+                vec3 scatterLobe = fwd * scatterFwd + bwd * scatterBack;
+
+                transmitted = mix(transmitted, scatterLobe, scatterMix);
+            }
 
             // Transmission replaces the DIFFUSE lobe — the specular reflection
             // off the surface stays. That is what makes glass read as glass
