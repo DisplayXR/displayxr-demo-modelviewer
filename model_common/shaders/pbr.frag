@@ -13,6 +13,10 @@
 #include "tonemap.glsl"
 #define SHEEN_PI 3.14159265359
 #include "sheen.glsl"
+// MV_TEX_SLOTS / MV_MAT_VEC4S. Shared verbatim with model_renderer.h — the
+// material SSBO's stride depends on both, and #81 is what a divergence looks
+// like. Do not re-spell either number here.
+#include "material_slots.glsl"
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -51,8 +55,10 @@ struct MatExt {
     vec4 p6;   // scatterStrength, scatterAnisotropy, -, -   (KHR_materials_scatter)
     vec4 p7;   // multiscatterColor.rgb, -
     // KHR_texture_transform, one entry per texture slot (binding order).
-    vec4 uvXf[15];   // offset.xy, scale.xy
-    vec4 uvRot[15];  // .x = rotation (radians)
+    // MV_TEX_SLOTS, never a literal: this length IS the struct's stride, and
+    // C++ derives its own from the same define (#81).
+    vec4 uvXf[MV_TEX_SLOTS];   // offset.xy, scale.xy
+    vec4 uvRot[MV_TEX_SLOTS];  // .x = rotation (radians)
 };
 layout(set = 0, binding = 1, std430) readonly buffer MatExtBuf {
     MatExt materials[];

@@ -33,4 +33,8 @@ set(MV_SHADER_INCLUDE_NAMES
     ibl_common.glsl
     tonemap.glsl
     sheen.glsl
+    # Also #included by model_renderer.h (it is only #defines). Both sides of the
+    # material SSBO's layout come from it, so a stale SPIR-V here would be a
+    # stride mismatch — see #81 — not merely an out-of-date constant.
+    material_slots.glsl
 )
