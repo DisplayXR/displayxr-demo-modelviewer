@@ -25,6 +25,11 @@
 #include <vector>
 #include "model_vulkan_utils.h"
 #include "model_loader.h"
+// MV_TEX_SLOTS / MV_MAT_VEC4S. A GLSL file, included here on purpose: it holds
+// nothing but #defines, and shaders/pbr.frag includes the same bytes. The
+// material SSBO's stride is a function of both numbers, so they cannot be
+// allowed to be written down twice. See the file's header and issue #81.
+#include "shaders/material_slots.glsl"
 
 struct ModelRenderer {
     bool init(VkInstance instance,
@@ -160,7 +165,11 @@ private:
     // PushBlock::emissive[3]) keeps it to one buffer and one binding no matter
     // how many extensions land later.
     //
-    // Packing is dictated by std430 vec4 alignment — five vec4s, 80 bytes.
+    // Packing is dictated by std430 vec4 alignment: MV_MAT_VEC4S named lanes
+    // followed by two MV_TEX_SLOTS-long vec4 arrays. Both counts come from
+    // shaders/material_slots.glsl, which pbr.frag includes too, and the
+    // static_assert below pins sizeof() to them — the layout is the ABI between
+    // this struct and the shader, and #81 is what happens when it drifts.
     struct MaterialExtGpu {
         float p0[4];   // ior, specularFactor, clearcoatFactor, clearcoatRoughness
         float p1[4];   // specularColorFactor.rgb, sheenRoughness
@@ -173,12 +182,21 @@ private:
         // KHR_texture_transform, one entry per MaterialTexSlot:
         //   uvXf[i] = (offset.x, offset.y, scale.x, scale.y),  uvRot[i].x = radians
         // Identity (0,0,1,1 / 0) unless the asset supplied a transform.
-        // MTS_COUNT (the loader's enum) rather than MTEX_COUNT: this struct is
-        // declared above MaterialTexSlot. The static_assert further down pins the
-        // two together, so the array is always the right length either way.
-        float uvXf[MTS_COUNT][4];
-        float uvRot[MTS_COUNT][4];
+        // MV_TEX_SLOTS, not MTS_COUNT/MTEX_COUNT: the shader spells the length
+        // the same way, out of the same file. The enums are asserted equal to it
+        // below, so all three move together or nothing compiles.
+        float uvXf[MV_TEX_SLOTS][4];
+        float uvRot[MV_TEX_SLOTS][4];
     };
+    static_assert(sizeof(MaterialExtGpu) == 16 * (MV_MAT_VEC4S + 2 * MV_TEX_SLOTS),
+                  "MaterialExtGpu no longer matches the std430 layout MatExt "
+                  "declares in shaders/pbr.frag. uploadMaterialExtensions() "
+                  "memcpys an array of these, so sizeof() IS the stride the "
+                  "shader indexes by: if they disagree, material 0 still reads "
+                  "correctly and every later material reads from the wrong "
+                  "offset. That is issue #81's signature. Either a lane was "
+                  "added without bumping MV_MAT_VEC4S, or the compiler inserted "
+                  "padding this struct is not allowed to have.");
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag} + skybox.frag).
     struct UniformBlock {
         float viewProj[16];
@@ -221,6 +239,12 @@ private:
                   "ModelMaterial::uvXf[] by ModelTexSlot index and the shader reads "
                   "it by binding index, so a divergence silently transforms the "
                   "wrong texture.");
+    static_assert((int)MTEX_COUNT == MV_TEX_SLOTS,
+                  "MTEX_COUNT and MV_TEX_SLOTS disagree. MV_TEX_SLOTS "
+                  "(shaders/material_slots.glsl) is what pbr.frag sizes its UV "
+                  "arrays with, so it, not the enum, sets the SSBO stride the "
+                  "shader reads. Adding an enumerator without bumping it is "
+                  "exactly the drift that produced #81.");
 
     VkDescriptorSet makeMaterialSet(const VkImageView views[MTEX_COUNT]);
     bool finalizeModel(struct ModelData& md);   // upload geometry+textures, build material sets
