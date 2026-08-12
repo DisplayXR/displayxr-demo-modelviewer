@@ -88,4 +88,18 @@ if(EXISTS "${MATERIAL_GRID}")
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${MATERIAL_GRID}" "$<TARGET_FILE_DIR:model_viewer_handle_vk_macos>/material_grid.glb"
         COMMENT "Copying material_grid.glb next to exe"
     )
+
+# The KHR_materials_coat and fuzz/diffuse-roughness sweeps (#81, #84), carried
+# next to the exe on the same terms as the material grid above. They are small
+# (about 118 KB each against the bundled model's 3.7 MB), and shipping them means
+# anyone reviewing the draft-extension work — including outside this repo — can
+# open them from an installed build with Ctrl+O instead of needing a source
+# checkout and a generator run.
+foreach(_sweep coat_test diffuse_fuzz_test)
+    add_custom_command(TARGET model_viewer_handle_vk_macos POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/assets/${_sweep}.glb"
+                "$<TARGET_FILE_DIR:model_viewer_handle_vk_macos>/${_sweep}.glb"
+        COMMENT "Copying ${_sweep}.glb next to exe")
+endforeach()
 endif()
