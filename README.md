@@ -64,7 +64,8 @@ difference.
 | `KHR_materials_transmission` | ✅ factor **+ `transmissionTexture`** (R) — refracts the rendered scene, roughness-blurred |
 | `KHR_materials_volume` | ✅ factors **+ `thicknessTexture`** (G) — thickness-driven refraction + Beer-Lambert attenuation |
 | `KHR_materials_scatter` *(draft)* | ⚠️ factors **+ `scatterStrengthTexture`** (A) **+ `multiscatterColorTexture`** (RGB) — subsurface/multiple scattering. Volumetric mode is approximated with the spec-sanctioned thin-walled model; see the limits below |
-| `KHR_texture_transform`, Draco, KTX2/Basis | ❌ |
+| `KHR_texture_transform` | ✅ offset / rotation / scale, per texture slot (all 15). `texCoord` overrides ignored — single UV set |
+| Draco, KTX2/Basis | ❌ |
 
 **Scatter is an approximation, and here is exactly where it stops.** The spec
 permits renderers without full volumetric transport to approximate volumetric mode
@@ -78,7 +79,19 @@ track the reference (density sparse→dense: ours +57%, reference +47%). Two kno
 gaps: the density response **saturates** past optical depth ~1 where the reference
 keeps grading, and the result is **over-saturated** — real multiple scattering
 desaturates as it redistributes energy between bounces, and one Lambertian bounce
-cannot. Neither is fixable without a real multi-bounce term.
+cannot.
+
+The obvious suspect for that second gap is the spec's Kulla-Conty multi→single
+scatter albedo remap, which this deliberately does **not** apply to the lobe. It was
+implemented and measured, not waved away: mean per-channel error against the
+reference is **25.2 with the authored multi-scatter albedo vs 43.1 with the remapped
+single-scatter one**, and at high anisotropy the remap sends the hue blue
+(g=+1 → (153, 175, 194) against a reference of (75, 70, 57)). That is the expected
+result once you notice the remap exists to derive *transport coefficients*: one
+bounce carrying the multi-scatter albedo approximates the converged multi-bounce
+appearance, whereas one bounce carrying the single-scatter albedo under-counts every
+bounce after the first. Re-measure it any time with
+`DXR_MODELVIEWER_KULLA_CONTY=1`.
 
 **Sheen conserves energy.** The base layer is scaled by
 `1 - max3(sheenColor) · E` before sheen is added, where `E` is the sheen

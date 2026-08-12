@@ -89,6 +89,38 @@ int extTexIndex(const tinygltf::Value& obj, const char* key) {
     return idx.IsInt() ? idx.GetNumberAsInt() : -1;
 }
 
+// KHR_texture_transform lives INSIDE a textureInfo, not on the material, so it has
+// to be read at every texture reference rather than once per material. Absent =>
+// identity, which is why every slot defaults to offset 0 / scale 1 / rotation 0.
+void readUvTransform(const tinygltf::Value& texInfo, ModelMaterial::UvTransform& out) {
+    if (!texInfo.IsObject() || !texInfo.Has("extensions")) return;
+    const tinygltf::Value& exts = texInfo.Get("extensions");
+    if (!exts.IsObject() || !exts.Has("KHR_texture_transform")) return;
+    const tinygltf::Value& t = exts.Get("KHR_texture_transform");
+    if (!t.IsObject()) return;
+    if (t.Has("offset")) {
+        const tinygltf::Value& a = t.Get("offset");
+        if (a.IsArray() && a.ArrayLen() >= 2)
+            for (int i = 0; i < 2; ++i) out.offset[i] = (float)a.Get(i).GetNumberAsDouble();
+    }
+    if (t.Has("scale")) {
+        const tinygltf::Value& a = t.Get("scale");
+        if (a.IsArray() && a.ArrayLen() >= 2)
+            for (int i = 0; i < 2; ++i) out.scale[i] = (float)a.Get(i).GetNumberAsDouble();
+    }
+    if (t.Has("rotation")) out.rotation = (float)t.Get("rotation").GetNumberAsDouble();
+    // `texCoord` (a UV-set override) is deliberately ignored: this renderer carries
+    // a single TEXCOORD_0, so honouring it would silently sample the wrong set.
+}
+
+// Resolve a texture reference AND capture its UV transform into the right slot.
+void readTexSlot(const tinygltf::Value& obj, const char* key, ModelMaterial& mm,
+                 ModelTexSlot slot, int& outIndex,
+                 const std::function<int(int)>& resolveTex) {
+    outIndex = resolveTex(extTexIndex(obj, key));
+    if (obj.IsObject() && obj.Has(key)) readUvTransform(obj.Get(key), mm.uvXf[slot]);
+}
+
 void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
                              const std::function<int(int)>& resolveTex) {
     auto ext = [&](const char* name) -> const tinygltf::Value* {
@@ -100,20 +132,20 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
     if (const tinygltf::Value* v = ext("KHR_materials_specular")) {
         mm.specularFactor = (float)extNumber(*v, "specularFactor", mm.specularFactor);
         extVec3(*v, "specularColorFactor", mm.specularColorFactor);
-        mm.specularTex      = resolveTex(extTexIndex(*v, "specularTexture"));
-        mm.specularColorTex = resolveTex(extTexIndex(*v, "specularColorTexture"));
+        readTexSlot(*v, "specularTexture", mm, MTS_SPECULAR, mm.specularTex, resolveTex);
+        readTexSlot(*v, "specularColorTexture", mm, MTS_SPECULAR_COLOR, mm.specularColorTex, resolveTex);
     }
     if (const tinygltf::Value* v = ext("KHR_materials_clearcoat")) {
         mm.clearcoatFactor    = (float)extNumber(*v, "clearcoatFactor", mm.clearcoatFactor);
         mm.clearcoatRoughness = (float)extNumber(*v, "clearcoatRoughnessFactor", mm.clearcoatRoughness);
-        mm.clearcoatTex          = resolveTex(extTexIndex(*v, "clearcoatTexture"));
-        mm.clearcoatRoughnessTex = resolveTex(extTexIndex(*v, "clearcoatRoughnessTexture"));
+        readTexSlot(*v, "clearcoatTexture", mm, MTS_CLEARCOAT, mm.clearcoatTex, resolveTex);
+        readTexSlot(*v, "clearcoatRoughnessTexture", mm, MTS_CLEARCOAT_ROUGH, mm.clearcoatRoughnessTex, resolveTex);
     }
     if (const tinygltf::Value* v = ext("KHR_materials_sheen")) {
         extVec3(*v, "sheenColorFactor", mm.sheenColorFactor);
         mm.sheenRoughness = (float)extNumber(*v, "sheenRoughnessFactor", mm.sheenRoughness);
-        mm.sheenColorTex     = resolveTex(extTexIndex(*v, "sheenColorTexture"));
-        mm.sheenRoughnessTex = resolveTex(extTexIndex(*v, "sheenRoughnessTexture"));
+        readTexSlot(*v, "sheenColorTexture", mm, MTS_SHEEN_COLOR, mm.sheenColorTex, resolveTex);
+        readTexSlot(*v, "sheenRoughnessTexture", mm, MTS_SHEEN_ROUGH, mm.sheenRoughnessTex, resolveTex);
     }
     if (const tinygltf::Value* v = ext("KHR_materials_emissive_strength"))
         mm.emissiveStrength = (float)extNumber(*v, "emissiveStrength", mm.emissiveStrength);
@@ -131,13 +163,13 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
     }
     if (const tinygltf::Value* v = ext("KHR_materials_transmission")) {
         mm.transmissionFactor = (float)extNumber(*v, "transmissionFactor", mm.transmissionFactor);
-        mm.transmissionTex    = resolveTex(extTexIndex(*v, "transmissionTexture"));
+        readTexSlot(*v, "transmissionTexture", mm, MTS_TRANSMISSION, mm.transmissionTex, resolveTex);
     }
     if (const tinygltf::Value* v = ext("KHR_materials_volume")) {
         mm.volumeThickness = (float)extNumber(*v, "thicknessFactor", mm.volumeThickness);
         extVec3(*v, "attenuationColor", mm.attenuationColor);
         mm.attenuationDistance = (float)extNumber(*v, "attenuationDistance", mm.attenuationDistance);
-        mm.thicknessTex = resolveTex(extTexIndex(*v, "thicknessTexture"));
+        readTexSlot(*v, "thicknessTexture", mm, MTS_THICKNESS, mm.thicknessTex, resolveTex);
     }
     // KHR_materials_scatter (draft; issue #79). Must be read AFTER volume: the
     // spec selects thin-walled vs volumetric mode on thicknessFactor, and the
@@ -146,8 +178,8 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
         mm.scatterStrength   = (float)extNumber(*v, "scatterStrengthFactor", mm.scatterStrength);
         extVec3(*v, "multiscatterColorFactor", mm.multiscatterColor);
         mm.scatterAnisotropy = (float)extNumber(*v, "scatterAnisotropy", mm.scatterAnisotropy);
-        mm.scatterStrengthTex   = resolveTex(extTexIndex(*v, "scatterStrengthTexture"));
-        mm.multiscatterColorTex = resolveTex(extTexIndex(*v, "multiscatterColorTexture"));
+        readTexSlot(*v, "scatterStrengthTexture", mm, MTS_SCATTER_STRENGTH, mm.scatterStrengthTex, resolveTex);
+        readTexSlot(*v, "multiscatterColorTexture", mm, MTS_MULTISCATTER_COLOR, mm.multiscatterColorTex, resolveTex);
     }
 }
 
@@ -473,6 +505,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
             // renderers without full volumetric transport — so this counts as
             // implemented rather than ignored, but see the README matrix.
             "KHR_materials_scatter",
+            "KHR_texture_transform",
             nullptr
         };
         for (const std::string& ext : model.extensionsUsed) {
@@ -549,6 +582,22 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         mm.normalTex             = resolveTex(mat.normalTexture.index);
         mm.occlusionTex          = resolveTex(mat.occlusionTexture.index);
         mm.emissiveTex           = resolveTex(mat.emissiveTexture.index);
+        // KHR_texture_transform on the five core maps. tinygltf parses these into
+        // typed structs, so the extension comes off their own `extensions` map
+        // rather than out of the material's — same data, different accessor.
+        auto coreXf = [&](const tinygltf::ExtensionMap& em, ModelTexSlot slot) {
+            auto it = em.find("KHR_texture_transform");
+            if (it == em.end()) return;
+            tinygltf::Value wrapper(tinygltf::Value::Object{
+                {"extensions", tinygltf::Value(tinygltf::Value::Object{
+                    {"KHR_texture_transform", it->second}})}});
+            readUvTransform(wrapper, mm.uvXf[slot]);
+        };
+        coreXf(pbr.baseColorTexture.extensions,         MTS_BASE_COLOR);
+        coreXf(pbr.metallicRoughnessTexture.extensions, MTS_MR);
+        coreXf(mat.normalTexture.extensions,            MTS_NORMAL);
+        coreXf(mat.occlusionTexture.extensions,         MTS_OCCLUSION);
+        coreXf(mat.emissiveTexture.extensions,          MTS_EMISSIVE);
         parseMaterialExtensions(mat, mm, resolveTex);
         out.materials.push_back(mm);
     }
