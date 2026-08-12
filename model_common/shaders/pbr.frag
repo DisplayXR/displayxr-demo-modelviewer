@@ -54,6 +54,8 @@ struct MatExt {
     vec4 p5;   // attenuationColor.rgb, attenuationDistance
     vec4 p6;   // scatterStrength, scatterAnisotropy, -, -   (KHR_materials_scatter)
     vec4 p7;   // multiscatterColor.rgb, -
+    vec4 p8;   // coatIor, coatDarkening, coatAnisoStrength, coatAnisoRotation
+    vec4 p9;   // coatColor.rgb, hasCoat   (KHR_materials_coat)
     // KHR_texture_transform, one entry per texture slot (binding order).
     // MV_TEX_SLOTS, never a literal: this length IS the struct's stride, and
     // C++ derives its own from the same define (#81).
@@ -84,13 +86,16 @@ layout(set = 1, binding = 11) uniform sampler2D transmissionTex;     // R
 layout(set = 1, binding = 12) uniform sampler2D thicknessTex;        // G
 layout(set = 1, binding = 13) uniform sampler2D scatterStrengthTex;  // A
 layout(set = 1, binding = 14) uniform sampler2D multiscatterColorTex;// RGB, sRGB
+layout(set = 1, binding = 15) uniform sampler2D coatColorTex;        // RGB, sRGB
+layout(set = 1, binding = 16) uniform sampler2D coatAnisotropyTex;   // B = strength, RG = rotation
 
 // KHR_texture_transform. Slot indices match the set-1 binding order above, which
 // ModelTexSlot / MaterialTexSlot also mirror (there is a static_assert on that).
 const int XF_BASE_COLOR = 0, XF_MR = 1, XF_NORMAL = 2, XF_OCCLUSION = 3, XF_EMISSIVE = 4,
           XF_CLEARCOAT = 5, XF_CLEARCOAT_ROUGH = 6, XF_SHEEN_COLOR = 7, XF_SHEEN_ROUGH = 8,
           XF_SPECULAR = 9, XF_SPECULAR_COLOR = 10, XF_TRANSMISSION = 11, XF_THICKNESS = 12,
-          XF_SCATTER_STRENGTH = 13, XF_MULTISCATTER_COLOR = 14;
+          XF_SCATTER_STRENGTH = 13, XF_MULTISCATTER_COLOR = 14,
+          XF_COAT_COLOR = 15, XF_COAT_ANISOTROPY = 16;
 
 // Set 2: image-based lighting (generated from the analytic sky).
 layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
@@ -515,17 +520,24 @@ void main() {
     // The coat uses the same normal as the base — KHR_materials_clearcoat also
     // allows a separate clearcoatNormalTexture, which we don't read.
     if (clearcoatFactor > 0.0) {
+        // f0 from the coat's IOR rather than the literal 0.04 this used to
+        // hardcode. For a clearcoat-only asset coatIor is 1.5 and
+        // ((1.5-1)/(1.5+1))^2 is exactly 0.04, so this is an identity there.
+        float coatIor = MAT.p8.x;
+        float ccF0 = (coatIor - 1.0) / (coatIor + 1.0);
+        ccF0 *= ccF0;
+
         float ca = clearcoatRoughness * clearcoatRoughness;
-        float ccF = (0.04 + 0.96 * pow(clamp(1.0 - ndotv, 0.0, 1.0), 5.0)) * clearcoatFactor;
+        float ccF = (ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - ndotv, 0.0, 1.0), 5.0)) * clearcoatFactor;
 
         float ccD = D_GGX(ndoth, ca);
         float ccG = G_SchlickSmith(ndotv, ndotl, ca);
-        float ccFd = (0.04 + 0.96 * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0));
+        float ccFd = (ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0));
         float ccSpec = (ccD * ccG) * ccFd / max(4.0 * ndotv * ndotl, 1e-4);
 
         vec2 ccAb = texture(brdfLUT, vec2(ndotv, clearcoatRoughness)).rg;
         vec3 ccIbl = textureLod(prefilteredMap, reflect(-V, N), clearcoatRoughness * maxLod).rgb
-                   * (0.04 * ccAb.x + ccAb.y);
+                   * (ccF0 * ccAb.x + ccAb.y);
 
         color = color * (1.0 - ccF)
               + (vec3(ccSpec) * 3.0 * ubo.tone.z * ndotl + ccIbl * ao) * clearcoatFactor;
