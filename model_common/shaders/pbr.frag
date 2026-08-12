@@ -50,6 +50,9 @@ struct MatExt {
     vec4 p5;   // attenuationColor.rgb, attenuationDistance
     vec4 p6;   // scatterStrength, scatterAnisotropy, -, -   (KHR_materials_scatter)
     vec4 p7;   // multiscatterColor.rgb, -
+    // KHR_texture_transform, one entry per texture slot (binding order).
+    vec4 uvXf[15];   // offset.xy, scale.xy
+    vec4 uvRot[15];  // .x = rotation (radians)
 };
 layout(set = 0, binding = 1, std430) readonly buffer MatExtBuf {
     MatExt materials[];
@@ -75,6 +78,13 @@ layout(set = 1, binding = 11) uniform sampler2D transmissionTex;     // R
 layout(set = 1, binding = 12) uniform sampler2D thicknessTex;        // G
 layout(set = 1, binding = 13) uniform sampler2D scatterStrengthTex;  // A
 layout(set = 1, binding = 14) uniform sampler2D multiscatterColorTex;// RGB, sRGB
+
+// KHR_texture_transform. Slot indices match the set-1 binding order above, which
+// ModelTexSlot / MaterialTexSlot also mirror (there is a static_assert on that).
+const int XF_BASE_COLOR = 0, XF_MR = 1, XF_NORMAL = 2, XF_OCCLUSION = 3, XF_EMISSIVE = 4,
+          XF_CLEARCOAT = 5, XF_CLEARCOAT_ROUGH = 6, XF_SHEEN_COLOR = 7, XF_SHEEN_ROUGH = 8,
+          XF_SPECULAR = 9, XF_SPECULAR_COLOR = 10, XF_TRANSMISSION = 11, XF_THICKNESS = 12,
+          XF_SCATTER_STRENGTH = 13, XF_MULTISCATTER_COLOR = 14;
 
 // Set 2: image-based lighting (generated from the analytic sky).
 layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
@@ -267,20 +277,37 @@ vec3 evalIridescence(float outsideIor, float filmIor, float cosTheta1,
     return max(I, vec3(0.0));
 }
 
+// KHR_texture_transform, per the spec's matrix = translation * rotation * scale.
+// Scale first, then rotate, then offset.
+vec2 xfUV(MatExt m, int slot, vec2 uv) {
+    vec4 os = m.uvXf[slot];
+    float r = m.uvRot[slot].x;
+    vec2 p = uv * os.zw;
+    if (r != 0.0) {
+        float c = cos(r), s = sin(r);
+        p = vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+    }
+    return p + os.xy;
+}
+
 void main() {
     // Foreground-only clip (transparent mode): drop geometry behind the
     // display plane. 0 = disabled (opaque path unaffected).
     if (ubo.lightDir.w > 0.0 && inViewZ > ubo.lightDir.w) discard;
 
-    vec4 baseSample = texture(baseColorTex, inUV);
+    // Fetched FIRST because KHR_texture_transform lives in it and the five core
+    // maps below are sampled before any extension factor is touched.
+    MatExt me = matExt.materials[int(pc.emissive.w + 0.5)];
+
+    vec4 baseSample = texture(baseColorTex, xfUV(me, XF_BASE_COLOR, inUV));
     vec3 albedo = srgbToLinear(baseSample.rgb) * pc.baseColorFactor.rgb;
 
-    vec3 mr = texture(mrTex, inUV).rgb;        // g=roughness, b=metallic (linear)
+    vec3 mr = texture(mrTex, xfUV(me, XF_MR, inUV)).rgb;        // g=roughness, b=metallic (linear)
     float metallic  = clamp(mr.b * pc.mrParams.x, 0.0, 1.0);
     float roughness = clamp(mr.g * pc.mrParams.y, 0.04, 1.0);
     float a = roughness * roughness;
-    float ao = texture(occlusionTex, inUV).r;
-    vec3 emissive = srgbToLinear(texture(emissiveTex, inUV).rgb) * pc.emissive.rgb;
+    float ao = texture(occlusionTex, xfUV(me, XF_OCCLUSION, inUV)).r;
+    vec3 emissive = srgbToLinear(texture(emissiveTex, xfUV(me, XF_EMISSIVE, inUV)).rgb) * pc.emissive.rgb;
 
     vec3 V = normalize(ubo.cameraPos.xyz - inWorldPos);
     vec3 Ng = normalize(inNormal);
@@ -305,7 +332,7 @@ void main() {
     } else {
         cotangentFrame(Ng, inUV, frameT, frameB, frameValid);
     }
-    vec3 N = perturbNormal(Ng, inUV, frameT, frameB, frameValid);
+    vec3 N = perturbNormal(Ng, xfUV(me, XF_NORMAL, inUV), frameT, frameB, frameValid);
 
     vec3 L = normalize(ubo.lightDir.xyz);
     vec3 H = normalize(V + L);
@@ -313,7 +340,7 @@ void main() {
     float ndotv = max(dot(N, V), 1e-4);
     float ndoth = max(dot(N, H), 0.0);
 
-    MatExt me = matExt.materials[int(pc.emissive.w + 0.5)];
+
     float ior                = me.p0.x;
     float specularFactor     = me.p0.y;
     float clearcoatFactor    = me.p0.z;
@@ -334,19 +361,19 @@ void main() {
 
     // Fold the texture variants into the factors. sheenColor/specularColor are
     // sRGB-encoded per spec; the rest are linear single channels.
-    clearcoatFactor    *= texture(clearcoatTex, inUV).r;
-    clearcoatRoughness  = clamp(clearcoatRoughness * texture(clearcoatRoughTex, inUV).g, 0.03, 1.0);
-    sheenColor         *= srgbToLinear(texture(sheenColorTex, inUV).rgb);
-    sheenRoughness      = clamp(sheenRoughness * texture(sheenRoughTex, inUV).a, 0.05, 1.0);
-    specularFactor     *= texture(specularTex, inUV).a;
-    specularColor      *= srgbToLinear(texture(specularColorTex, inUV).rgb);
-    transmissionFactor  = clamp(transmissionFactor * texture(transmissionTex, inUV).r, 0.0, 1.0);
-    volumeThickness    *= texture(thicknessTex, inUV).g;
+    clearcoatFactor    *= texture(clearcoatTex, xfUV(me, XF_CLEARCOAT, inUV)).r;
+    clearcoatRoughness  = clamp(clearcoatRoughness * texture(clearcoatRoughTex, xfUV(me, XF_CLEARCOAT_ROUGH, inUV)).g, 0.03, 1.0);
+    sheenColor         *= srgbToLinear(texture(sheenColorTex, xfUV(me, XF_SHEEN_COLOR, inUV)).rgb);
+    sheenRoughness      = clamp(sheenRoughness * texture(sheenRoughTex, xfUV(me, XF_SHEEN_ROUGH, inUV)).a, 0.05, 1.0);
+    specularFactor     *= texture(specularTex, xfUV(me, XF_SPECULAR, inUV)).a;
+    specularColor      *= srgbToLinear(texture(specularColorTex, xfUV(me, XF_SPECULAR_COLOR, inUV)).rgb);
+    transmissionFactor  = clamp(transmissionFactor * texture(transmissionTex, xfUV(me, XF_TRANSMISSION, inUV)).r, 0.0, 1.0);
+    volumeThickness    *= texture(thicknessTex, xfUV(me, XF_THICKNESS, inUV)).g;
     // KHR_materials_scatter (draft; issue #79). Strength rides the texture's
     // ALPHA channel, the multi-scatter colour its RGB (sRGB-encoded), per spec.
-    float scatterStrength = clamp(me.p6.x * texture(scatterStrengthTex, inUV).a, 0.0, 1.0);
+    float scatterStrength = clamp(me.p6.x * texture(scatterStrengthTex, xfUV(me, XF_SCATTER_STRENGTH, inUV)).a, 0.0, 1.0);
     float scatterG        = clamp(me.p6.y, -0.99, 0.99);
-    vec3  multiscatterColor = me.p7.rgb * srgbToLinear(texture(multiscatterColorTex, inUV).rgb);
+    vec3  multiscatterColor = me.p7.rgb * srgbToLinear(texture(multiscatterColorTex, xfUV(me, XF_MULTISCATTER_COLOR, inUV)).rgb);
 
 
     // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────
@@ -604,16 +631,30 @@ void main() {
                                : 0.0;
             float density = (volumeThickness > 0.0) ? (1.0 - exp(-opticalDepth)) : 1.0;
             float scatterMix = scatterStrength * density;
+            // The spec's Kulla-Conty remap, multi-scatter albedo -> single-scatter
+            // albedo. Gated behind a switch because whether it BELONGS here is a
+            // real question, not a formality: the spec applies it to derive the
+            // transport coefficients (sigma_s = sigma_t * rho_ss), and we do no
+            // transport. A single Lambertian lobe standing in for the CONVERGED
+            // multi-bounce result should carry the multi-scatter albedo the artist
+            // authored, not the per-bounce one. Measured both ways below.
+            vec3 lobeAlbedo = multiscatterColor;
+            if (ubo.viewport.z > 0.5) {   // DXR_MODELVIEWER_KULLA_CONTY=1
+                vec3 rms = clamp(multiscatterColor * scatterStrength, vec3(0.0), vec3(1.0));
+                vec3 ks = vec3(4.09712) + 4.20863 * rms
+                        - sqrt(vec3(9.59217) + 41.6808 * rms + 17.7126 * rms * rms);
+                lobeAlbedo = (vec3(1.0) - ks * ks) / (vec3(1.0) - scatterG * ks * ks);
+            }
             if (scatterMix > 0.0) {
                 // Backward half: a Lambertian reflection lobe of multi-scatter
                 // albedo. Same shape as the diffuse lobe, different albedo.
-                vec3 scatterBack = (multiscatterColor / PI) * vec3(3.0 * ubo.tone.z) * ndotl
-                                 + texture(irradianceMap, N).rgb * multiscatterColor * ao;
+                vec3 scatterBack = (lobeAlbedo / PI) * vec3(3.0 * ubo.tone.z) * ndotl
+                                 + texture(irradianceMap, N).rgb * lobeAlbedo * ao;
                 // Forward half: what lies behind, fully diffused. The top mip of
                 // the scene chain is the most-blurred copy available, which is
                 // the closest stand-in for a diffuse transmission lobe.
                 float diffuseLod = float(textureQueryLevels(sceneColor) - 1);
-                vec3 scatterFwd = textureLod(sceneColor, uv, diffuseLod).rgb * multiscatterColor;
+                vec3 scatterFwd = textureLod(sceneColor, uv, diffuseLod).rgb * lobeAlbedo;
 
                 float fwd = 0.5 * (1.0 + scatterG);
                 float bwd = 0.5 * (1.0 - scatterG);

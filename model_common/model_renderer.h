@@ -170,6 +170,14 @@ private:
         float p5[4];   // attenuationColor.rgb, attenuationDistance (0 = none)
         float p6[4];   // scatterStrength, scatterAnisotropy, 0, 0   (KHR_materials_scatter)
         float p7[4];   // multiscatterColor.rgb, 0
+        // KHR_texture_transform, one entry per MaterialTexSlot:
+        //   uvXf[i] = (offset.x, offset.y, scale.x, scale.y),  uvRot[i].x = radians
+        // Identity (0,0,1,1 / 0) unless the asset supplied a transform.
+        // MTS_COUNT (the loader's enum) rather than MTEX_COUNT: this struct is
+        // declared above MaterialTexSlot. The static_assert further down pins the
+        // two together, so the array is always the right length either way.
+        float uvXf[MTS_COUNT][4];
+        float uvRot[MTS_COUNT][4];
     };
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag} + skybox.frag).
     struct UniformBlock {
@@ -208,6 +216,12 @@ private:
         MTEX_SCATTER_STRENGTH, MTEX_MULTISCATTER_COLOR,
         MTEX_COUNT
     };
+    static_assert((int)MTEX_COUNT == (int)MTS_COUNT,
+                  "MaterialTexSlot must mirror ModelTexSlot: the loader fills "
+                  "ModelMaterial::uvXf[] by ModelTexSlot index and the shader reads "
+                  "it by binding index, so a divergence silently transforms the "
+                  "wrong texture.");
+
     VkDescriptorSet makeMaterialSet(const VkImageView views[MTEX_COUNT]);
     bool finalizeModel(struct ModelData& md);   // upload geometry+textures, build material sets
     // Override the load-time (bind-pose) AABB with one measured from the active

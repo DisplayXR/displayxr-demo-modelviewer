@@ -49,6 +49,15 @@ struct ModelTexture {
     std::vector<uint8_t> rgba;   // width*height*4
 };
 
+// Texture slot order, shared by the loader and the renderer's descriptor set.
+enum ModelTexSlot {
+    MTS_BASE_COLOR = 0, MTS_MR, MTS_NORMAL, MTS_OCCLUSION, MTS_EMISSIVE,
+    MTS_CLEARCOAT, MTS_CLEARCOAT_ROUGH, MTS_SHEEN_COLOR, MTS_SHEEN_ROUGH,
+    MTS_SPECULAR, MTS_SPECULAR_COLOR, MTS_TRANSMISSION, MTS_THICKNESS,
+    MTS_SCATTER_STRENGTH, MTS_MULTISCATTER_COLOR,
+    MTS_COUNT
+};
+
 struct ModelMaterial {
     float baseColorFactor[4] = {1, 1, 1, 1};
     float metallic = 1.0f;
@@ -96,6 +105,20 @@ struct ModelMaterial {
     float multiscatterColor[3] = {1, 1, 1};   // multi-scatter albedo (linear)
     float scatterAnisotropy = 0.0f;           // (-1,1) Henyey-Greenstein g
 
+    // KHR_texture_transform: a per-TEXTURE-SLOT UV transform. Slot order is
+    // ModelTexSlot below, which ModelRenderer::MaterialTexSlot mirrors (a
+    // static_assert keeps the two from drifting).
+    //
+    // This became load-bearing with KHR_materials_scatter (#79): the conformance
+    // asset rotates scatterStrengthTexture 90 degrees, and a 90-degree rotation
+    // changes essentially every texel of it (measured mean |a - rot90(a)| = 127
+    // on 0..255). Sampling it untransformed is simply wrong.
+    struct UvTransform {
+        float offset[2] = {0.0f, 0.0f};
+        float scale[2]  = {1.0f, 1.0f};
+        float rotation  = 0.0f;          // radians
+    };
+
     // Texture-driven variants of the factors above. Indices into
     // ModelData::textures, or -1. Each samples the channel the extension
     // specifies and MULTIPLIES the corresponding factor, per glTF.
@@ -109,6 +132,10 @@ struct ModelMaterial {
     int thicknessTex = -1;           // G
     int scatterStrengthTex = -1;     // A (KHR_materials_scatter)
     int multiscatterColorTex = -1;   // RGB (sRGB-encoded)
+
+    // Per-slot UV transforms, indexed by ModelTexSlot. Identity by default, so a
+    // texture without the extension samples exactly as it did before.
+    UvTransform uvXf[MTS_COUNT];
 };
 
 struct ModelPrimitive {

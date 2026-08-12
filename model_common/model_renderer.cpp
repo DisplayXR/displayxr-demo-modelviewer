@@ -750,6 +750,13 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p7[0] = m.multiscatterColor[0];
         g.p7[1] = m.multiscatterColor[1];
         g.p7[2] = m.multiscatterColor[2];
+        for (int t = 0; t < (int)MTEX_COUNT; ++t) {
+            g.uvXf[t][0] = m.uvXf[t].offset[0];
+            g.uvXf[t][1] = m.uvXf[t].offset[1];
+            g.uvXf[t][2] = m.uvXf[t].scale[0];
+            g.uvXf[t][3] = m.uvXf[t].scale[1];
+            g.uvRot[t][0] = m.uvXf[t].rotation;
+        }
         gpu.push_back(g);
     }
     if (gpu.empty()) {
@@ -763,6 +770,7 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p4[0] = 100.0f; g.p4[1] = 400.0f; // thickness min/max (nm)
         g.p5[0] = g.p5[1] = g.p5[2] = 1.0f; // attenuationColor
         g.p7[0] = g.p7[1] = g.p7[2] = 1.0f; // multiscatterColor (scatterStrength 0 = off)
+        for (int t = 0; t < (int)MTEX_COUNT; ++t) { g.uvXf[t][2] = 1.0f; g.uvXf[t][3] = 1.0f; }
         gpu.push_back(g);
     }
 
@@ -1607,7 +1615,15 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.tone[3] = transmissionProbe_ ? 1.0f : 0.0f;
     ub.viewport[0] = (width_  > 0) ? (float)vpWidth_  / (float)width_  : 1.0f;
     ub.viewport[1] = (height_ > 0) ? (float)vpHeight_ / (float)height_ : 1.0f;
-    ub.viewport[2] = ub.viewport[3] = 0.0f;
+    // DXR_MODELVIEWER_KULLA_CONTY=1 switches the scatter lobe to the spec's
+    // multi->single scatter albedo remap, so the two can be MEASURED against the
+    // conformance references rather than argued about. See pbr.frag.
+    static const bool kullaConty = [] {
+        const char* e = std::getenv("DXR_MODELVIEWER_KULLA_CONTY");
+        return e && *e && *e != '0';
+    }();
+    ub.viewport[2] = kullaConty ? 1.0f : 0.0f;
+    ub.viewport[3] = 0.0f;
 
     void* mapped = nullptr;
     vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(UniformBlock), 0, &mapped);
