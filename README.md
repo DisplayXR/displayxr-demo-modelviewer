@@ -64,6 +64,8 @@ difference.
 | `KHR_materials_transmission` | ✅ factor **+ `transmissionTexture`** (R) — refracts the rendered scene, roughness-blurred |
 | `KHR_materials_volume` | ✅ factors **+ `thicknessTexture`** (G) — thickness-driven refraction + Beer-Lambert attenuation |
 | `KHR_materials_coat` *(draft)* | ✅ factors **+ textures** (`coatTexture` R, `coatRoughnessTexture` G, `coatColorTexture` RGB, `coatAnisotropyTexture` B/RG) — coloured tint, darkening, anisotropy, tunable IOR. No `coatNormalTexture`; darkening uses one R form, see below |
+| `KHR_materials_diffuse_roughness` *(draft)* | ⚠️ factor **+ `diffuseRoughnessTexture`** (R) — Fujii energy-preserving Oren-Nayar for direct light; IBL uses the spec's normal-bend approximation |
+| `KHR_materials_fuzz` *(draft)* | ⚠️ factors **+ textures** (`fuzzTexture` R, `fuzzColorTexture` RGB, `fuzzRoughnessTexture` A) — replaces sheen, layered above the coat, weight separate from colour. Limited by the sheen LUT, see below |
 | `KHR_materials_scatter` *(draft)* | ⚠️ factors **+ `scatterStrengthTexture`** (A) **+ `multiscatterColorTexture`** (RGB) — subsurface/multiple scattering. Volumetric mode is approximated with the spec-sanctioned thin-walled model; see the limits below |
 | `KHR_texture_transform` | ✅ offset / rotation / scale, per texture slot (all 15). `texCoord` overrides ignored — single UV set |
 | Draco, KTX2/Basis | ❌ |
@@ -128,7 +130,47 @@ all raised upstream:
   the ambient term near the terminator. Splitting the lobes is deferred while
   coat is draft.
 
-**Texture-driven variants are read** for coat, clear coat, sheen, specular,
+**Diffuse roughness is a separate roughness.** The diffuse substrate gets a
+microfacet model instead of pure Lambert, so a rough diffuse surface
+back-scatters at grazing angles and flattens out — sandstone rather than matte
+plastic. Direct light uses **Fujii's energy-preserving qualitative Oren-Nayar**,
+not the EON model (arXiv 2410.18026) the spec points at; the spec explicitly
+permits the substitution ("Implementations of the BRDF itself can vary based on
+device performance… there is no single micro-facet model we can use as a ground
+truth"). IBL uses the spec's third option, bending the shading normal toward the
+view — which the spec itself calls the least correct and most performant of the
+three, the other two meaning a rebuilt IBL pipeline for one draft extension.
+Roughness 0 returns the Lambertian path unchanged.
+
+**Spec defect:** `diffuseRoughnessFactor` defaults to `0.0` in the README
+property table and `1.0` in the JSON schema. We take 0.0 — 1.0 would restyle
+every existing asset.
+
+**Fuzz replaces sheen, and reuses its lobe and its table.** `fuzzColorTexture`
+and `fuzzRoughnessTexture` sample the *identical* channels as their sheen
+counterparts, so fuzz rides the sheen lanes and slots; only the weight and a
+`hasFuzz` flag are new. The two real differences are both implemented: fuzz sits
+**above the coat** where sheen sits below it, and its weight is separate from its
+colour, so fuzz can be *darker* than what it covers. Black soot is the motivating
+case, and it is inexpressible in sheen — a black sheen colour just switches the
+layer off. Measured on `assets/diffuse_fuzz_test.glb`, the same white→black
+colour sweep written both ways: sheen −99.6 luma converging on the bare base,
+fuzz −115.3 continuing past it into soot.
+
+**Known limit ([#85](https://github.com/DisplayXR/displayxr-demo-modelviewer/issues/85)).**
+The Charlie/Ashikhmin directional albedo in `sheenLUT` saturates at its 1.0 clamp
+below roughness ~0.5 (measured 1.00 at 0.3, 0.54 at 1.0) — the lobe is not
+energy-conserving there. Both sheen and fuzz use `1 - E` as the fraction of base
+that survives, so where it saturates the base is removed entirely. Sheen hides
+this because its colour is its intensity and it always puts a lobe back; a dark
+fuzz does not, and nulls the surface. Fixing it means renormalising the lobe,
+which moves every sheen material, so it is tracked separately.
+
+**Spec defect:** `fuzzRoughnessFactor` defaults to `0.5` in the README table and
+`0.0` in the schema. We take the schema.
+
+**Texture-driven variants are read** for coat, clear coat, sheen/fuzz, diffuse
+roughness, specular,
 transmission and volume — each samples the channel its extension specifies and
 multiplies the corresponding factor. Absent maps bind to 1×1 white, the
 multiplicative identity, so a factors-only material behaves exactly as before.
@@ -137,9 +179,9 @@ Still **not** read: `clearcoatNormalTexture` / `coatNormalTexture`, `anisotropyT
 implementations rather than missing ones, so they do **not** trip the
 ignored-extension warning — this table is the reference.
 
-Set 1 now binds 17 samplers and set 2 binds 5. Vulkan only *guarantees* 16 per
+Set 1 now binds 19 samplers and set 2 binds 5. Vulkan only *guarantees* 16 per
 stage, so the renderer logs its budget against the device's actual limit at
-startup (`sampled images per stage: need 22, device allows …`) rather than
+startup (`sampled images per stage: need 24, device allows …`) rather than
 letting a constrained device fail with an opaque pipeline-layout error.
 
 That slot count and the material SSBO's two trailing UV-transform arrays are
@@ -268,6 +310,28 @@ at coat 0.5 on purpose: at full coat the base is almost entirely displaced by
 the coat's own mirror reflection of the sky, and tint and darkening both act on
 the *base*, so there is nothing left for them to act on. The first cut of this
 asset used a red base at full coat and measured a flat row for both.
+
+### diffuse_fuzz_test.glb
+
+`assets/diffuse_fuzz_test.glb`, six rows by seven, for `KHR_materials_fuzz` and
+`KHR_materials_diffuse_roughness` — again, Khronos publishes no conformance asset
+for either.
+
+| Row | Sweep |
+|---|---|
+| 0 | CONTROL — `KHR_materials_sheen`, `sheenColorFactor` white → black |
+| 1 | `fuzzFactor` 0 → 1, white fuzz |
+| 2 | `fuzzColorFactor` white → **black** at weight 1 |
+| 3 | `fuzzRoughnessFactor` 0.05 → 1 |
+| 4 | `diffuseRoughnessFactor` 0 → 1, matte base |
+| 5 | `diffuseRoughnessFactor` 0 → 1, semi-gloss base |
+
+Measure with `python3 scripts/probe_fuzz_test.py <atlas.png>`. Rows 0 and 2 are
+the same sweep under both extensions and must move in *opposite* directions —
+that divergence is the extension's reason to exist. Row 5 exists to catch
+coupling: diffuse roughness must not touch the specular lobe, and rows 4 and 5
+responding differently (+17.8 vs +5.4) is what shows it does not. Row 3 sweeps
+across the LUT saturation described above, deliberately.
 
 `material_grid.glb` is deliberately **not** extended when an extension lands. It
 is the baseline every "does this change the render" measurement is taken

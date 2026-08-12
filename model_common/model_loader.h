@@ -56,6 +56,7 @@ enum ModelTexSlot {
     MTS_SPECULAR, MTS_SPECULAR_COLOR, MTS_TRANSMISSION, MTS_THICKNESS,
     MTS_SCATTER_STRENGTH, MTS_MULTISCATTER_COLOR,
     MTS_COAT_COLOR, MTS_COAT_ANISOTROPY,
+    MTS_DIFFUSE_ROUGHNESS, MTS_FUZZ,
     MTS_COUNT
 };
 
@@ -127,6 +128,29 @@ struct ModelMaterial {
     float coatColor[3] = {1, 1, 1};     // linear
     bool  hasCoat = false;
 
+    // KHR_materials_diffuse_roughness (draft; issue #84). Roughness of the
+    // DIFFUSE substrate, independent of the specular roughness above. 0 is
+    // Lambertian, i.e. the behaviour of every asset that does not use it.
+    //
+    // NOTE the spec contradicts itself on the default: the README property table
+    // says 0.0 and the JSON schema says 1.0. 0.0 is the only value that leaves
+    // existing assets alone, so that is what this takes. Raised upstream.
+    float diffuseRoughness = 0.0f;
+
+    // KHR_materials_fuzz (draft; issue #84). Intended to REPLACE
+    // KHR_materials_sheen: same Charlie-family lobe, but sitting above the coat
+    // rather than below it, and with a real weight so the layer can be darker
+    // than what it covers (black soot) instead of a black colour simply
+    // disabling it.
+    //
+    // fuzzColor and fuzzRoughness are NOT stored here. They use the identical
+    // texture channels as their sheen counterparts (RGB sRGB, alpha), so the
+    // loader writes them into sheenColorFactor / sheenRoughness and their
+    // texture slots, and `hasFuzz` tells the shader to read those lanes as fuzz
+    // and to layer them above the coat. Only the weight is genuinely new.
+    float fuzzFactor = 0.0f;
+    bool  hasFuzz = false;
+
     // KHR_texture_transform: a per-TEXTURE-SLOT UV transform. Slot order is
     // ModelTexSlot below, which ModelRenderer::MaterialTexSlot mirrors (a
     // static_assert keeps the two from drifting).
@@ -156,6 +180,8 @@ struct ModelMaterial {
     int multiscatterColorTex = -1;   // RGB (sRGB-encoded)
     int coatColorTex = -1;           // RGB (sRGB-encoded) (KHR_materials_coat)
     int coatAnisotropyTex = -1;      // B = strength, RG = rotation vector
+    int diffuseRoughnessTex = -1;    // R (KHR_materials_diffuse_roughness)
+    int fuzzTex = -1;                // R (KHR_materials_fuzz)
 
     // Per-slot UV transforms, indexed by ModelTexSlot. Identity by default, so a
     // texture without the extension samples exactly as it did before.

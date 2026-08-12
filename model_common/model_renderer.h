@@ -177,8 +177,10 @@ private:
         float p3[4];   // anisotropyStrength, anisotropyRotation, iridescenceFactor, iridescenceIor
         float p4[4];   // iridescenceThicknessMin/Max, transmissionFactor, volumeThickness
         float p5[4];   // attenuationColor.rgb, attenuationDistance (0 = none)
-        float p6[4];   // scatterStrength, scatterAnisotropy, 0, 0   (KHR_materials_scatter)
-        float p7[4];   // multiscatterColor.rgb, 0
+        float p6[4];   // scatterStrength, scatterAnisotropy (KHR_materials_scatter),
+                       // diffuseRoughness (KHR_materials_diffuse_roughness),
+                       // fuzzFactor (KHR_materials_fuzz)
+        float p7[4];   // multiscatterColor.rgb, hasFuzz (0/1)
         float p8[4];   // coatIor, coatDarkening, coatAnisoStrength, coatAnisoRotation
         float p9[4];   // coatColor.rgb, hasCoat (0/1)   (KHR_materials_coat)
         // KHR_texture_transform, one entry per MaterialTexSlot:
@@ -235,6 +237,7 @@ private:
         MTEX_SPECULAR, MTEX_SPECULAR_COLOR, MTEX_TRANSMISSION, MTEX_THICKNESS,
         MTEX_SCATTER_STRENGTH, MTEX_MULTISCATTER_COLOR,
         MTEX_COAT_COLOR, MTEX_COAT_ANISOTROPY,
+        MTEX_DIFFUSE_ROUGHNESS, MTEX_FUZZ,
         MTEX_COUNT
     };
     static_assert((int)MTEX_COUNT == (int)MTS_COUNT,

@@ -24,7 +24,7 @@
 // model_renderer.cpp. The static_asserts catch the first three; nothing catches
 // a forgotten descriptor write except a black texture.
 
-#define MV_TEX_SLOTS 17
+#define MV_TEX_SLOTS 19
 
 // Number of leading vec4 "p" lanes in the material struct, before the UV arrays.
 #define MV_MAT_VEC4S 10

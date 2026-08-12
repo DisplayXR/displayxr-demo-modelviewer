@@ -88,6 +88,8 @@ layout(set = 1, binding = 13) uniform sampler2D scatterStrengthTex;  // A
 layout(set = 1, binding = 14) uniform sampler2D multiscatterColorTex;// RGB, sRGB
 layout(set = 1, binding = 15) uniform sampler2D coatColorTex;        // RGB, sRGB
 layout(set = 1, binding = 16) uniform sampler2D coatAnisotropyTex;   // B = strength, RG = rotation
+layout(set = 1, binding = 17) uniform sampler2D diffuseRoughTex;     // R
+layout(set = 1, binding = 18) uniform sampler2D fuzzTex;             // R
 
 // KHR_texture_transform. Slot indices match the set-1 binding order above, which
 // ModelTexSlot / MaterialTexSlot also mirror (there is a static_assert on that).
@@ -95,7 +97,8 @@ const int XF_BASE_COLOR = 0, XF_MR = 1, XF_NORMAL = 2, XF_OCCLUSION = 3, XF_EMIS
           XF_CLEARCOAT = 5, XF_CLEARCOAT_ROUGH = 6, XF_SHEEN_COLOR = 7, XF_SHEEN_ROUGH = 8,
           XF_SPECULAR = 9, XF_SPECULAR_COLOR = 10, XF_TRANSMISSION = 11, XF_THICKNESS = 12,
           XF_SCATTER_STRENGTH = 13, XF_MULTISCATTER_COLOR = 14,
-          XF_COAT_COLOR = 15, XF_COAT_ANISOTROPY = 16;
+          XF_COAT_COLOR = 15, XF_COAT_ANISOTROPY = 16,
+          XF_DIFFUSE_ROUGHNESS = 17, XF_FUZZ = 18;
 
 // Set 2: image-based lighting (generated from the analytic sky).
 layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
@@ -136,6 +139,33 @@ float G_SchlickSmith(float ndotv, float ndotl, float a) {
     float gl = ndotl / (ndotl * (1.0 - k) + k);
     return gv * gl;
 }
+// KHR_materials_diffuse_roughness (draft) — a microfacet diffuse term to replace
+// the Lambertian 1/PI when the diffuse substrate is rough. V-shaped cavities add
+// masking, shadowing and interreflection, so the surface brightens where view
+// and light align and darkens where they are perpendicular: the back-scattering
+// that makes sandstone and unglazed clay read as rough rather than as matte
+// plastic.
+//
+// This is Fujii's energy-preserving qualitative Oren-Nayar, NOT the EON model
+// (arXiv 2410.18026) the spec points at as OpenPBR's choice. The spec explicitly
+// allows the substitution — "Implementations of the BRDF itself can vary based
+// on device performance and resource constraints. There is no single
+// micro-facet model that we can use as a ground truth reference" — and this one
+// is a handful of ALU against EON's closed form. Returns the multiplier on the
+// Lambertian term, so roughness 0 returns exactly 1 and the existing path is
+// bit-unchanged.
+float diffuseOrenNayar(float ndotl, float ndotv, float ldotv, float sigma) {
+    if (sigma <= 0.0) return 1.0;
+    float s = ldotv - ndotl * ndotv;
+    // The standard rewrite of max(0,cos(phi))·sin(alpha)·tan(beta): when the
+    // half-plane term is negative there is no interreflection to add, and t
+    // becomes 1 so the B term vanishes rather than going the wrong way.
+    float t = (s > 0.0) ? max(max(ndotl, ndotv), 1e-4) : 1.0;
+    float A = 1.0 / (1.0 + (0.5 - 2.0 / (3.0 * PI)) * sigma);
+    float B = sigma * A;
+    return A + B * s / t;
+}
+
 vec3 F_Schlick(float cosT, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
@@ -396,6 +426,14 @@ void main() {
     float scatterStrength = clamp(MAT.p6.x * texture(scatterStrengthTex, xfUV(XF_SCATTER_STRENGTH, inUV)).a, 0.0, 1.0);
     float scatterG        = clamp(MAT.p6.y, -0.99, 0.99);
     vec3  multiscatterColor = MAT.p7.rgb * srgbToLinear(texture(multiscatterColorTex, xfUV(XF_MULTISCATTER_COLOR, inUV)).rgb);
+    // KHR_materials_diffuse_roughness (draft; issue #84). R channel, per spec.
+    float diffuseRoughness = clamp(MAT.p6.z * texture(diffuseRoughTex, xfUV(XF_DIFFUSE_ROUGHNESS, inUV)).r, 0.0, 1.0);
+    // KHR_materials_fuzz (draft; issue #84). Weight on R; the colour and
+    // roughness ride the SHEEN lanes read above, because they are the same
+    // quantity from the same channels. hasFuzz picks which of the two
+    // extensions those lanes belong to, and where in the stack the lobe goes.
+    bool  hasFuzz    = MAT.p7.w > 0.5;
+    float fuzzFactor = clamp(MAT.p6.w * texture(fuzzTex, xfUV(XF_FUZZ, inUV)).r, 0.0, 1.0);
 
 
     // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────
@@ -452,12 +490,30 @@ void main() {
     // an HDRI environment is active: a real capture already contains its own
     // sun, so keeping the analytic key light would double-count the dominant
     // light source and quietly break any authoring-tool comparison.
-    vec3 direct = (kd * albedo / PI + spec) * vec3(3.0 * ubo.tone.z) * ndotl;
+    // KHR_materials_diffuse_roughness: the Lambertian diffuse becomes a
+    // microfacet one. The multiplier is exactly 1 at roughness 0, so a material
+    // without the extension takes the identical path it always did.
+    float dr = diffuseOrenNayar(ndotl, ndotv, dot(L, V), diffuseRoughness);
+    vec3 direct = (kd * albedo / PI * dr + spec) * vec3(3.0 * ubo.tone.z) * ndotl;
 
     // Ambient = image-based lighting (split-sum): irradiance cube for diffuse,
     // prefiltered cube + BRDF LUT for specular.
     vec3 Fr = Fr_base;
-    vec3 diffuseIBL = texture(irradianceMap, N).rgb * albedo * (1.0 - metallic);
+    // Diffuse IBL under diffuse roughness. A view-dependent diffuse lobe does not
+    // fit prefiltered irradiance, which is indexed by normal alone; the spec
+    // offers three ways out and calls this one — bend the shading normal toward
+    // the view by the roughness — "the least correct of these solutions but also
+    // the most performant". It flattens the diffuse falloff and lifts the
+    // terminator, which is the visible half of the effect. The other two options
+    // (per-frame CDF sampling, or baking an average light direction into the
+    // prefilter) both mean rebuilding the IBL pipeline for one draft extension.
+    //
+    // Half the roughness as the bend fraction: at full roughness the diffuse
+    // normal is halfway to the view, which is as far as this can be pushed
+    // before the sphere loses its shading entirely.
+    vec3 Nd = (diffuseRoughness > 0.0)
+            ? normalize(mix(N, V, 0.5 * diffuseRoughness)) : N;
+    vec3 diffuseIBL = texture(irradianceMap, Nd).rgb * albedo * (1.0 - metallic);
     float maxLod = float(textureQueryLevels(prefilteredMap) - 1);
     // Anisotropic reflections: bend the reflection vector towards the direction
     // the highlight is stretched in. This is the glTF sample-viewer approach —
@@ -495,8 +551,12 @@ void main() {
     // generate, so it is omitted — sheen here adds energy rather than
     // redistributing it. Documented as an approximation in the README; it shows
     // up as a fabric that is slightly too bright at grazing angles.
+    // hasFuzz means these lanes are KHR_materials_fuzz's, not sheen's, and the
+    // lobe belongs above the coat rather than here. The fuzz block near the end
+    // of main() picks them up. Per spec, fuzz takes precedence over sheen where
+    // a material carries both.
     float sheenMax = max(sheenColor.r, max(sheenColor.g, sheenColor.b));
-    if (sheenMax > 0.0) {
+    if (!hasFuzz && sheenMax > 0.0) {
         // Energy compensation, per spec: the base layer is scaled by
         // 1 - max3(sheenColor)·E before sheen is added, so a sheened fabric
         // never reflects more light than falls on it. E is the hemispherical
@@ -787,11 +847,64 @@ void main() {
             // Transmission replaces the DIFFUSE lobe — the specular reflection
             // off the surface stays. That is what makes glass read as glass
             // rather than as a hole in the image.
-            vec3 diffuseTerm = (kd * albedo / PI) * vec3(3.0 * ubo.tone.z) * ndotl
+            // Same `dr` the direct diffuse was built with, so transmission
+            // subtracts exactly the lobe that was added rather than a
+            // Lambertian approximation of it.
+            vec3 diffuseTerm = (kd * albedo / PI * dr) * vec3(3.0 * ubo.tone.z) * ndotl
                              + diffuseIBL * ao;
             vec3 transmissionTerm = transmitted * (1.0 - metallic);
             color += (transmissionTerm - diffuseTerm) * transmissionFactor;
         }
+    }
+
+    // ── KHR_materials_fuzz (draft) ───────────────────────────────────────────
+    // Fine surface fibres — peach skin, velvet, dust, soot. Intended to replace
+    // KHR_materials_sheen, and its two differences from sheen are both here.
+    //
+    // POSITION. Fuzz is the TOPMOST layer, above the coat; sheen sits below it.
+    // That is why this block is at the end of main() and the sheen block is
+    // before the coat's. `hasFuzz` routes the shared colour/roughness lanes to
+    // one place or the other.
+    //
+    // WEIGHT. Sheen used its colour as an intensity, so a black sheen colour
+    // disabled the layer and black fuzz was inexpressible. Fuzz has a separate
+    // weight, and the spec's layering
+    //   fuzz = fuzzColor·refl·weight + base·mix(1, 1-refl, weight)
+    // multiplies the COLOUR rather than gating the layer — so a black fuzzColor
+    // darkens what is underneath instead of vanishing. Soot is the motivating
+    // case, and it is the reason the extension exists.
+    //
+    // The reflectance is the directional albedo of the Charlie/Ashikhmin lobe,
+    // read from the table sheen_lut.frag already bakes. The spec recommends the
+    // Zeltner/Burley/Chiang LTC sheen model, which is the same family; reusing
+    // one table keeps the layering weight consistent with the lobe actually
+    // evaluated, exactly as sheen's energy compensation does.
+    //
+    // KNOWN LIMIT, measured: Efz saturates at its 1.0 clamp for fuzz roughness
+    // below about 0.5 (dumped straight out of the table: 1.00 at 0.3, 0.54 at
+    // 1.0). D_Charlie x V_Ashikhmin is not energy-conserving down there and its
+    // directional albedo genuinely integrates above 1. Where it saturates,
+    // `1 - Efz` is zero and the layer transmits NOTHING — a black fuzz nulls the
+    // surface to exactly 0 rather than darkening it. Sheen has always had this
+    // (its energy compensation removes the whole base at those roughnesses) but
+    // hides it, because sheen's colour is its intensity so it always has a lobe
+    // to put back. Fuzz's separate weight is what makes it visible. Fixing it
+    // means renormalising the lobe, which would change every sheen material —
+    // out of scope here, where sheen is required to stay byte-identical. See the
+    // follow-up issue.
+    //
+    // Skipped under the #75 transmission probe, which asserts on `color` being
+    // the raw scene sample; a layer over the top would break that.
+    if (hasFuzz && fuzzFactor > 0.0 && !probe) {
+        float Efz = texture(sheenLUT, vec2(ndotv, sheenRoughness)).r;
+        vec3 fuzzDirect = sheenColor * D_Charlie(ndoth, sheenRoughness)
+                        * V_Ashikhmin(ndotl, ndotv) * 3.0 * ubo.tone.z * ndotl;
+        // Ambient fuzz: the irradiance cube stands in for the full integral,
+        // weighted by the same directional albedo. Same approximation the sheen
+        // lobe makes, and the same caveat.
+        vec3 fuzzAmb = sheenColor * texture(irradianceMap, N).rgb * Efz * ao;
+        color = (fuzzDirect + fuzzAmb) * fuzzFactor
+              + color * mix(1.0, 1.0 - Efz, fuzzFactor);
     }
 
     // ── KHR_materials_emissive_strength ──────────────────────────────────────

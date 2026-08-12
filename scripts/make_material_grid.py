@@ -351,6 +351,91 @@ COAT_ROWS = [
 
 COAT_EXTENSIONS_USED = ["KHR_materials_clearcoat", "KHR_materials_coat"]
 
+
+# ── KHR_materials_fuzz + KHR_materials_diffuse_roughness sweep (issue #84) ───
+# A third asset, for the same reason coat_test.glb is a second one: Khronos
+# publishes no conformance asset for either extension, and material_grid.glb is
+# the frozen regression baseline.
+#
+# The fuzz rows use a dark navy fabric base — the same one the grid's sheen row
+# uses — because fuzz is a fabric model and because row 0 is a sheen control
+# that has to be comparable. The diffuse-roughness rows use a matte neutral: the
+# effect is a change in how the diffuse lobe falls off, so anything glossy would
+# bury it under a specular highlight.
+FUZZ_BASE = (0.14, 0.20, 0.42)
+DIFF_BASE = (0.62, 0.60, 0.58)
+
+
+def m_sheen_ref(t):
+    """CONTROL: the extension fuzz replaces, colour swept toward black.
+
+    This row is the argument for the extension. sheenColorFactor IS sheen's
+    intensity, so sweeping it to black does not make the fabric sooty — it
+    fades the layer out and leaves the bare base. Row 2 is the same sweep in
+    fuzz, which does darken."""
+    g = 1.0 - t
+    return {"pbrMetallicRoughness": pbr(FUZZ_BASE, 0.0, 0.85),
+            "extensions": {"KHR_materials_sheen": {
+                "sheenColorFactor": [g, g, g], "sheenRoughnessFactor": 0.7}}}
+
+
+def m_fuzz_factor(t):
+    """fuzzFactor 0 -> 1 with white fuzz: the layer fading in."""
+    return {"pbrMetallicRoughness": pbr(FUZZ_BASE, 0.0, 0.85),
+            "extensions": {"KHR_materials_fuzz": {
+                "fuzzFactor": t, "fuzzColorFactor": [1.0, 1.0, 1.0],
+                "fuzzRoughnessFactor": 0.7}}}
+
+
+def m_fuzz_black(t):
+    """fuzzColorFactor white -> black at full weight. THE headline case: black
+    soot. Under sheen this sweep fades the layer away (row 0); under fuzz the
+    weight is separate from the colour, so it darkens instead."""
+    g = 1.0 - t
+    return {"pbrMetallicRoughness": pbr(FUZZ_BASE, 0.0, 0.85),
+            "extensions": {"KHR_materials_fuzz": {
+                "fuzzFactor": 1.0, "fuzzColorFactor": [g, g, g],
+                "fuzzRoughnessFactor": 0.7}}}
+
+
+def m_fuzz_rough(t):
+    """fuzzRoughnessFactor 0.05 -> 1: tight fibre-like reflection at the low end,
+    broad dust-like scattering at the high end."""
+    return {"pbrMetallicRoughness": pbr(FUZZ_BASE, 0.0, 0.85),
+            "extensions": {"KHR_materials_fuzz": {
+                "fuzzFactor": 1.0, "fuzzColorFactor": [1.0, 1.0, 1.0],
+                "fuzzRoughnessFactor": max(0.05, t)}}}
+
+
+def m_diffuse_rough(t):
+    """diffuseRoughnessFactor 0 -> 1 on a matte neutral. Oren-Nayar
+    back-scattering flattens the falloff and lifts the terminator."""
+    return {"pbrMetallicRoughness": pbr(DIFF_BASE, 0.0, 0.95),
+            "extensions": {"KHR_materials_diffuse_roughness": {
+                "diffuseRoughnessFactor": t}}}
+
+
+def m_diffuse_rough_spec(t):
+    """The same sweep on a SEMI-GLOSS base. diffuse_roughness must not touch the
+    specular lobe — if this row tracked row 4 exactly the two roughnesses would
+    be coupled, which is the one thing the extension exists to separate."""
+    return {"pbrMetallicRoughness": pbr(DIFF_BASE, 0.0, 0.35),
+            "extensions": {"KHR_materials_diffuse_roughness": {
+                "diffuseRoughnessFactor": t}}}
+
+
+FUZZ_ROWS = [
+    ("sheen_ref",     "CONTROL: sheenColorFactor white → black",     m_sheen_ref),
+    ("fuzz_factor",   "fuzzFactor 0 → 1, white fuzz",                m_fuzz_factor),
+    ("fuzz_black",    "fuzzColorFactor white → BLACK at weight 1",   m_fuzz_black),
+    ("fuzz_rough",    "fuzzRoughnessFactor 0.05 → 1",                m_fuzz_rough),
+    ("diffuse_rough", "diffuseRoughnessFactor 0 → 1, matte base",    m_diffuse_rough),
+    ("diffuse_gloss", "diffuseRoughnessFactor 0 → 1, gloss base",    m_diffuse_rough_spec),
+]
+
+FUZZ_EXTENSIONS_USED = ["KHR_materials_sheen", "KHR_materials_fuzz",
+                        "KHR_materials_diffuse_roughness"]
+
 # Extensions this scene references. extensionsUsed ONLY — putting any of these
 # in extensionsRequired would make a conformant loader that lacks them refuse
 # the file, which defeats the point of it being a degradation test.
@@ -671,6 +756,17 @@ def main():
     print("  rows 0 and 1 are the same material in both spellings. Measure with")
     print("  scripts/probe_coat_test.py; note the two rows sit at different heights")
     print("  and so see different sky, which bounds how equal they can read.")
+
+    fdest = dest.parent / "diffuse_fuzz_test.glb"
+    fglb, fnmat, frows, fcols, flayout = build_glb(
+        row_specs=FUZZ_ROWS, textured=[], extensions=FUZZ_EXTENSIONS_USED,
+        scene_name="diffuse_fuzz_test")
+    fdest.write_bytes(fglb)
+    print(f"wrote {fdest} ({len(fglb):,} bytes)")
+    print(f"{frows} families x {fcols} steps = {fnmat} materials (fuzz + diffuse roughness, #84):")
+    print("\n".join(flayout))
+    print("  rows 0 and 2 are the same colour sweep under sheen and under fuzz —")
+    print("  sheen fades out, fuzz goes sooty. Check with scripts/probe_fuzz_test.py.")
 
     tdest = dest.parent / "transmission_test.glb"
     tdest.write_bytes(build_transmission_test())

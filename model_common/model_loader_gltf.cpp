@@ -178,6 +178,40 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
         readTexSlot(*v, "sheenColorTexture", mm, MTS_SHEEN_COLOR, mm.sheenColorTex, resolveTex);
         readTexSlot(*v, "sheenRoughnessTexture", mm, MTS_SHEEN_ROUGH, mm.sheenRoughnessTex, resolveTex);
     }
+    // KHR_materials_fuzz (draft; issue #84). Deliberately AFTER sheen, and by the
+    // same rule coat follows clearcoat: fuzz is intended to REPLACE sheen, the
+    // spec says fuzz takes precedence where both appear, and sheen survives only
+    // as the fallback for loaders that do not know fuzz.
+    //
+    // Colour and roughness are written into the SHEEN fields. They are the same
+    // quantity sampled from the same texture channels (RGB sRGB, alpha), so one
+    // pair of lanes and one pair of texture slots serve both; `hasFuzz` is what
+    // tells the shader to read them as fuzz and layer them ABOVE the coat rather
+    // than below it. Only the weight needs a lane of its own.
+    if (const tinygltf::Value* v = ext("KHR_materials_fuzz")) {
+        mm.hasFuzz = true;
+        mm.fuzzFactor = (float)extNumber(*v, "fuzzFactor", 0.0);
+        // Fuzz's colour default is WHITE where sheen's is black — sheen used the
+        // colour as its intensity, so black disabled it, whereas fuzz has a
+        // separate weight. Seed white before reading, or a fuzz material that
+        // omits the colour would inherit sheen's "off".
+        mm.sheenColorFactor[0] = mm.sheenColorFactor[1] = mm.sheenColorFactor[2] = 1.0f;
+        extVec3(*v, "fuzzColorFactor", mm.sheenColorFactor);
+        // Schema default 0.0; the README's property table says 0.5. Taking the
+        // schema, since that is what validators enforce. Raised upstream.
+        mm.sheenRoughness = (float)extNumber(*v, "fuzzRoughnessFactor", 0.0);
+        readTexSlot(*v, "fuzzTexture", mm, MTS_FUZZ, mm.fuzzTex, resolveTex);
+        readTexSlot(*v, "fuzzColorTexture", mm, MTS_SHEEN_COLOR, mm.sheenColorTex, resolveTex);
+        readTexSlot(*v, "fuzzRoughnessTexture", mm, MTS_SHEEN_ROUGH,
+                    mm.sheenRoughnessTex, resolveTex);
+    }
+    // KHR_materials_diffuse_roughness (draft; issue #84).
+    if (const tinygltf::Value* v = ext("KHR_materials_diffuse_roughness")) {
+        mm.diffuseRoughness = (float)extNumber(*v, "diffuseRoughnessFactor",
+                                               mm.diffuseRoughness);
+        readTexSlot(*v, "diffuseRoughnessTexture", mm, MTS_DIFFUSE_ROUGHNESS,
+                    mm.diffuseRoughnessTex, resolveTex);
+    }
     if (const tinygltf::Value* v = ext("KHR_materials_emissive_strength"))
         mm.emissiveStrength = (float)extNumber(*v, "emissiveStrength", mm.emissiveStrength);
     if (const tinygltf::Value* v = ext("KHR_materials_anisotropy")) {
