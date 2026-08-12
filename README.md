@@ -63,6 +63,7 @@ difference.
 | `KHR_materials_iridescence` | ✅ factors — full thin-film model, no thickness texture |
 | `KHR_materials_transmission` | ✅ factor **+ `transmissionTexture`** (R) — refracts the rendered scene, roughness-blurred |
 | `KHR_materials_volume` | ✅ factors **+ `thicknessTexture`** (G) — thickness-driven refraction + Beer-Lambert attenuation |
+| `KHR_materials_coat` *(draft)* | ✅ factors **+ textures** (`coatTexture` R, `coatRoughnessTexture` G, `coatColorTexture` RGB, `coatAnisotropyTexture` B/RG) — coloured tint, darkening, anisotropy, tunable IOR. No `coatNormalTexture`; darkening uses one R form, see below |
 | `KHR_materials_scatter` *(draft)* | ⚠️ factors **+ `scatterStrengthTexture`** (A) **+ `multiscatterColorTexture`** (RGB) — subsurface/multiple scattering. Volumetric mode is approximated with the spec-sanctioned thin-walled model; see the limits below |
 | `KHR_texture_transform` | ✅ offset / rotation / scale, per texture slot (all 15). `texCoord` overrides ignored — single UV set |
 | Draco, KTX2/Basis | ❌ |
@@ -100,19 +101,54 @@ pair the shader evaluates, baked into a 64² table at startup
 (`shaders/sheen_lut.frag`). Evaluator and integrand share `shaders/sheen.glsl`,
 so the table cannot drift from the BRDF it is meant to integrate.
 
-**Texture-driven variants are read** for clear coat, sheen, specular,
+**Coat replaces clear coat, and reuses its lobe.** `KHR_materials_coat` is a
+superset that the spec maps `KHR_materials_clearcoat` onto 1:1, so the loader
+folds clearcoat's five properties into the coat fields and *one* shader lobe
+serves both — a `hasCoat` flag gates only what coat adds. A clearcoat-only asset
+therefore takes IOR 1.5 (f0 = 0.04, the constant the lobe used to hardcode),
+white tint, no darkening and no anisotropy, and renders **byte-identically** to
+the pre-coat build: mean 0.000 over 11,059,200 channels of
+`assets/material_grid.glb`, and 0.000 on each of its ten rows individually. Coat
+takes precedence where a material carries both, per spec.
+
+Three notes where we knowingly diverge or where the draft is self-inconsistent,
+all raised upstream:
+
+- **`coatDarkeningFactor` defaults to 0 for a clearcoat-only asset**, not the
+  spec's 1. Darkening is physically correct and coat turns it on, but clearcoat
+  never had it, so applying it to a clearcoat asset would silently restyle it.
+  With `KHR_materials_coat` present the spec's 1.0 applies.
+- **Darkening is gated by coat weight.** The spec's composition applies
+  `coatColor × coatDarkening` to the base *outside* the weighted mix, so a
+  material with `coatFactor: 0` would still be tinted and darkened by a coat
+  that is not there. We scale by the weight instead.
+- **One Fresnel form for darkening.** The spec gives separate R for direct light
+  and for IBL; by the time the coat lobe runs, the two lobes are already summed
+  into one colour, so the direct-light form is applied to both. It over-darkens
+  the ambient term near the terminator. Splitting the lobes is deferred while
+  coat is draft.
+
+**Texture-driven variants are read** for coat, clear coat, sheen, specular,
 transmission and volume — each samples the channel its extension specifies and
 multiplies the corresponding factor. Absent maps bind to 1×1 white, the
 multiplicative identity, so a factors-only material behaves exactly as before.
-Still **not** read: `clearcoatNormalTexture`, `anisotropyTexture`,
+Still **not** read: `clearcoatNormalTexture` / `coatNormalTexture`, `anisotropyTexture`,
 `iridescenceTexture` and `iridescenceThicknessTexture`. Those are partial
 implementations rather than missing ones, so they do **not** trip the
 ignored-extension warning — this table is the reference.
 
-Set 1 now binds 13 samplers and set 2 binds 5. Vulkan only *guarantees* 16 per
+Set 1 now binds 17 samplers and set 2 binds 5. Vulkan only *guarantees* 16 per
 stage, so the renderer logs its budget against the device's actual limit at
-startup (`sampled images per stage: need 18, device allows …`) rather than
+startup (`sampled images per stage: need 22, device allows …`) rather than
 letting a constrained device fail with an opaque pipeline-layout error.
+
+That slot count and the material SSBO's two trailing UV-transform arrays are
+sized from a single `#define` in `model_common/shaders/material_slots.glsl`,
+included by both `pbr.frag` and `model_renderer.h`, with `static_assert`s tying
+the enums and `sizeof(MaterialExtGpu)` to it. The count sets the struct's
+*stride*, and when the two sides disagree only material 0 reads correctly —
+which looks like whole-image corruption, not like a texture-slot problem. That
+is issue #81; it cost a reverted branch to diagnose, and is now a build error.
 
 **Transmission costs a scene-colour copy per view.** Refracting the *rendered
 scene* (rather than only the environment, which the spec calls out as falling
@@ -210,6 +246,32 @@ to the executable alongside `sample.glb`.
 | 7 | transmission | `transmissionFactor` 0 → 1, `ior` 1.5, volume |
 | 8 | emissive | `emissiveStrength` 0 → 6 |
 | 9 | textured | one texture-driven property per column, all reading one ramp |
+
+### coat_test.glb
+
+`assets/coat_test.glb` is a second sweep, six rows by seven, for
+`KHR_materials_coat` — Khronos publishes no conformance asset for it, so this
+stands in. Every row shares one light neutral base; row 0 is plain
+`KHR_materials_clearcoat` and row 1 is the same material in coat's spelling.
+
+| Row | Sweep |
+|---|---|
+| 0 | CONTROL — `clearcoatFactor` 0 → 1 |
+| 1 | `coatFactor` 0 → 1 (the same material, coat's spelling) |
+| 2 | `coatColorFactor` white → amber, coat 0.5 |
+| 3 | `coatDarkeningFactor` 0 → 1, coat 0.5 |
+| 4 | `coatIor` 1.0 → 2.0 (f0 0 → 0.111) |
+| 5 | `coatAnisotropyStrength` 0 → 1 |
+
+Measure with `python3 scripts/probe_coat_test.py <atlas.png>`. Rows 2 and 3 run
+at coat 0.5 on purpose: at full coat the base is almost entirely displaced by
+the coat's own mirror reflection of the sky, and tint and darkening both act on
+the *base*, so there is nothing left for them to act on. The first cut of this
+asset used a red base at full coat and measured a flat row for both.
+
+`material_grid.glb` is deliberately **not** extended when an extension lands. It
+is the baseline every "does this change the render" measurement is taken
+against, and an asset that moves each time cannot serve that purpose.
 
 **The grid is a progress meter as much as a test asset**: a row is flat while
 its extension is ignored and comes alive when the extension lands. All nine rows
