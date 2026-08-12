@@ -413,11 +413,22 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
     if (input.keyQ) { input.cameraPosX -= upX*d;  input.cameraPosY -= upY*d;  input.cameraPosZ -= upZ*d; }
 
     // Auto-orbit: if enabled and user has been idle > 10s, slowly yaw the display.
-    double idleFor = NowSec() - input.lastInputTimeSec;
-    input.animationActive = (input.animateEnabled && idleFor > 10.0);
-    if (input.animationActive) {
-        float rate = 6.2831853f / 20.0f; // one revolution per 20 seconds
-        input.yaw += rate * dt;
+    // Held while a clip plays — the asset already carries its own motion, and
+    // orbiting on top of it double-animates the scene and fights whatever
+    // framing the clip was authored for. Holding the idle clock at "now" (rather
+    // than just skipping the yaw) restarts the 10 s countdown when playback
+    // pauses, so the turntable doesn't snap on the instant the user hits K.
+    // macOS has no transparent mode, so that half of the Windows gate is moot.
+    if (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) {
+        input.animationActive = false;
+        input.lastInputTimeSec = NowSec();
+    } else {
+        double idleFor = NowSec() - input.lastInputTimeSec;
+        input.animationActive = (input.animateEnabled && idleFor > 10.0);
+        if (input.animationActive) {
+            float rate = 6.2831853f / 20.0f; // one revolution per 20 seconds
+            input.yaw += rate * dt;
+        }
     }
 }
 
@@ -2728,8 +2739,15 @@ int main() {
                     }
 
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
+                    // "held" rather than "idle countdown" while a clip plays —
+                    // the countdown is being reset every frame, so it will never
+                    // reach the turntable and saying otherwise is a lie.
+                    const bool orbitHeld =
+                        g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused();
                     const char *orbitLabel = g_input.animateEnabled
-                        ? (g_input.animationActive ? "ON (running)" : "ON (idle countdown)")
+                        ? (orbitHeld ? "ON (held: clip playing)"
+                                     : (g_input.animationActive ? "ON (running)"
+                                                                : "ON (idle countdown)"))
                         : "OFF";
                     uint32_t activeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                         ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
