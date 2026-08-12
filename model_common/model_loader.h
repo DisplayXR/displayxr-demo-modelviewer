@@ -55,6 +55,7 @@ enum ModelTexSlot {
     MTS_CLEARCOAT, MTS_CLEARCOAT_ROUGH, MTS_SHEEN_COLOR, MTS_SHEEN_ROUGH,
     MTS_SPECULAR, MTS_SPECULAR_COLOR, MTS_TRANSMISSION, MTS_THICKNESS,
     MTS_SCATTER_STRENGTH, MTS_MULTISCATTER_COLOR,
+    MTS_COAT_COLOR, MTS_COAT_ANISOTROPY,
     MTS_COUNT
 };
 
@@ -105,6 +106,27 @@ struct ModelMaterial {
     float multiscatterColor[3] = {1, 1, 1};   // multi-scatter albedo (linear)
     float scatterAnisotropy = 0.0f;           // (-1,1) Henyey-Greenstein g
 
+    // KHR_materials_coat (draft; issue #81). A superset of KHR_materials_clearcoat
+    // that the spec maps onto it 1:1, so coatFactor/coatRoughnessFactor and their
+    // textures land in the clearcoat fields above and one shader lobe serves both.
+    // These are the properties coat ADDS.
+    //
+    // The defaults here are the values that make a clearcoat-only asset shade
+    // exactly as it did before coat existed, which is NOT the same as the spec's
+    // defaults: coatIor 1.5 gives f0 = ((1.5-1)/(1.5+1))^2 = 0.04, the constant
+    // the clearcoat lobe used to hardcode, but coatDarkening must default to 0
+    // here where the spec says 1.0. Darkening is physically correct and the spec
+    // turns it on; KHR_materials_clearcoat never had it, so applying it to a
+    // clearcoat asset would change that asset's appearance. hasCoat is what
+    // distinguishes the two cases — the parser sets darkening to the spec's 1.0
+    // only when KHR_materials_coat is actually present.
+    float coatIor = 1.5f;
+    float coatDarkening = 0.0f;         // spec default 1.0, but only when hasCoat
+    float coatAnisotropyStrength = 0.0f;
+    float coatAnisotropyRotation = 0.0f;  // radians
+    float coatColor[3] = {1, 1, 1};     // linear
+    bool  hasCoat = false;
+
     // KHR_texture_transform: a per-TEXTURE-SLOT UV transform. Slot order is
     // ModelTexSlot below, which ModelRenderer::MaterialTexSlot mirrors (a
     // static_assert keeps the two from drifting).
@@ -132,6 +154,8 @@ struct ModelMaterial {
     int thicknessTex = -1;           // G
     int scatterStrengthTex = -1;     // A (KHR_materials_scatter)
     int multiscatterColorTex = -1;   // RGB (sRGB-encoded)
+    int coatColorTex = -1;           // RGB (sRGB-encoded) (KHR_materials_coat)
+    int coatAnisotropyTex = -1;      // B = strength, RG = rotation vector
 
     // Per-slot UV transforms, indexed by ModelTexSlot. Identity by default, so a
     // texture without the extension samples exactly as it did before.

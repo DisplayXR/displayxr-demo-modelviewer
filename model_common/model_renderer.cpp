@@ -750,6 +750,19 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p7[0] = m.multiscatterColor[0];
         g.p7[1] = m.multiscatterColor[1];
         g.p7[2] = m.multiscatterColor[2];
+        // KHR_materials_coat. Written for EVERY material, not only coated ones:
+        // the shader's one lobe serves clearcoat too, so coatIor has to carry
+        // 1.5 (f0 0.04, the constant the lobe used to hardcode) even where no
+        // coat extension exists. hasCoat, not the presence of a lane, is what
+        // gates the properties coat adds.
+        g.p8[0] = m.coatIor;
+        g.p8[1] = m.coatDarkening;
+        g.p8[2] = m.coatAnisotropyStrength;
+        g.p8[3] = m.coatAnisotropyRotation;
+        g.p9[0] = m.coatColor[0];
+        g.p9[1] = m.coatColor[1];
+        g.p9[2] = m.coatColor[2];
+        g.p9[3] = m.hasCoat ? 1.0f : 0.0f;
         for (int t = 0; t < (int)MTEX_COUNT; ++t) {
             g.uvXf[t][0] = m.uvXf[t].offset[0];
             g.uvXf[t][1] = m.uvXf[t].offset[1];
@@ -770,6 +783,8 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p4[0] = 100.0f; g.p4[1] = 400.0f; // thickness min/max (nm)
         g.p5[0] = g.p5[1] = g.p5[2] = 1.0f; // attenuationColor
         g.p7[0] = g.p7[1] = g.p7[2] = 1.0f; // multiscatterColor (scatterStrength 0 = off)
+        g.p8[0] = 1.5f;                     // coatIor -> f0 0.04 (darkening 0, hasCoat 0)
+        g.p9[0] = g.p9[1] = g.p9[2] = 1.0f; // coatColor (white = no tint)
         for (int t = 0; t < (int)MTEX_COUNT; ++t) { g.uvXf[t][2] = 1.0f; g.uvXf[t][3] = 1.0f; }
         gpu.push_back(g);
     }
@@ -1472,6 +1487,8 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
             viewOr(m.thicknessTex,          whiteTex_.view),
             viewOr(m.scatterStrengthTex,    whiteTex_.view),
             viewOr(m.multiscatterColorTex,  whiteTex_.view),
+            viewOr(m.coatColorTex,          whiteTex_.view),
+            viewOr(m.coatAnisotropyTex,     whiteTex_.view),
         };
         materialSets_.push_back(makeMaterialSet(v));
     }
