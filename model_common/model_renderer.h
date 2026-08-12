@@ -168,6 +168,8 @@ private:
         float p3[4];   // anisotropyStrength, anisotropyRotation, iridescenceFactor, iridescenceIor
         float p4[4];   // iridescenceThicknessMin/Max, transmissionFactor, volumeThickness
         float p5[4];   // attenuationColor.rgb, attenuationDistance (0 = none)
+        float p6[4];   // scatterStrength, scatterAnisotropy, 0, 0   (KHR_materials_scatter)
+        float p7[4];   // multiscatterColor.rgb, 0
     };
     // Set-0 uniform buffer (must match shaders/pbr.{vert,frag} + skybox.frag).
     struct UniformBlock {
@@ -203,6 +205,7 @@ private:
         MTEX_BASE_COLOR = 0, MTEX_MR, MTEX_NORMAL, MTEX_OCCLUSION, MTEX_EMISSIVE,
         MTEX_CLEARCOAT, MTEX_CLEARCOAT_ROUGH, MTEX_SHEEN_COLOR, MTEX_SHEEN_ROUGH,
         MTEX_SPECULAR, MTEX_SPECULAR_COLOR, MTEX_TRANSMISSION, MTEX_THICKNESS,
+        MTEX_SCATTER_STRENGTH, MTEX_MULTISCATTER_COLOR,
         MTEX_COUNT
     };
     VkDescriptorSet makeMaterialSet(const VkImageView views[MTEX_COUNT]);

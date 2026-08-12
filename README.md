@@ -63,7 +63,22 @@ difference.
 | `KHR_materials_iridescence` | ✅ factors — full thin-film model, no thickness texture |
 | `KHR_materials_transmission` | ✅ factor **+ `transmissionTexture`** (R) — refracts the rendered scene, roughness-blurred |
 | `KHR_materials_volume` | ✅ factors **+ `thicknessTexture`** (G) — thickness-driven refraction + Beer-Lambert attenuation |
+| `KHR_materials_scatter` *(draft)* | ⚠️ factors **+ `scatterStrengthTexture`** (A) **+ `multiscatterColorTexture`** (RGB) — subsurface/multiple scattering. Volumetric mode is approximated with the spec-sanctioned thin-walled model; see the limits below |
 | `KHR_texture_transform`, Draco, KTX2/Basis | ❌ |
+
+**Scatter is an approximation, and here is exactly where it stops.** The spec
+permits renderers without full volumetric transport to approximate volumetric mode
+with the thin-walled model, which is what this does: a Lambertian lobe of the
+multi-scatter albedo, split by anisotropy into a forward half (the most-blurred
+scene copy, standing in for diffuse transmission) and a backward half (a diffuse
+reflection). How much of the light takes that path is driven by optical depth
+`thickness / attenuationDistance`, so density still matters. Measured against the
+Khronos conformance assets, the anisotropy sweep and the density response both
+track the reference (density sparse→dense: ours +57%, reference +47%). Two known
+gaps: the density response **saturates** past optical depth ~1 where the reference
+keeps grading, and the result is **over-saturated** — real multiple scattering
+desaturates as it redistributes energy between bounces, and one Lambertian bounce
+cannot. Neither is fixable without a real multi-bounce term.
 
 **Sheen conserves energy.** The base layer is scaled by
 `1 - max3(sheenColor) · E` before sheen is added, where `E` is the sheen
