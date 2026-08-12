@@ -747,6 +747,9 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p5[3] = m.attenuationDistance;
         g.p6[0] = m.scatterStrength;
         g.p6[1] = m.scatterAnisotropy;
+        g.p6[2] = m.diffuseRoughness;   // KHR_materials_diffuse_roughness
+        g.p6[3] = m.fuzzFactor;         // KHR_materials_fuzz (colour/roughness
+                                        // ride the sheen lanes — see p7[3])
         g.p7[0] = m.multiscatterColor[0];
         g.p7[1] = m.multiscatterColor[1];
         g.p7[2] = m.multiscatterColor[2];
@@ -763,6 +766,7 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
         g.p9[1] = m.coatColor[1];
         g.p9[2] = m.coatColor[2];
         g.p9[3] = m.hasCoat ? 1.0f : 0.0f;
+        g.p7[3] = m.hasFuzz ? 1.0f : 0.0f;
         for (int t = 0; t < (int)MTEX_COUNT; ++t) {
             g.uvXf[t][0] = m.uvXf[t].offset[0];
             g.uvXf[t][1] = m.uvXf[t].offset[1];
@@ -1498,6 +1502,8 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
             viewOr(m.multiscatterColorTex,  whiteTex_.view),
             viewOr(m.coatColorTex,          whiteTex_.view),
             viewOr(m.coatAnisotropyTex,     coatAnisoDefaultTex_.view),
+            viewOr(m.diffuseRoughnessTex,   whiteTex_.view),
+            viewOr(m.fuzzTex,               whiteTex_.view),
         };
         materialSets_.push_back(makeMaterialSet(v));
     }
