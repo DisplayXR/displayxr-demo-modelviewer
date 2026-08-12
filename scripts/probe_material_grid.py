@@ -78,22 +78,55 @@ def px(rows, ch, x, y):
     return rows[y][o], rows[y][o + 1], rows[y][o + 2]
 
 
-def main():
-    if len(sys.argv) < 2:
-        raise SystemExit(__doc__)
-    path = sys.argv[1]
-    w, h, ch, rows = load_png(path)
-    print(f"atlas            {w} x {h}")
+# The grid's row order, as make_material_grid.py emits it.
+ROWS = ["dielectric", "metal", "clearcoat", "sheen", "anisotropy",
+        "iridescence", "specular_ior", "transmission", "emissive", "textured"]
 
-    # The sky is a smooth VERTICAL gradient, so comparing every pixel against a
-    # single corner sample marks most of the background as foreground. Estimate
-    # the background PER ROW — the median across a row is sky, since sky is the
-    # majority of every row — and compare in RGB rather than luminance: several
-    # of the grid's spheres are pale enough to match the sky's brightness while
-    # differing clearly in hue.
-    # Sampling strides scale with the image so cost stays roughly constant from
-    # a 1920-wide atlas to a 4K one — a fixed stride makes the pure-Python scan
-    # take minutes at 3840x2160. ~200 samples is far more than a median needs.
+
+# ── Geometry detection ───────────────────────────────────────────────────────
+# Module scope, not nested in main(), because compare_captures.py locates the
+# same rows to attribute a diff to a material. One locator, one set of bands —
+# the same reason transmission_test_scene.py exists for the #75 probes.
+
+def runs_of(pred, n):
+    out, start_i = [], None
+    for i in range(n):
+        if pred(i) and start_i is None:
+            start_i = i
+        elif not pred(i) and start_i is not None:
+            out.append((start_i, i)); start_i = None
+    if start_i is not None:
+        out.append((start_i, n))
+    return out
+
+
+def merge(rs, gap):
+    """Join runs separated by less than `gap` — spheres within a tile are
+    separate runs, so the grid is a CLUSTER of runs, not one long one."""
+    if not rs:
+        return []
+    out = [list(rs[0])]
+    for a, b in rs[1:]:
+        if a - out[-1][1] < gap:
+            out[-1][1] = b
+        else:
+            out.append([a, b])
+    return [tuple(t) for t in out]
+
+
+def foreground(w, h, ch, rows):
+    """Return (is_fg, sx, sy): a foreground predicate and the sampling strides.
+
+    The sky is a smooth VERTICAL gradient, so comparing every pixel against a
+    single corner sample marks most of the background as foreground. Estimate
+    the background PER ROW — the median across a row is sky, since sky is the
+    majority of every row — and compare in RGB rather than luminance: several of
+    the grid's spheres are pale enough to match the sky's brightness while
+    differing clearly in hue.
+    Sampling strides scale with the image so cost stays roughly constant from a
+    1920-wide atlas to a 4K one — a fixed stride makes the pure-Python scan take
+    minutes at 3840x2160. ~200 samples is far more than a median needs.
+    """
     sx = max(1, w // 200)
     sy = max(1, h // 400)
     bg_row = []
@@ -106,60 +139,38 @@ def main():
         b = bg_row[y]
         return abs(p[0] - b[0]) + abs(p[1] - b[1]) + abs(p[2] - b[2]) > 18
 
-    # 1. Uninitialized-memory signature. Cheap, and the single most diagnostic
-    #    number here: it is what the viewport-scaling bug looked like.
-    magenta = sum(1 for y in range(0, h, max(1, sy // 2)) for x in range(0, w, max(1, sx // 2))
-                  if (lambda p: p[0] > 200 and p[1] < 70 and p[2] > 200)(px(rows, ch, x, y)))
-    print(f"magenta pixels   {magenta}   <- MUST be 0 (uninitialized VRAM signature)")
+    return is_fg, sx, sy
 
-    # 2. Locate the geometry. Every coordinate below is derived from the image
-    #    itself and reported as a FRACTION of its view tile, never as an absolute
-    #    pixel — atlas tile size varies with display resolution and window size,
-    #    so hard-coded pixel probes would only ever be valid on one machine.
-    def runs_of(pred, n):
-        out, start_i = [], None
-        for i in range(n):
-            if pred(i) and start_i is None:
-                start_i = i
-            elif not pred(i) and start_i is not None:
-                out.append((start_i, i)); start_i = None
-        if start_i is not None:
-            out.append((start_i, n))
-        return out
 
-    def merge(rs, gap):
-        """Join runs separated by less than `gap` — spheres within a tile are
-        separate runs, so the grid is a CLUSTER of runs, not one long one."""
-        if not rs:
-            return []
-        out = [list(rs[0])]
-        for a, b in rs[1:]:
-            if a - out[-1][1] < gap:
-                out[-1][1] = b
-            else:
-                out.append([a, b])
-        return [tuple(t) for t in out]
+def detect_tiles(w, h, is_fg, sy):
+    """Locate the view tiles and the sphere columns within them.
 
+    Every coordinate is derived from the image itself and reported as a FRACTION
+    of its view tile by the callers, never as an absolute pixel — atlas tile size
+    varies with display resolution and window size, so hard-coded pixel probes
+    would only ever be valid on one machine.
+    """
     col_occupied = [any(is_fg(x, y) for y in range(0, h, sy)) for x in range(w)]
     sphere_cols = runs_of(lambda x: col_occupied[x], w)
     tile_x_bands = [t for t in merge(sphere_cols, w // 20) if t[1] - t[0] > w // 40]
     # Tiles tile the atlas as an M×N grid (2×1 SBS, 2×2 Quad, …). Detect tile
     # ROWS the same way as tile columns — vertical content bands — so a 2×2
     # atlas reads as four tiles, not two mis-detected ones (#70 4-view / Quad).
-    # Coarse gap (h//20) separates tiles; the per-tile pass below re-splits each
-    # tile's band into material-grid rows with a fine gap.
+    # Coarse gap (h//20) separates tiles; detect_rows() re-splits each tile's
+    # band into material-grid rows with a fine gap.
     row_bands_occ = [any(is_fg(x, y) for x in range(0, w, 4)) for y in range(h)]
     tile_y_bands = [t for t in merge(runs_of(lambda y: row_bands_occ[y], h), h // 20)
                     if t[1] - t[0] > h // 40]
     tiles = [(xb[0], xb[1], yb[0], yb[1]) for yb in tile_y_bands for xb in tile_x_bands]
-    print(f"view tiles       {len(tiles)}   ({len(tile_x_bands)} cols x {len(tile_y_bands)} rows)")
-    if not tiles:
-        raise SystemExit("no geometry found — was material_grid.glb actually loaded?")
+    return tiles, sphere_cols, tile_x_bands, tile_y_bands
 
-    ROWS = ["dielectric", "metal", "clearcoat", "sheen", "anisotropy",
-            "iridescence", "specular_ior", "transmission", "emissive", "textured"]
 
-    # Detect each tile's sphere-columns and material-row bands up front.
+def detect_rows(tiles, sphere_cols, is_fg):
+    """Per tile, return (tx0, tx1, ty0, ty1, sphere_cols, row_bands, raw_n).
+
+    `row_bands` is aligned to the canonical layout where possible; `raw_n` is how
+    many bands that tile resolved on its own, which is what the caller reports.
+    """
     tile_data = []
     for (tx0, tx1, ty0, ty1) in tiles:
         tcols = [c for c in sphere_cols if c[0] >= tx0 and c[1] <= tx1]
@@ -180,12 +191,42 @@ def main():
         rty0, rty1 = ref[2], ref[3]; rth = rty1 - rty0
         canon = [((a - rty0) / rth, (b - rty0) / rth) for a, b in ref[5][:len(ROWS)]]
 
-    for ti, (tx0, tx1, ty0, ty1, cols, rws) in enumerate(tile_data):
-        tw, th = tx1 - tx0, ty1 - ty0
-        raw_n = len(rws)
+    out = []
+    for (tx0, tx1, ty0, ty1, tcols, trws) in tile_data:
+        raw_n = len(trws)
         if canon is not None:
-            rws = [(int(ty0 + f0 * th), int(ty0 + f1 * th)) for f0, f1 in canon]
-        aligned = " (rows aligned to reference)" if (canon is not None and raw_n != len(ROWS)) else ""
+            th = ty1 - ty0
+            trws = [(int(ty0 + f0 * th), int(ty0 + f1 * th)) for f0, f1 in canon]
+        out.append((tx0, tx1, ty0, ty1, tcols, trws, raw_n))
+    return out
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise SystemExit(__doc__)
+    path = sys.argv[1]
+    w, h, ch, rows = load_png(path)
+    print(f"atlas            {w} x {h}")
+
+    is_fg, sx, sy = foreground(w, h, ch, rows)
+
+    # 1. Uninitialized-memory signature. Cheap, and the single most diagnostic
+    #    number here: it is what the viewport-scaling bug looked like.
+    magenta = sum(1 for y in range(0, h, max(1, sy // 2)) for x in range(0, w, max(1, sx // 2))
+                  if (lambda p: p[0] > 200 and p[1] < 70 and p[2] > 200)(px(rows, ch, x, y)))
+    print(f"magenta pixels   {magenta}   <- MUST be 0 (uninitialized VRAM signature)")
+
+    # 2. Locate the geometry.
+    tiles, sphere_cols, tile_x_bands, tile_y_bands = detect_tiles(w, h, is_fg, sy)
+    print(f"view tiles       {len(tiles)}   ({len(tile_x_bands)} cols x {len(tile_y_bands)} rows)")
+    if not tiles:
+        raise SystemExit("no geometry found — was material_grid.glb actually loaded?")
+
+    tile_data = detect_rows(tiles, sphere_cols, is_fg)
+
+    for ti, (tx0, tx1, ty0, ty1, cols, rws, raw_n) in enumerate(tile_data):
+        tw, th = tx1 - tx0, ty1 - ty0
+        aligned = " (rows aligned to reference)" if raw_n != len(rws) else ""
         print(f"\ntile {ti}   x[{tx0},{tx1}] y[{ty0},{ty1}] {tw}x{th}   "
               f"columns detected {len(cols)}/7   rows detected {raw_n}/{len(ROWS)}{aligned}")
         if len(cols) != 7 or len(rws) != len(ROWS):
