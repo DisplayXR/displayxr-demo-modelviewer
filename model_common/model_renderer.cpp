@@ -938,7 +938,16 @@ bool ModelRenderer::createSamplerAndDefaults() {
     whiteTex_ = uploadTexture(white);
     ModelTexture flat;  flat.width = 1;  flat.height = 1;  flat.rgba = {128, 128, 255, 255};
     flatNormalTex_ = uploadTexture(flat);
-    return whiteTex_.view != VK_NULL_HANDLE && flatNormalTex_.view != VK_NULL_HANDLE;
+    // KHR_materials_coat's coatAnisotropyTexture is the one slot for which white
+    // is NOT the identity. Its RG is a direction VECTOR biased into [0,1] (0.5 =
+    // zero), and only B is a multiplier — so white decodes to the direction
+    // (1,1), i.e. a spurious 45-degree rotation of the highlight on every
+    // material that has no such texture. The neutral is (255, 128, 255):
+    // direction (+1, 0) => rotation 0, strength multiplier 1.
+    ModelTexture aniso; aniso.width = 1; aniso.height = 1; aniso.rgba = {255, 128, 255, 255};
+    coatAnisoDefaultTex_ = uploadTexture(aniso);
+    return whiteTex_.view != VK_NULL_HANDLE && flatNormalTex_.view != VK_NULL_HANDLE
+        && coatAnisoDefaultTex_.view != VK_NULL_HANDLE;
 }
 
 bool ModelRenderer::genCubeMap(CubeMap& cube, uint32_t size, uint32_t mips,
@@ -1488,13 +1497,14 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
             viewOr(m.scatterStrengthTex,    whiteTex_.view),
             viewOr(m.multiscatterColorTex,  whiteTex_.view),
             viewOr(m.coatColorTex,          whiteTex_.view),
-            viewOr(m.coatAnisotropyTex,     whiteTex_.view),
+            viewOr(m.coatAnisotropyTex,     coatAnisoDefaultTex_.view),
         };
         materialSets_.push_back(makeMaterialSet(v));
     }
     VkImageView dflt[MTEX_COUNT];
     for (uint32_t i = 0; i < MTEX_COUNT; ++i) dflt[i] = whiteTex_.view;
     dflt[MTEX_NORMAL] = flatNormalTex_.view;
+    dflt[MTEX_COAT_ANISOTROPY] = coatAnisoDefaultTex_.view;
     defaultMatSet_ = makeMaterialSet(dflt);
 
     modelLoaded_ = true;
@@ -2374,6 +2384,7 @@ void ModelRenderer::cleanup() {
     if (sampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
     if (whiteTex_.image != VK_NULL_HANDLE) modelDestroyImage(device_, whiteTex_);
     if (flatNormalTex_.image != VK_NULL_HANDLE) modelDestroyImage(device_, flatNormalTex_);
+    if (coatAnisoDefaultTex_.image != VK_NULL_HANDLE) modelDestroyImage(device_, coatAnisoDefaultTex_);
     if (matSetLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, matSetLayout_, nullptr); matSetLayout_ = VK_NULL_HANDLE; }
 
     // IBL resources.

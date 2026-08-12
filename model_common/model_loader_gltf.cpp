@@ -141,6 +141,37 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
         readTexSlot(*v, "clearcoatTexture", mm, MTS_CLEARCOAT, mm.clearcoatTex, resolveTex);
         readTexSlot(*v, "clearcoatRoughnessTexture", mm, MTS_CLEARCOAT_ROUGH, mm.clearcoatRoughnessTex, resolveTex);
     }
+    // KHR_materials_coat (draft; issue #81). Deliberately AFTER clearcoat: the
+    // spec maps clearcoat's five properties onto coat's 1:1 and says coat takes
+    // precedence where both appear, clearcoat surviving only as the fallback for
+    // loaders that do not know coat. So coat overwrites the clearcoat fields and
+    // one shader lobe serves both.
+    //
+    // The overwrite uses COAT's defaults, not the clearcoat values already read:
+    // a material carrying `"KHR_materials_coat": {}` has coatFactor 0, i.e. no
+    // coat, and honouring its fallback's factor instead would be reading the
+    // extension the spec just told us to ignore.
+    if (const tinygltf::Value* v = ext("KHR_materials_coat")) {
+        mm.hasCoat            = true;
+        mm.clearcoatFactor    = (float)extNumber(*v, "coatFactor", 0.0);
+        mm.clearcoatRoughness = (float)extNumber(*v, "coatRoughnessFactor", 0.0);
+        readTexSlot(*v, "coatTexture", mm, MTS_CLEARCOAT, mm.clearcoatTex, resolveTex);
+        readTexSlot(*v, "coatRoughnessTexture", mm, MTS_CLEARCOAT_ROUGH,
+                    mm.clearcoatRoughnessTex, resolveTex);
+        mm.coatIor = (float)extNumber(*v, "coatIor", 1.5);
+        extVec3(*v, "coatColorFactor", mm.coatColor);
+        // Spec default 1.0, and only reachable here — ModelMaterial defaults it
+        // to 0 so a clearcoat-only asset keeps the un-darkened look it had
+        // before coat existed. This is the one place the two differ.
+        mm.coatDarkening = (float)extNumber(*v, "coatDarkeningFactor", 1.0);
+        mm.coatAnisotropyStrength = (float)extNumber(*v, "coatAnisotropyStrength", 0.0);
+        mm.coatAnisotropyRotation = (float)extNumber(*v, "coatAnisotropyRotation", 0.0);
+        readTexSlot(*v, "coatColorTexture", mm, MTS_COAT_COLOR, mm.coatColorTex, resolveTex);
+        readTexSlot(*v, "coatAnisotropyTexture", mm, MTS_COAT_ANISOTROPY,
+                    mm.coatAnisotropyTex, resolveTex);
+        // coatNormalTexture is not read, matching the clearcoat lobe this shares
+        // — the coat shades with the base normal. Listed in the README's gaps.
+    }
     if (const tinygltf::Value* v = ext("KHR_materials_sheen")) {
         extVec3(*v, "sheenColorFactor", mm.sheenColorFactor);
         mm.sheenRoughness = (float)extNumber(*v, "sheenRoughnessFactor", mm.sheenRoughness);

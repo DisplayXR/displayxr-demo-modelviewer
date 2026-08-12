@@ -358,6 +358,7 @@ private:
     VkSampler sampler_ = VK_NULL_HANDLE;
     ModelImage whiteTex_;        // 1x1 white  — default base-color/MR/AO/emissive
     ModelImage flatNormalTex_;   // 1x1 (128,128,255) — default tangent-space normal
+    ModelImage coatAnisoDefaultTex_;  // 1x1 (255,128,255) — coat aniso: dir (+1,0), strength 1
     VkDescriptorSetLayout matSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool matPool_ = VK_NULL_HANDLE;          // recreated per model
     std::vector<VkDescriptorSet> materialSets_;          // one per material

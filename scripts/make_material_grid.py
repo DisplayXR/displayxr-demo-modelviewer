@@ -245,6 +245,112 @@ ROWS = [
 # Row 9 is built from TEXTURED rather than a sweep function.
 TEXTURED_ROW_LABEL = ("textured", "one texture-driven property per column")
 
+
+# ── KHR_materials_coat sweep (draft; issue #81) ──────────────────────────────
+# A SEPARATE asset rather than five more rows on material_grid.glb, for the same
+# reason #79 validated scatter against Khronos' conformance assets instead of
+# growing the grid: material_grid.glb is the regression baseline that "this
+# change renders byte-identically" is measured against, and an asset that moves
+# every time an extension lands cannot serve that purpose. Coat needs its own
+# sweep because, unlike scatter, Khronos has published no conformance asset for
+# it — glTF-Sample-Assets#269 carries the scatter models only.
+#
+# Every row shares one base material: a rough red dielectric, the same one the
+# grid's clearcoat row uses. That is deliberate. Row 0 is plain
+# KHR_materials_clearcoat and row 1 is the KHR_materials_coat spelling of the
+# identical material, so the spec's claim that coat is a 1:1 superset of
+# clearcoat becomes a measurement WITHIN a single capture — the two rows must
+# read the same — rather than something taken on trust.
+# A light NEUTRAL base, not the grid's red one. An amber tint on a red base is
+# very nearly a no-op — the base has almost no green or blue left to remove —
+# and the first cut of this asset used red and measured a flat row because of it.
+# Coat's tint and darkening both act on what the BASE shows through, so the base
+# has to be bright and uncoloured for either to be legible.
+COAT_BASE = (0.78, 0.78, 0.80)
+COAT_ROUGH = 0.40
+
+
+def m_coat_clearcoat_ref(t):
+    """Control: the old extension, factor 0 -> 1."""
+    return {"pbrMetallicRoughness": pbr(COAT_BASE, 0.0, COAT_ROUGH),
+            "extensions": {"KHR_materials_clearcoat": {
+                "clearcoatFactor": t, "clearcoatRoughnessFactor": 0.06}}}
+
+
+def m_coat_factor(t):
+    """The same sweep in coat's spelling. coatDarkeningFactor 0 to match the
+    control — the spec defaults it to 1, and that difference is row 3's job."""
+    return {"pbrMetallicRoughness": pbr(COAT_BASE, 0.0, COAT_ROUGH),
+            "extensions": {"KHR_materials_coat": {
+                "coatFactor": t, "coatRoughnessFactor": 0.06,
+                "coatDarkeningFactor": 0.0}}}
+
+
+def m_coat_color(t):
+    """White -> amber tint. coatFactor 0.5, not 1: the tint acts on the base,
+    while the coat's OWN reflection is untinted (correctly — it never entered
+    the coat), so at full coat the sphere is half sky-reflection and the tint
+    reads at half strength. Half a coat keeps the tinted base dominant.
+    The tint should also deepen toward the rim, where the refracted path
+    through the coat is longer."""
+    return {"pbrMetallicRoughness": pbr(COAT_BASE, 0.0, COAT_ROUGH),
+            "extensions": {"KHR_materials_coat": {
+                "coatFactor": 0.5, "coatRoughnessFactor": 0.06,
+                "coatDarkeningFactor": 0.0,
+                "coatColorFactor": [1.0, 1.0 - 0.65 * t, 1.0 - 0.9 * t]}}}
+
+
+def m_coat_darkening(t):
+    """coatDarkeningFactor 0 -> 1. The property whose absence users notice: it
+    is what makes a coated surface read as wet.
+
+    coatFactor 0.5 for the same reason as the tint row. Darkening acts on the
+    base, and at full coat the base is almost entirely displaced by the coat's
+    own mirror reflection of the sky — rows 3-5 of the first cut of this asset
+    all rendered as the identical dark sphere, with nothing left to darken.
+
+    Expect a SMALL effect. The spec's transmittance is T = (1-R)^2, a single
+    two-way pass, and R is the coat's Fresnel — about 0.04 head-on. Real
+    wet-look darkening is stronger because light bounces inside the coat many
+    times; a one-pass model gives roughly 10 %, and half of that at coat 0.5."""
+    return {"pbrMetallicRoughness": pbr(COAT_BASE, 0.0, COAT_ROUGH),
+            "extensions": {"KHR_materials_coat": {
+                "coatFactor": 0.5, "coatRoughnessFactor": 0.06,
+                "coatDarkeningFactor": t}}}
+
+
+def m_coat_ior(t):
+    """coatIor 1.0 -> 2.0. f0 runs 0 -> 0.111, so the coat's reflection
+    strengthens across the row. 1.5 (column 3.5) is the clearcoat constant."""
+    return {"pbrMetallicRoughness": pbr(COAT_BASE, 0.0, COAT_ROUGH),
+            "extensions": {"KHR_materials_coat": {
+                "coatFactor": 1.0, "coatRoughnessFactor": 0.06,
+                "coatDarkeningFactor": 0.0,
+                "coatIor": 1.0 + t}}}
+
+
+def m_coat_anisotropy(t):
+    """coatAnisotropyStrength 0 -> 1 on a smoother coat, where the highlight is
+    tight enough for the stretch to be visible. Direct light only, like the base
+    material's anisotropy."""
+    return {"pbrMetallicRoughness": pbr(COAT_BASE, 0.0, COAT_ROUGH),
+            "extensions": {"KHR_materials_coat": {
+                "coatFactor": 1.0, "coatRoughnessFactor": 0.15,
+                "coatDarkeningFactor": 0.0,
+                "coatAnisotropyStrength": t, "coatAnisotropyRotation": 0.0}}}
+
+
+COAT_ROWS = [
+    ("clearcoat_ref", "CONTROL: KHR_materials_clearcoat, factor 0 → 1", m_coat_clearcoat_ref),
+    ("coat_factor",   "coatFactor 0 → 1 (must match row 0)",            m_coat_factor),
+    ("coat_color",    "coatColorFactor white → amber, coat 0.5",        m_coat_color),
+    ("coat_darkening", "coatDarkeningFactor 0 → 1, coat 0.5",           m_coat_darkening),
+    ("coat_ior",      "coatIor 1.0 → 2.0 (f0 0 → 0.111)",               m_coat_ior),
+    ("coat_aniso",    "coatAnisotropyStrength 0 → 1, coatRough 0.15",   m_coat_anisotropy),
+]
+
+COAT_EXTENSIONS_USED = ["KHR_materials_clearcoat", "KHR_materials_coat"]
+
 # Extensions this scene references. extensionsUsed ONLY — putting any of these
 # in extensionsRequired would make a conformant loader that lacks them refuse
 # the file, which defeats the point of it being a degradation test.
@@ -261,7 +367,18 @@ EXTENSIONS_USED = [
 ]
 
 
-def build_glb():
+def build_glb(row_specs=None, textured=None, extensions=None, scene_name="material_grid"):
+    """Build a sweep grid: one row per (name, doc, make) spec, STEPS columns wide.
+
+    Parameterised so a second sweep can be emitted without cloning the builder —
+    coat_test.glb is exactly this with different rows and no textured row. The
+    defaults reproduce material_grid.glb byte-for-byte, which matters: that asset
+    is the regression baseline every "did this change the render" measurement is
+    taken against, so it must not move when a new extension is added.
+    """
+    row_specs = ROWS if row_specs is None else row_specs
+    textured = TEXTURED if textured is None else textured
+    extensions = EXTENSIONS_USED if extensions is None else extensions
     pos, nrm, uv, tan, idx = uv_sphere(RADIUS, LON, LAT)
 
     pos_b = b"".join(struct.pack("<3f", *p) for p in pos)
@@ -297,8 +414,9 @@ def build_glb():
     ]
 
     materials, meshes, nodes, layout = [], [], [], []
-    rows, cols = len(ROWS) + 1, STEPS   # +1 for the textured row
-    for r, (name, doc, make) in enumerate(ROWS):
+    rows = len(row_specs) + (1 if textured else 0)
+    cols = STEPS
+    for r, (name, doc, make) in enumerate(row_specs):
         for c in range(cols):
             t = c / (cols - 1)
             mat = make(t)
@@ -314,9 +432,9 @@ def build_glb():
             nodes.append({"name": mat["name"], "mesh": mi, "translation": [x, y, 0.0]})
         layout.append(f"  row {r}  {name:<13} {doc}")
 
-    # Row 9: texture-driven variants, one property per column.
-    r = len(ROWS)
-    for c, (tname, mat) in enumerate(TEXTURED):
+    # Last row (when present): texture-driven variants, one property per column.
+    r = len(row_specs)
+    for c, (tname, mat) in enumerate(textured or []):
         mat = dict(mat)
         mat["name"] = f"{r:02d}_textured_{tname}"
         mi = len(materials)
@@ -327,15 +445,16 @@ def build_glb():
         x = (c - (cols - 1) / 2.0) * SPACING
         y = ((rows - 1) / 2.0 - r) * SPACING
         nodes.append({"name": mat["name"], "mesh": mi, "translation": [x, y, 0.0]})
-    layout.append(f"  row {r}  {'textured':<13} one texture-driven property per column")
+    if textured:
+        layout.append(f"  row {r}  {'textured':<13} one texture-driven property per column")
 
     gltf = {
         "asset": {"version": "2.0",
                   "generator": "DisplayXR model-viewer material grid "
                                "(scripts/make_material_grid.py, issue #70)"},
-        "extensionsUsed": EXTENSIONS_USED,
+        "extensionsUsed": extensions,
         "scene": 0,
-        "scenes": [{"name": "material_grid", "nodes": list(range(len(nodes)))}],
+        "scenes": [{"name": scene_name, "nodes": list(range(len(nodes)))}],
         "nodes": nodes,
         "meshes": meshes,
         "materials": materials,
@@ -540,6 +659,18 @@ def main():
     print(f"wrote {dest} ({len(glb):,} bytes)")
     print(f"{rows} families x {cols} steps = {nmat} materials, sweep runs left to right:")
     print("\n".join(layout))
+
+    cdest = dest.parent / "coat_test.glb"
+    cglb, cnmat, crows, ccols, clayout = build_glb(
+        row_specs=COAT_ROWS, textured=[], extensions=COAT_EXTENSIONS_USED,
+        scene_name="coat_test")
+    cdest.write_bytes(cglb)
+    print(f"wrote {cdest} ({len(cglb):,} bytes)")
+    print(f"{crows} families x {ccols} steps = {cnmat} materials (KHR_materials_coat, #81):")
+    print("\n".join(clayout))
+    print("  rows 0 and 1 are the same material in both spellings. Measure with")
+    print("  scripts/probe_coat_test.py; note the two rows sit at different heights")
+    print("  and so see different sky, which bounds how equal they can read.")
 
     tdest = dest.parent / "transmission_test.glb"
     tdest.write_bytes(build_transmission_test())

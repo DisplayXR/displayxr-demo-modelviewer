@@ -513,33 +513,125 @@ void main() {
                * pow(1.0 - ndotv, 3.0) * ao;
     }
 
-    // ── KHR_materials_clearcoat ──────────────────────────────────────────────
-    // A second, always-dielectric GGX lobe (ior 1.5 → f0 0.04) layered over
-    // everything above. The base is attenuated by the coat's Fresnel so the
-    // layering conserves energy: what the coat reflects, the base doesn't get.
-    // The coat uses the same normal as the base — KHR_materials_clearcoat also
-    // allows a separate clearcoatNormalTexture, which we don't read.
+    // ── KHR_materials_coat (draft) + KHR_materials_clearcoat ─────────────────
+    // A second, dielectric GGX lobe layered over everything above. The base is
+    // attenuated by the coat's Fresnel so the layering conserves energy: what
+    // the coat reflects, the base doesn't get.
+    //
+    // ONE lobe serves both extensions. KHR_materials_coat is a superset that the
+    // spec maps clearcoat onto 1:1 (coatFactor <- clearcoatFactor and so on), so
+    // the loader folds clearcoat into the coat fields and `hasCoat` gates only
+    // the four things coat ADDS: a tunable IOR, a coloured tint, darkening, and
+    // anisotropy. A clearcoat-only asset arrives here with ior 1.5, white tint,
+    // darkening 0 and anisotropy 0, which reduces this block exactly to the
+    // clearcoat lobe that shipped before — verified byte-for-byte, not asserted.
+    //
+    // The coat shades with the BASE normal. Both extensions allow a separate
+    // coat/clearcoat normal texture; neither is read. README, known gaps.
     if (clearcoatFactor > 0.0) {
         // f0 from the coat's IOR rather than the literal 0.04 this used to
         // hardcode. For a clearcoat-only asset coatIor is 1.5 and
         // ((1.5-1)/(1.5+1))^2 is exactly 0.04, so this is an identity there.
-        float coatIor = MAT.p8.x;
+        //
+        // The spec allows coatIor 0 for backwards compatibility. Clamping to 1
+        // maps that to f0 = 0 — a coat that reflects nothing head-on and still
+        // Fresnels toward 1 at grazing — rather than to ((0-1)/(0+1))^2 = 1, a
+        // full mirror, which is certainly not what "no IOR" is asking for.
+        float coatIor = max(MAT.p8.x, 1.0);
         float ccF0 = (coatIor - 1.0) / (coatIor + 1.0);
         ccF0 *= ccF0;
 
+        bool  hasCoat      = MAT.p9.w > 0.5;
+        float coatDarkAmt  = MAT.p8.y;              // 0 for clearcoat-only assets
+        float coatAnisoStr = clamp(MAT.p8.z, 0.0, 1.0);
+        float coatAnisoRot = MAT.p8.w;
+        vec3  coatColor    = MAT.p9.rgb;
+        if (hasCoat) {
+            coatColor *= srgbToLinear(texture(coatColorTex, xfUV(XF_COAT_COLOR, inUV)).rgb);
+            // Per spec: strength rides B; RG is a direction VECTOR biased into
+            // [0,1], whose angle ADDS to the authored rotation. The absent-map
+            // default for this slot is (1, 0.5, 1), not white — see
+            // createSamplerAndDefaults() for why white would be a 45° rotation.
+            vec3 ta = texture(coatAnisotropyTex, xfUV(XF_COAT_ANISOTROPY, inUV)).rgb;
+            coatAnisoStr *= ta.b;
+            coatAnisoRot += atan(ta.g * 2.0 - 1.0, ta.r * 2.0 - 1.0);
+        }
+
         float ca = clearcoatRoughness * clearcoatRoughness;
         float ccF = (ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - ndotv, 0.0, 1.0), 5.0)) * clearcoatFactor;
-
-        float ccD = D_GGX(ndoth, ca);
-        float ccG = G_SchlickSmith(ndotv, ndotl, ca);
         float ccFd = (ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0));
-        float ccSpec = (ccD * ccG) * ccFd / max(4.0 * ndotv * ndotl, 1e-4);
+
+        // Coat anisotropy, direct light only — the same treatment, and the same
+        // D/V pair, the base material's KHR_materials_anisotropy gets above, so
+        // the two layers stretch consistently. Needs a tangent frame; without
+        // one (no UVs) it falls back to the isotropic lobe rather than guessing
+        // a direction. Anisotropic IBL is not attempted here for the reason
+        // documented on the base lobe: bending the reflection across the
+        // analytic sky's hard horizon reads as a seam, not as a stretch.
+        float ccSpec;
+        if (coatAnisoStr > 0.0 && frameValid) {
+            vec2 cdir = vec2(cos(coatAnisoRot), sin(coatAnisoRot));
+            vec3 cT = normalize(frameT * cdir.x + frameB * cdir.y);
+            vec3 cB = normalize(cross(N, cT));
+            float cat = mix(ca, 1.0, coatAnisoStr * coatAnisoStr);
+            float cab = ca;
+            float ccD = D_GGX_anisotropic(ndoth, dot(cT, H), dot(cB, H), cat, cab);
+            float ccV = V_GGX_anisotropic(ndotl, ndotv, dot(cB, V), dot(cT, V),
+                                          dot(cT, L), dot(cB, L), cat, cab);
+            ccSpec = ccD * ccV * ccFd;
+        } else {
+            float ccD = D_GGX(ndoth, ca);
+            float ccG = G_SchlickSmith(ndotv, ndotl, ca);
+            ccSpec = (ccD * ccG) * ccFd / max(4.0 * ndotv * ndotl, 1e-4);
+        }
 
         vec2 ccAb = texture(brdfLUT, vec2(ndotv, clearcoatRoughness)).rg;
         vec3 ccIbl = textureLod(prefilteredMap, reflect(-V, N), clearcoatRoughness * maxLod).rgb
                    * (ccF0 * ccAb.x + ccAb.y);
 
-        color = color * (1.0 - ccF)
+        // What the base sees through the coat: tint, then darkening. Both are
+        // KHR_materials_coat only; for clearcoat this whole term is vec3(1).
+        vec3 baseThroughCoat = vec3(1.0);
+        if (hasCoat) {
+            // Coloured absorption. The authored colour is the tint at NORMAL
+            // incidence and represents light crossing the coat TWICE, so the
+            // view-dependent path length is 1/cos(theta_t) after refraction.
+            // Total internal reflection (sin2T >= 1) cannot happen entering a
+            // denser medium, but the guard costs nothing and keeps the pow()
+            // away from a NaN if coatIor is ever driven below 1.
+            float cosI  = clamp(ndotv, 1e-4, 1.0);
+            float sin2T = (1.0 - cosI * cosI) / max(coatIor * coatIor, 1e-4);
+            vec3 tint = vec3(0.0);
+            if (sin2T < 1.0) {
+                float cosT = sqrt(1.0 - sin2T);
+                tint = pow(max(coatColor, vec3(1e-4)), vec3(1.0 / max(cosT, 1e-4)));
+            }
+            // Darkening: light entering the base scatters back up and is partly
+            // reflected DOWN again by the underside of the coat, and each such
+            // round trip loses energy. Per spec T = (1-R)^2 is the two-way
+            // transmittance, and a rough coat scatters that internal reflection
+            // incoherently — hence the (1 - roughness*0.5) factor on T.
+            //
+            // DEVIATION, deliberate. The spec gives R two forms: for direct
+            // light 0.5*(fresnel(N,V) + fresnel(N,L)), and for IBL
+            // 0.5*(fresnel(N,V) + F_0 + 0.5*F_90). By this point `color` is the
+            // direct and ambient lobes already summed, so there is nothing left
+            // to apply two different R to, and we use the direct-light form for
+            // both. It over-darkens the ambient contribution where N·L is small
+            // — the unlit side of a sphere darkens as if it were lit — because
+            // fresnel(N,L) goes to 1 at the terminator. Splitting the lobes
+            // apart to fix this means carrying `direct` and `ambient` separately
+            // through the sheen and transmission blocks; worth doing if coat
+            // leaves draft, not worth the churn while it can still change.
+            // Flagged upstream with the two default mismatches (see the PR).
+            float fV = ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - ndotv, 0.0, 1.0), 5.0);
+            float fL = ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - ndotl, 0.0, 1.0), 5.0);
+            float R  = 0.5 * (fV + fL);
+            float T  = (1.0 - R) * (1.0 - R) * (1.0 - clearcoatRoughness * 0.5);
+            baseThroughCoat = tint * mix(1.0, T, clamp(coatDarkAmt, 0.0, 1.0) * clearcoatFactor);
+        }
+
+        color = color * (1.0 - ccF) * baseThroughCoat
               + (vec3(ccSpec) * 3.0 * ubo.tone.z * ndotl + ccIbl * ao) * clearcoatFactor;
     }
 
