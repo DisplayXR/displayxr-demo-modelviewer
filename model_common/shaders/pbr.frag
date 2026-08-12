@@ -283,11 +283,22 @@ vec3 evalIridescence(float outsideIor, float filmIor, float cosTheta1,
     return max(I, vec3(0.0));
 }
 
+// This fragment's material row, indexed in place rather than copied.
+//
+// `MatExt me = matExt.materials[i]` loads the WHOLE row into a local — all
+// MV_MAT_VEC4S + 2*MV_TEX_SLOTS vec4s of it, 608 bytes today — and then
+// xfUV(MatExt m, ...) copied that local again, by value, at every one of its
+// call sites. Indexing the buffer in place lets the compiler load only the
+// lanes a fragment actually reads, and keeps a 600-byte-and-growing struct off
+// the stack on MoltenVK.
+int gMat;
+#define MAT matExt.materials[gMat]
+
 // KHR_texture_transform, per the spec's matrix = translation * rotation * scale.
 // Scale first, then rotate, then offset.
-vec2 xfUV(MatExt m, int slot, vec2 uv) {
-    vec4 os = m.uvXf[slot];
-    float r = m.uvRot[slot].x;
+vec2 xfUV(int slot, vec2 uv) {
+    vec4 os = MAT.uvXf[slot];
+    float r = MAT.uvRot[slot].x;
     vec2 p = uv * os.zw;
     if (r != 0.0) {
         float c = cos(r), s = sin(r);
@@ -301,19 +312,19 @@ void main() {
     // display plane. 0 = disabled (opaque path unaffected).
     if (ubo.lightDir.w > 0.0 && inViewZ > ubo.lightDir.w) discard;
 
-    // Fetched FIRST because KHR_texture_transform lives in it and the five core
-    // maps below are sampled before any extension factor is touched.
-    MatExt me = matExt.materials[int(pc.emissive.w + 0.5)];
+    // Set FIRST because KHR_texture_transform lives in the material row and the
+    // five core maps below are sampled before any extension factor is touched.
+    gMat = int(pc.emissive.w + 0.5);
 
-    vec4 baseSample = texture(baseColorTex, xfUV(me, XF_BASE_COLOR, inUV));
+    vec4 baseSample = texture(baseColorTex, xfUV(XF_BASE_COLOR, inUV));
     vec3 albedo = srgbToLinear(baseSample.rgb) * pc.baseColorFactor.rgb;
 
-    vec3 mr = texture(mrTex, xfUV(me, XF_MR, inUV)).rgb;        // g=roughness, b=metallic (linear)
+    vec3 mr = texture(mrTex, xfUV(XF_MR, inUV)).rgb;        // g=roughness, b=metallic (linear)
     float metallic  = clamp(mr.b * pc.mrParams.x, 0.0, 1.0);
     float roughness = clamp(mr.g * pc.mrParams.y, 0.04, 1.0);
     float a = roughness * roughness;
-    float ao = texture(occlusionTex, xfUV(me, XF_OCCLUSION, inUV)).r;
-    vec3 emissive = srgbToLinear(texture(emissiveTex, xfUV(me, XF_EMISSIVE, inUV)).rgb) * pc.emissive.rgb;
+    float ao = texture(occlusionTex, xfUV(XF_OCCLUSION, inUV)).r;
+    vec3 emissive = srgbToLinear(texture(emissiveTex, xfUV(XF_EMISSIVE, inUV)).rgb) * pc.emissive.rgb;
 
     vec3 V = normalize(ubo.cameraPos.xyz - inWorldPos);
     vec3 Ng = normalize(inNormal);
@@ -338,7 +349,7 @@ void main() {
     } else {
         cotangentFrame(Ng, inUV, frameT, frameB, frameValid);
     }
-    vec3 N = perturbNormal(Ng, xfUV(me, XF_NORMAL, inUV), frameT, frameB, frameValid);
+    vec3 N = perturbNormal(Ng, xfUV(XF_NORMAL, inUV), frameT, frameB, frameValid);
 
     vec3 L = normalize(ubo.lightDir.xyz);
     vec3 H = normalize(V + L);
@@ -347,39 +358,39 @@ void main() {
     float ndoth = max(dot(N, H), 0.0);
 
 
-    float ior                = me.p0.x;
-    float specularFactor     = me.p0.y;
-    float clearcoatFactor    = me.p0.z;
-    float clearcoatRoughness = me.p0.w;
-    vec3  specularColor      = me.p1.rgb;
-    float sheenRoughness     = me.p1.w;
-    vec3  sheenColor         = me.p2.rgb;
-    float emissiveStrength   = me.p2.w;
-    float anisoStrength      = clamp(me.p3.x, 0.0, 1.0);
-    float anisoRotation      = me.p3.y;
-    float iridescenceFactor  = clamp(me.p3.z, 0.0, 1.0);
-    float iridescenceIor     = me.p3.w;
-    float iridThickness      = me.p4.y;   // no thickness texture → the maximum
-    float transmissionFactor = clamp(me.p4.z, 0.0, 1.0);
-    float volumeThickness    = me.p4.w;
-    vec3  attenuationColor   = me.p5.rgb;
-    float attenuationDist    = me.p5.w;
+    float ior                = MAT.p0.x;
+    float specularFactor     = MAT.p0.y;
+    float clearcoatFactor    = MAT.p0.z;
+    float clearcoatRoughness = MAT.p0.w;
+    vec3  specularColor      = MAT.p1.rgb;
+    float sheenRoughness     = MAT.p1.w;
+    vec3  sheenColor         = MAT.p2.rgb;
+    float emissiveStrength   = MAT.p2.w;
+    float anisoStrength      = clamp(MAT.p3.x, 0.0, 1.0);
+    float anisoRotation      = MAT.p3.y;
+    float iridescenceFactor  = clamp(MAT.p3.z, 0.0, 1.0);
+    float iridescenceIor     = MAT.p3.w;
+    float iridThickness      = MAT.p4.y;   // no thickness texture → the maximum
+    float transmissionFactor = clamp(MAT.p4.z, 0.0, 1.0);
+    float volumeThickness    = MAT.p4.w;
+    vec3  attenuationColor   = MAT.p5.rgb;
+    float attenuationDist    = MAT.p5.w;
 
     // Fold the texture variants into the factors. sheenColor/specularColor are
     // sRGB-encoded per spec; the rest are linear single channels.
-    clearcoatFactor    *= texture(clearcoatTex, xfUV(me, XF_CLEARCOAT, inUV)).r;
-    clearcoatRoughness  = clamp(clearcoatRoughness * texture(clearcoatRoughTex, xfUV(me, XF_CLEARCOAT_ROUGH, inUV)).g, 0.03, 1.0);
-    sheenColor         *= srgbToLinear(texture(sheenColorTex, xfUV(me, XF_SHEEN_COLOR, inUV)).rgb);
-    sheenRoughness      = clamp(sheenRoughness * texture(sheenRoughTex, xfUV(me, XF_SHEEN_ROUGH, inUV)).a, 0.05, 1.0);
-    specularFactor     *= texture(specularTex, xfUV(me, XF_SPECULAR, inUV)).a;
-    specularColor      *= srgbToLinear(texture(specularColorTex, xfUV(me, XF_SPECULAR_COLOR, inUV)).rgb);
-    transmissionFactor  = clamp(transmissionFactor * texture(transmissionTex, xfUV(me, XF_TRANSMISSION, inUV)).r, 0.0, 1.0);
-    volumeThickness    *= texture(thicknessTex, xfUV(me, XF_THICKNESS, inUV)).g;
+    clearcoatFactor    *= texture(clearcoatTex, xfUV(XF_CLEARCOAT, inUV)).r;
+    clearcoatRoughness  = clamp(clearcoatRoughness * texture(clearcoatRoughTex, xfUV(XF_CLEARCOAT_ROUGH, inUV)).g, 0.03, 1.0);
+    sheenColor         *= srgbToLinear(texture(sheenColorTex, xfUV(XF_SHEEN_COLOR, inUV)).rgb);
+    sheenRoughness      = clamp(sheenRoughness * texture(sheenRoughTex, xfUV(XF_SHEEN_ROUGH, inUV)).a, 0.05, 1.0);
+    specularFactor     *= texture(specularTex, xfUV(XF_SPECULAR, inUV)).a;
+    specularColor      *= srgbToLinear(texture(specularColorTex, xfUV(XF_SPECULAR_COLOR, inUV)).rgb);
+    transmissionFactor  = clamp(transmissionFactor * texture(transmissionTex, xfUV(XF_TRANSMISSION, inUV)).r, 0.0, 1.0);
+    volumeThickness    *= texture(thicknessTex, xfUV(XF_THICKNESS, inUV)).g;
     // KHR_materials_scatter (draft; issue #79). Strength rides the texture's
     // ALPHA channel, the multi-scatter colour its RGB (sRGB-encoded), per spec.
-    float scatterStrength = clamp(me.p6.x * texture(scatterStrengthTex, xfUV(me, XF_SCATTER_STRENGTH, inUV)).a, 0.0, 1.0);
-    float scatterG        = clamp(me.p6.y, -0.99, 0.99);
-    vec3  multiscatterColor = me.p7.rgb * srgbToLinear(texture(multiscatterColorTex, xfUV(me, XF_MULTISCATTER_COLOR, inUV)).rgb);
+    float scatterStrength = clamp(MAT.p6.x * texture(scatterStrengthTex, xfUV(XF_SCATTER_STRENGTH, inUV)).a, 0.0, 1.0);
+    float scatterG        = clamp(MAT.p6.y, -0.99, 0.99);
+    vec3  multiscatterColor = MAT.p7.rgb * srgbToLinear(texture(multiscatterColorTex, xfUV(XF_MULTISCATTER_COLOR, inUV)).rgb);
 
 
     // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────
