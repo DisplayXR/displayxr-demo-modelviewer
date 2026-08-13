@@ -77,12 +77,20 @@ multi-scatter albedo, split by anisotropy into a forward half (the most-blurred
 scene copy, standing in for diffuse transmission) and a backward half (a diffuse
 reflection). How much of the light takes that path is driven by optical depth
 `thickness / attenuationDistance`, so density still matters. Measured against the
-Khronos conformance assets, the anisotropy sweep and the density response both
-track the reference (density sparse→dense: ours +57%, reference +47%). Two known
-gaps: the density response **saturates** past optical depth ~1 where the reference
-keeps grading, and the result is **over-saturated** — real multiple scattering
-desaturates as it redistributes energy between bounces, and one Lambertian bounce
-cannot.
+Khronos conformance assets (`ScatterColorAndDensity`, rasterizer reference), the
+density response rises with density in both, and **ours saturates where the
+reference keeps grading** — sampling the leftmost `multiscatterColorFactor`
+column sparse→dense gives ours 141 → 182 → 181 → 181 against the reference's
+98 → 123 → 141 → 135, i.e. ours is flat after the second step. Read those as a
+direction, not a score: the absolute values are not comparable (the reference is
+lit by an outdoor HDRI, we use the procedural analytic sky) and the percentages
+move with where on the sphere you sample. The second known gap is that the result
+is **over-saturated** — real multiple scattering desaturates as it redistributes
+energy between bounces, and one Lambertian bounce cannot.
+
+These were re-measured after the inverted-normal fix (#87); the figures quoted
+here before that landed were taken with Fresnel pinned at grazing on every
+material and should not be cited.
 
 The obvious suspect for that second gap is the spec's Kulla-Conty multi→single
 scatter albedo remap, which this deliberately does **not** apply to the lobe. It was
