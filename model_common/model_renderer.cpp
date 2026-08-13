@@ -603,7 +603,27 @@ bool ModelRenderer::createPipeline() {
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;       // two-sided shading handles back faces
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    // CLOCKWISE, not COUNTER_CLOCKWISE, because renderEye() rasterises through a
+    // NEGATIVE-HEIGHT viewport (see the vpRect below). Vulkan classifies facing
+    // from the signed area in FRAMEBUFFER space, so the Y flip reverses it: glTF's
+    // counter-clockwise front faces arrive clockwise, and every visible fragment
+    // reports gl_FrontFacing == false. pbr.frag's two-sided flip
+    // (`if (!gl_FrontFacing) Ng = -Ng`) then inverted the normal on ALL of them.
+    //
+    // That is issue #87, and it was not a clearcoat bug: with N inverted,
+    // dot(N,V) was NEGATIVE everywhere (measured -0.983 head-on, where it must be
+    // +1), so `ndotv` sat on its 1e-4 clamp for every pixel of every model. Every
+    // view-dependent term in the shader was therefore evaluated as if seen at
+    // perfect grazing incidence — Fresnel pinned near f90, the split-sum BRDF LUT
+    // and the sheen LUT sampled at their u=0 edge, G_SchlickSmith near zero.
+    // The clearcoat symptom (base multiplied by ~0 at full coat, since ccF
+    // collapses to exactly clearcoatFactor when pow(1-ndotv,5) == 1) was just the
+    // most visible consequence.
+    //
+    // cullMode is NONE, so this changes gl_FrontFacing ONLY — nothing is culled
+    // either way, and genuine back faces still get their normal flipped, which is
+    // what the two-sided path is for.
+    rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
     rs.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};

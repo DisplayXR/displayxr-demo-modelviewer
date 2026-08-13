@@ -158,9 +158,17 @@ def main():
         ("coat_darkening", 3, "darkening darkens, monotonically (small: one-pass T)",
          lambda m: luma(m[6]) < luma(m[0]) - 0.3
                    and monotone([luma(v) for v in m], -1)),
-        ("coat_ior", 4, "higher IOR reflects more, monotonically",
-         lambda m: luma(m[6]) > luma(m[0]) + 0.3
-                   and monotone([luma(v) for v in m], +1)),
+        # A higher coat IOR raises f0, so the coat reflects more and the base
+        # receives less. Whether the sphere brightens or darkens depends on
+        # whether the coat's mirror is brighter than what it covers — over a
+        # bright neutral base under a sky-and-ground environment it DARKENS.
+        # So the claim is monotonicity, not a direction. (The first version of
+        # this check asserted "brighter", which only held while issue #87 had
+        # Fresnel pinned at grazing.)
+        ("coat_ior", 4, "IOR changes the coat/base balance, monotonically",
+         lambda m: abs(luma(m[6]) - luma(m[0])) > 0.3
+                   and (monotone([luma(v) for v in m], +1)
+                        or monotone([luma(v) for v in m], -1))),
         ("coat_aniso", 5, "anisotropy changes the lobe (soft: direct light only)",
          lambda m: abs(luma(m[6]) - luma(m[0])) > 0.2),
     ]

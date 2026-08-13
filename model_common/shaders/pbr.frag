@@ -880,18 +880,13 @@ void main() {
     // one table keeps the layering weight consistent with the lobe actually
     // evaluated, exactly as sheen's energy compensation does.
     //
-    // KNOWN LIMIT, measured: Efz saturates at its 1.0 clamp for fuzz roughness
-    // below about 0.5 (dumped straight out of the table: 1.00 at 0.3, 0.54 at
-    // 1.0). D_Charlie x V_Ashikhmin is not energy-conserving down there and its
-    // directional albedo genuinely integrates above 1. Where it saturates,
-    // `1 - Efz` is zero and the layer transmits NOTHING — a black fuzz nulls the
-    // surface to exactly 0 rather than darkening it. Sheen has always had this
-    // (its energy compensation removes the whole base at those roughnesses) but
-    // hides it, because sheen's colour is its intensity so it always has a lobe
-    // to put back. Fuzz's separate weight is what makes it visible. Fixing it
-    // means renormalising the lobe, which would change every sheen material —
-    // out of scope here, where sheen is required to stay byte-identical. See the
-    // follow-up issue.
+    // An earlier note here claimed Efz saturated at its 1.0 clamp below fuzz
+    // roughness ~0.5, and that a dark fuzz therefore nulled the surface. That was
+    // an artifact of issue #87, not a property of the lobe: `ndotv` was pinned at
+    // its 1e-4 clamp, so every sample landed on the LUT's grazing edge, where a
+    // directional albedo legitimately does approach 1. Re-measured head-on with
+    // #87 fixed, E runs 0.000 at roughness 0.05 to 0.148 at 1.0 — small,
+    // monotonic, and nowhere near the clamp.
     //
     // Skipped under the #75 transmission probe, which asserts on `color` being
     // the raw scene sample; a layer over the top would break that.

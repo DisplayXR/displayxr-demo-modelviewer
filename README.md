@@ -154,17 +154,15 @@ counterparts, so fuzz rides the sheen lanes and slots; only the weight and a
 colour, so fuzz can be *darker* than what it covers. Black soot is the motivating
 case, and it is inexpressible in sheen — a black sheen colour just switches the
 layer off. Measured on `assets/diffuse_fuzz_test.glb`, the same white→black
-colour sweep written both ways: sheen −99.6 luma converging on the bare base,
-fuzz −115.3 continuing past it into soot.
+colour sweep written both ways: sheen −31.0 luma converging on the bare base,
+fuzz −56.9 continuing past it into soot.
 
-**Known limit ([#85](https://github.com/DisplayXR/displayxr-demo-modelviewer/issues/85)).**
-The Charlie/Ashikhmin directional albedo in `sheenLUT` saturates at its 1.0 clamp
-below roughness ~0.5 (measured 1.00 at 0.3, 0.54 at 1.0) — the lobe is not
-energy-conserving there. Both sheen and fuzz use `1 - E` as the fraction of base
-that survives, so where it saturates the base is removed entirely. Sheen hides
-this because its colour is its intensity and it always puts a lobe back; a dark
-fuzz does not, and nulls the surface. Fixing it means renormalising the lobe,
-which moves every sheen material, so it is tracked separately.
+A note that used to sit here claimed the sheen/fuzz directional albedo saturated
+below roughness ~0.5 and that a dark fuzz therefore nulled the surface. **That was
+issue #87, not a lobe problem** — `ndotv` was pinned at its clamp, so every LUT
+sample landed on the grazing edge where a directional albedo legitimately
+approaches 1. Head-on with #87 fixed, E runs 0.000 at roughness 0.05 to 0.148 at
+1.0. Issue #85 was closed as invalid.
 
 **Spec defect:** `fuzzRoughnessFactor` defaults to `0.5` in the README table and
 `0.0` in the schema. We take the schema.
@@ -330,8 +328,7 @@ Measure with `python3 scripts/probe_fuzz_test.py <atlas.png>`. Rows 0 and 2 are
 the same sweep under both extensions and must move in *opposite* directions —
 that divergence is the extension's reason to exist. Row 5 exists to catch
 coupling: diffuse roughness must not touch the specular lobe, and rows 4 and 5
-responding differently (+17.8 vs +5.4) is what shows it does not. Row 3 sweeps
-across the LUT saturation described above, deliberately.
+responding differently is what shows it does not.
 
 `material_grid.glb` is deliberately **not** extended when an extension lands. It
 is the baseline every "does this change the render" measurement is taken
