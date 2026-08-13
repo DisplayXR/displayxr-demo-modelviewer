@@ -698,9 +698,32 @@ void main() {
             float fL = ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - ndotl, 0.0, 1.0), 5.0);
             float roughScale = 1.0 - clearcoatRoughness * 0.5;
             float Rdir = 0.5 * (fV + fL) * roughScale;
-            // F_90 is 1 for a dielectric coat, so the hemisphere average is
-            // ccF0 + 0.5.
-            float Ribl = 0.5 * (fV + ccF0 + 0.5) * roughScale;
+            // The incoming half for IBL is a hemisphere average, and this is
+            // where we deliberately DEPART from the spec's arithmetic.
+            //
+            // The spec computes it as F_0 + 0.5*F_90, describing that as "the
+            // hemisphere-averaged reflectance ... a value halfway between F_0
+            // and F_90". With F_90 = 1 that is 0.54 — but a value halfway
+            // between F_0 and F_90 is NOT a hemisphere average, because it
+            // weights grazing angles as heavily as normal ones. The cosine-
+            // weighted hemispherical average of a Schlick Fresnel is
+            //
+            //     F_0 + (1 - F_0) * integral_0^1 (1-u)^5 * 2u du
+            //   = F_0 + (1 - F_0) * 2*B(2,6)
+            //   = F_0 + (1 - F_0) * 0.0476
+            //
+            // which is 0.086 for a 1.5-IOR coat — 6.3x smaller than 0.54. Taking
+            // the spec literally darkens ambient light by 48% at full weight
+            // against direct light's ~8%, and that gap is what puts a hard dark
+            // band on the unlit side of every coated surface (#90). With the
+            // true average it is 12% against 8%, and the band goes away.
+            //
+            // DXR_MODELVIEWER_COAT_SPEC_HEMI=1 restores the literal formula so
+            // the difference stays measurable rather than becoming folklore.
+            float hemiAvg = (ubo.viewport.w > 0.5)
+                          ? (ccF0 + 0.5)                       // spec, literal
+                          : (ccF0 + (1.0 - ccF0) * 0.047619);  // true cosine-weighted
+            float Ribl = 0.5 * (fV + hemiAvg) * roughScale;
             float Tdir = (1.0 - Rdir) * (1.0 - Rdir);
             float Tibl = (1.0 - Ribl) * (1.0 - Ribl);
             float amt  = clamp(coatDarkAmt, 0.0, 1.0) * clearcoatFactor;

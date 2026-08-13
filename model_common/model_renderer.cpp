@@ -1676,7 +1676,17 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
         return e && *e && *e != '0';
     }();
     ub.viewport[2] = kullaConty ? 1.0f : 0.0f;
-    ub.viewport[3] = 0.0f;
+    // DXR_MODELVIEWER_COAT_SPEC_HEMI=1 restores KHR_materials_coat's LITERAL
+    // hemisphere-averaged reflectance for coat darkening (F_0 + 0.5*F_90), which
+    // we otherwise replace with the true cosine-weighted average. Kept switchable
+    // for the same reason the Kulla-Conty remap above is: the deviation is a
+    // claim about the spec being wrong, and a claim like that should stay
+    // measurable rather than becoming folklore. See pbr.frag (#90).
+    static const bool coatSpecHemi = [] {
+        const char* e = std::getenv("DXR_MODELVIEWER_COAT_SPEC_HEMI");
+        return e && *e && *e != '0';
+    }();
+    ub.viewport[3] = coatSpecHemi ? 1.0f : 0.0f;
 
     void* mapped = nullptr;
     vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(UniformBlock), 0, &mapped);
