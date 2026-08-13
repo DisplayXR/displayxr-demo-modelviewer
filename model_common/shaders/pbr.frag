@@ -542,8 +542,12 @@ void main() {
     vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
     vec3 ambient = (diffuseIBL + specularIBL) * ao;
 
-    vec3 color = direct + ambient;
-
+    // `direct` and `ambient` stay SEPARATE until after the coat block, and are
+    // summed there. The coat's darkening needs them apart: the spec gives its
+    // internal reflectance R in two forms, one using dot(N,L) for direct light
+    // and an L-independent hemisphere average for IBL, and collapsing to a
+    // single `color` first leaves nothing to apply two R to (issue #90).
+    //
     // ── KHR_materials_sheen ──────────────────────────────────────────────────
     // Added on top of the base layer, direct + a cheap ambient term. NOTE: the
     // spec's energy compensation (scaling the base by 1 - max(sheenColor)*E,
@@ -563,14 +567,16 @@ void main() {
         // integral of the very same D_Charlie/V_Ashikhmin pair evaluated below
         // (shared via sheen.glsl), baked into sheenLUT at startup.
         float E = texture(sheenLUT, vec2(ndotv, sheenRoughness)).r;
-        color *= (1.0 - sheenMax * E);
+        // The compensation scales what is underneath — both halves of it.
+        direct  *= (1.0 - sheenMax * E);
+        ambient *= (1.0 - sheenMax * E);
 
         float sheenD = D_Charlie(ndoth, sheenRoughness);
         float sheenV = V_Ashikhmin(ndotl, ndotv);
-        color += sheenColor * sheenD * sheenV * 3.0 * ubo.tone.z * ndotl;
+        direct += sheenColor * sheenD * sheenV * 3.0 * ubo.tone.z * ndotl;
         // Ambient sheen: the irradiance cube stands in for the full integral.
-        color += sheenColor * texture(irradianceMap, N).rgb
-               * pow(1.0 - ndotv, 3.0) * ao;
+        ambient += sheenColor * texture(irradianceMap, N).rgb
+                 * pow(1.0 - ndotv, 3.0) * ao;
     }
 
     // ── KHR_materials_coat (draft) + KHR_materials_clearcoat ─────────────────
@@ -650,8 +656,23 @@ void main() {
                    * (ccF0 * ccAb.x + ccAb.y);
 
         // What the base sees through the coat: tint, then darkening. Both are
-        // KHR_materials_coat only; for clearcoat this whole term is vec3(1).
-        vec3 baseThroughCoat = vec3(1.0);
+        // KHR_materials_coat only; for clearcoat both terms are vec3(1).
+        //
+        // TWO transmittances, because the spec gives R two forms and they are
+        // not interchangeable (issue #90). Verbatim:
+        //
+        //   R_directlight = (fresnel(N, V) + fresnel(N, L)) * 0.5
+        //   R_IBL         = (fresnel(N, V) + F_0 + 0.5 * F_90) * 0.5
+        //
+        // The IBL one is L-INDEPENDENT — "light is coming from all angles", so
+        // the incoming half is the hemisphere average F_0 + 0.5*F_90 rather than
+        // a Fresnel at one direction. Using the direct form for ambient light is
+        // what produced #90: fresnel(N,L) goes to 1 as N·L goes to 0, so the
+        // ambient term was darkened hardest exactly where there is no direct
+        // light to darken — a measured -36.9% at the terminator against -3.2% on
+        // the lit side, i.e. a hard dark band on the shadow side.
+        vec3 baseThroughCoatDirect = vec3(1.0);
+        vec3 baseThroughCoatAmb    = vec3(1.0);
         if (hasCoat) {
             // Coloured absorption. The authored colour is the tint at NORMAL
             // incidence and represents light crossing the coat TWICE, so the
@@ -666,34 +687,36 @@ void main() {
                 float cosT = sqrt(1.0 - sin2T);
                 tint = pow(max(coatColor, vec3(1e-4)), vec3(1.0 / max(cosT, 1e-4)));
             }
-            // Darkening: light entering the base scatters back up and is partly
-            // reflected DOWN again by the underside of the coat, and each such
-            // round trip loses energy. Per spec T = (1-R)^2 is the two-way
-            // transmittance, and a rough coat scatters that internal reflection
-            // incoherently — hence the (1 - roughness*0.5) factor on T.
+            // T = (1-R)^2 is the spec's geometric series over an infinite number
+            // of internal reflections, not merely a two-way pass.
             //
-            // DEVIATION, deliberate. The spec gives R two forms: for direct
-            // light 0.5*(fresnel(N,V) + fresnel(N,L)), and for IBL
-            // 0.5*(fresnel(N,V) + F_0 + 0.5*F_90). By this point `color` is the
-            // direct and ambient lobes already summed, so there is nothing left
-            // to apply two different R to, and we use the direct-light form for
-            // both. It over-darkens the ambient contribution where N·L is small
-            // — the unlit side of a sphere darkens as if it were lit — because
-            // fresnel(N,L) goes to 1 at the terminator. Splitting the lobes
-            // apart to fix this means carrying `direct` and `ambient` separately
-            // through the sheen and transmission blocks; worth doing if coat
-            // leaves draft, not worth the churn while it can still change.
-            // Flagged upstream with the two default mismatches (see the PR).
+            // The roughness modulation scales R, NOT T: "we can approximate this
+            // empirically by scaling the average reflectance, R, by
+            // 1.0 - M_c * 0.5". An earlier revision here applied it to T and
+            // described that as following the spec; it was backwards.
             float fV = ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - ndotv, 0.0, 1.0), 5.0);
             float fL = ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - ndotl, 0.0, 1.0), 5.0);
-            float R  = 0.5 * (fV + fL);
-            float T  = (1.0 - R) * (1.0 - R) * (1.0 - clearcoatRoughness * 0.5);
-            baseThroughCoat = tint * mix(1.0, T, clamp(coatDarkAmt, 0.0, 1.0) * clearcoatFactor);
+            float roughScale = 1.0 - clearcoatRoughness * 0.5;
+            float Rdir = 0.5 * (fV + fL) * roughScale;
+            // F_90 is 1 for a dielectric coat, so the hemisphere average is
+            // ccF0 + 0.5.
+            float Ribl = 0.5 * (fV + ccF0 + 0.5) * roughScale;
+            float Tdir = (1.0 - Rdir) * (1.0 - Rdir);
+            float Tibl = (1.0 - Ribl) * (1.0 - Ribl);
+            float amt  = clamp(coatDarkAmt, 0.0, 1.0) * clearcoatFactor;
+            baseThroughCoatDirect = tint * mix(1.0, Tdir, amt);
+            baseThroughCoatAmb    = tint * mix(1.0, Tibl, amt);
         }
 
-        color = color * (1.0 - ccF) * baseThroughCoat
-              + (vec3(ccSpec) * 3.0 * ubo.tone.z * ndotl + ccIbl * ao) * clearcoatFactor;
+        // The coat's own reflection splits the same way: its GGX highlight is
+        // direct light, its prefiltered-environment term is ambient.
+        direct  = direct  * (1.0 - ccF) * baseThroughCoatDirect
+                + vec3(ccSpec) * 3.0 * ubo.tone.z * ndotl * clearcoatFactor;
+        ambient = ambient * (1.0 - ccF) * baseThroughCoatAmb
+                + ccIbl * ao * clearcoatFactor;
     }
+
+    vec3 color = direct + ambient;
 
     // ── KHR_materials_transmission + KHR_materials_volume ────────────────────
     // Refract through the surface, find where the ray leaves the volume, project
