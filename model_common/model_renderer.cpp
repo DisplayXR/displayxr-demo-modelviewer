@@ -603,27 +603,40 @@ bool ModelRenderer::createPipeline() {
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;       // two-sided shading handles back faces
-    // CLOCKWISE, not COUNTER_CLOCKWISE, because renderEye() rasterises through a
-    // NEGATIVE-HEIGHT viewport (see the vpRect below). Vulkan classifies facing
-    // from the signed area in FRAMEBUFFER space, so the Y flip reverses it: glTF's
-    // counter-clockwise front faces arrive clockwise, and every visible fragment
-    // reports gl_FrontFacing == false. pbr.frag's two-sided flip
-    // (`if (!gl_FrontFacing) Ng = -Ng`) then inverted the normal on ALL of them.
+    // Front-face winding is PER-PLATFORM, and both sides are empirical.
     //
-    // That is issue #87, and it was not a clearcoat bug: with N inverted,
-    // dot(N,V) was NEGATIVE everywhere (measured -0.983 head-on, where it must be
-    // +1), so `ndotv` sat on its 1e-4 clamp for every pixel of every model. Every
-    // view-dependent term in the shader was therefore evaluated as if seen at
-    // perfect grazing incidence — Fresnel pinned near f90, the split-sum BRDF LUT
-    // and the sheen LUT sampled at their u=0 edge, G_SchlickSmith near zero.
-    // The clearcoat symptom (base multiplied by ~0 at full coat, since ccF
-    // collapses to exactly clearcoatFactor when pow(1-ndotv,5) == 1) was just the
-    // most visible consequence.
+    // The #87 analysis (unconditional CLOCKWISE, v0.21.1) held on macOS: under
+    // MoltenVK the negative-height viewport in renderEye reverses facing, every
+    // visible fragment reported gl_FrontFacing == false with CCW, and pbr.frag's
+    // two-sided flip inverted the normal on all of them — dot(N,V) measured
+    // -0.983 head-on where it must be +1, Fresnel pinned near f90, materials
+    // rendered as environment mirrors (blue gold, black clearcoat). CLOCKWISE
+    // fixed it there, verified by probe (dot(N,V) +0.987) and by eye.
+    //
+    // On WINDOWS (native Vulkan, NVIDIA) the SAME change inverted the normals
+    // instead: v0.20.1 and v0.21.0 render sample.glb's materials correctly with
+    // COUNTER_CLOCKWISE, and v0.21.1 — whose only functional change was this
+    // constant — renders every material as a sky mirror. Reproduced 2026-08-13
+    // on one box with the runtime held constant, deterministic captures,
+    // releases bisected: 0.20.1 OK, 0.21.0 OK (pixel-identical), 0.21.1 chrome,
+    // 0.22.0 chrome. Rejected on the panel by David.
+    //
+    // So the effective facing parity of the chain (rig view + GL-style
+    // projection + negative-height viewport) DIFFERS between MoltenVK and
+    // native Vulkan here. Which stack deviates from the VK spec's
+    // framebuffer-space rule — and why — is deliberately left open (#92): this
+    // constant follows the measurement on each platform, not the theory.
+    // Linux/Android ship the native-Vulkan value; on-hardware verification of
+    // those two is part of #92.
     //
     // cullMode is NONE, so this changes gl_FrontFacing ONLY — nothing is culled
-    // either way, and genuine back faces still get their normal flipped, which is
-    // what the two-sided path is for.
-    rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    // either way, and genuine back faces still get their normal flipped, which
+    // is what the two-sided path is for.
+#ifdef __APPLE__
+    rs.frontFace = VK_FRONT_FACE_CLOCKWISE;          // MoltenVK — measured (#87)
+#else
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;  // native VK — measured (#92)
+#endif
     rs.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};

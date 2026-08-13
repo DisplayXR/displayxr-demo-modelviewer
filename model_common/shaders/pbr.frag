@@ -373,9 +373,15 @@ void main() {
     // NONE) using the rasterizer's winding, NOT dot(N,V). The view test wrongly
     // flips large flat *front* faces seen near edge-on, sending their normal to
     // the dark lower hemisphere of the IBL irradiance cube (the dark-torso
-    // artifact on low-poly skinned meshes like Fox). gl_FrontFacing stays
-    // geometric under the renderer's Y-flipped projection, so flip only true
-    // back-faces — visible front faces keep their authored outward normal.
+    // artifact on low-poly skinned meshes like Fox), so do NOT "simplify" this
+    // to a view test — that regression has already been paid for once.
+    //
+    // gl_FrontFacing is geometric ONLY when the pipeline's front-face constant
+    // matches the platform's measured facing parity — which differs between
+    // MoltenVK (clockwise, #87) and native Vulkan (counter-clockwise, #92).
+    // Getting it wrong inverts the normal on every visible fragment and turns
+    // all materials into environment mirrors; see the winding block in
+    // ModelRenderer::createPipeline() before touching either side.
     if (!gl_FrontFacing) Ng = -Ng;
     vec3 frameT, frameB; bool frameValid;
     // An authored TANGENT is continuous across UV seams and well-defined at
