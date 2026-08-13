@@ -120,6 +120,40 @@ def gradient_png():
             + chunk(b"IEND", b""))
 
 
+def ripple_normal_png(w=64, h=64, periods=4, amp=0.60):
+    """A tangent-space normal map: sinusoidal ripples running along +u.
+
+    Needed because coat_test's coat-normal row has to perturb the COAT and
+    nothing else, and the grid's shared gradient ramp cannot serve — decoded as a
+    normal it gives (v,v,v)*2-1, which is degenerate and normalizes 0/0 at the
+    midpoint. This encodes a genuine unit normal per texel, so a wiring error in
+    the coat-normal path shows up as a flat or wrongly-oriented sphere rather
+    than as noise."""
+    import math
+    px = bytearray()
+    for y in range(h):
+        for x in range(w):
+            # slope of sin along u -> normal tilts in the u direction only
+            dzdx = amp * math.cos(2.0 * math.pi * periods * x / w)
+            n = (-dzdx, 0.0, 1.0)
+            L = math.sqrt(n[0] * n[0] + n[2] * n[2])
+            nx, ny, nz = n[0] / L, 0.0, n[2] / L
+            px += bytes((int(round((nx * 0.5 + 0.5) * 255)),
+                         int(round((ny * 0.5 + 0.5) * 255)),
+                         int(round((nz * 0.5 + 0.5) * 255)), 255))
+    raw = b"".join(b"\x00" + bytes(px[y * w * 4:(y + 1) * w * 4]) for y in range(h))
+
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body +
+                struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\x0a"[:8]
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
+
+
 def pbr(base, metallic, roughness):
     return {"baseColorFactor": list(base) + [1.0],
             "metallicFactor": metallic,
@@ -340,6 +374,20 @@ def m_coat_anisotropy(t):
                 "coatAnisotropyStrength": t, "coatAnisotropyRotation": 0.0}}}
 
 
+def m_coat_normal(t):
+    """coatFactor 0 -> 1 with a rippled coatNormalTexture on the COAT only.
+
+    The base is smooth, so any ripple visible in the highlight belongs to the
+    coat's own normal — which is the whole point of the property. At factor 0 the
+    lobe is off and the sphere is smooth; the ripple should appear and strengthen
+    across the row."""
+    return {"pbrMetallicRoughness": pbr(COAT_BASE, 0.0, COAT_ROUGH),
+            "extensions": {"KHR_materials_coat": {
+                "coatFactor": t, "coatRoughnessFactor": 0.10,
+                "coatDarkeningFactor": 0.0,
+                "coatNormalTexture": {"index": 1}}}}
+
+
 COAT_ROWS = [
     ("clearcoat_ref", "CONTROL: KHR_materials_clearcoat, factor 0 → 1", m_coat_clearcoat_ref),
     ("coat_factor",   "coatFactor 0 → 1 (must match row 0)",            m_coat_factor),
@@ -347,6 +395,7 @@ COAT_ROWS = [
     ("coat_darkening", "coatDarkeningFactor 0 → 1, coat 0.5",           m_coat_darkening),
     ("coat_ior",      "coatIor 1.0 → 2.0 (f0 0 → 0.111)",               m_coat_ior),
     ("coat_aniso",    "coatAnisotropyStrength 0 → 1, coatRough 0.15",   m_coat_anisotropy),
+    ("coat_normal",   "coatNormalTexture ripple, coatFactor 0 → 1",     m_coat_normal),
 ]
 
 COAT_EXTENSIONS_USED = ["KHR_materials_clearcoat", "KHR_materials_coat"]
@@ -452,7 +501,8 @@ EXTENSIONS_USED = [
 ]
 
 
-def build_glb(row_specs=None, textured=None, extensions=None, scene_name="material_grid"):
+def build_glb(row_specs=None, textured=None, extensions=None, scene_name="material_grid",
+              extra_png=None):
     """Build a sweep grid: one row per (name, doc, make) spec, STEPS columns wide.
 
     Parameterised so a second sweep can be emitted without cloning the builder —
@@ -475,6 +525,13 @@ def build_glb(row_specs=None, textured=None, extensions=None, scene_name="materi
     png = gradient_png()
     png_pad = b"\x00" * ((4 - len(png) % 4) % 4)
     blob = pos_b + nrm_b + uv_b + tan_b + idx_b + png + png_pad
+    # A SECOND image, only when a caller asks for one (coat_test's coat-normal
+    # map). Appended after the existing padding so every byte before it — and
+    # therefore material_grid.glb in its entirety — is untouched.
+    extra_pad = b""
+    if extra_png is not None:
+        extra_pad = b"\x00" * ((4 - len(extra_png) % 4) % 4)
+        blob = blob + extra_png + extra_pad
 
     pmin = [min(p[k] for p in pos) for k in range(3)]
     pmax = [max(p[k] for p in pos) for k in range(3)]
@@ -488,6 +545,11 @@ def build_glb(row_specs=None, textured=None, extensions=None, scene_name="materi
 
     png_view = len(views)
     views.append({"buffer": 0, "byteOffset": off, "byteLength": len(png)})
+    extra_view = None
+    if extra_png is not None:
+        extra_off = off + len(png) + len(png_pad)
+        extra_view = len(views)
+        views.append({"buffer": 0, "byteOffset": extra_off, "byteLength": len(extra_png)})
 
     accessors = [
         {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3",
@@ -546,10 +608,13 @@ def build_glb(row_specs=None, textured=None, extensions=None, scene_name="materi
         "accessors": accessors,
         "bufferViews": views,
         "buffers": [{"byteLength": len(blob)}],
-        "images": [{"bufferView": png_view, "mimeType": "image/png"}],
+        "images": ([{"bufferView": png_view, "mimeType": "image/png"}]
+                   + ([{"bufferView": extra_view, "mimeType": "image/png"}]
+                      if extra_view is not None else [])),
         "samplers": [{"magFilter": 9729, "minFilter": 9729,
                       "wrapS": 33071, "wrapT": 33071}],
-        "textures": [{"source": 0, "sampler": 0}],
+        "textures": ([{"source": 0, "sampler": 0}]
+                     + ([{"source": 1, "sampler": 0}] if extra_view is not None else [])),
     }
 
     json_b = json.dumps(gltf, separators=(",", ":")).encode()
@@ -748,7 +813,7 @@ def main():
     cdest = dest.parent / "coat_test.glb"
     cglb, cnmat, crows, ccols, clayout = build_glb(
         row_specs=COAT_ROWS, textured=[], extensions=COAT_EXTENSIONS_USED,
-        scene_name="coat_test")
+        scene_name="coat_test", extra_png=ripple_normal_png())
     cdest.write_bytes(cglb)
     print(f"wrote {cdest} ({len(cglb):,} bytes)")
     print(f"{crows} families x {ccols} steps = {cnmat} materials (KHR_materials_coat, #81):")

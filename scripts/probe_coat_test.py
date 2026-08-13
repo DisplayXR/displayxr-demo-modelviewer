@@ -11,6 +11,7 @@ Issue #81. Six rows, seven spheres each, all over the same rough red base:
     3  coat_darkening   coatDarkeningFactor 0 -> 1
     4  coat_ior         coatIor 1.0 -> 2.0
     5  coat_aniso       coatAnisotropyStrength 0 -> 1
+    6  coat_normal      coatNormalTexture ripple, coatFactor 0 -> 1
 
 WHAT THIS DOES AND DOES NOT ESTABLISH.
 
@@ -70,7 +71,7 @@ except ImportError:
     raise SystemExit("numpy + Pillow required: python3 -m pip install numpy pillow")
 
 ROWS = ["clearcoat_ref", "coat_factor", "coat_color",
-        "coat_darkening", "coat_ior", "coat_aniso"]
+        "coat_darkening", "coat_ior", "coat_aniso", "coat_normal"]
 
 
 def main():
@@ -172,6 +173,53 @@ def main():
         ("coat_aniso", 5, "anisotropy changes the lobe (soft: direct light only)",
          lambda m: abs(luma(m[6]) - luma(m[0])) > 0.2),
     ]
+    # The coat-normal row is judged on CONTRAST, not mean luma: a normal map
+    # redistributes light across the sphere without changing how much of it there
+    # is, so a mean would sit still while the ripple came in. std/mean over the
+    # sphere is what actually moves.
+    def contrast(r):
+        # An INTERIOR disc, not the foreground mask used everywhere else in this
+        # file. The mask reaches the silhouette, whose own shading gradient is
+        # several times larger than the ripple and drowns it (measured 0.164
+        # baseline against 0.062 for the interior). The ripple lives on the part
+        # of the sphere facing the viewer, so that is where to look.
+        ry0, ry1 = rws[r]
+        cy = 0.5 * (ry0 + ry1)
+        yy2, xx2 = np.mgrid[0:rgb.shape[0], 0:rgb.shape[1]]
+        out = []
+        for c in range(7):
+            cx0, cx1 = cols[c]
+            cx = 0.5 * (cx0 + cx1)
+            # Sized from the ROW BAND (the sphere's diameter), not the detected
+            # column run, and kept well inside it. Measured across radii, the
+            # ripple's contrast ratio is 2.6x at 0.45 of the diameter and falls
+            # to 1.4x at 0.90 as the sphere's own shading gradient dilutes it —
+            # so a tight disc is the sensitive instrument here, the opposite of
+            # the whole-sphere rule that governs the mean-luma checks above.
+            rad = 0.45 * (ry1 - ry0) / 2.0
+            m = ((xx2 - cx) ** 2 + (yy2 - cy) ** 2) < rad * rad
+            px = rgb[m]
+            if px.size == 0:
+                out.append(0.0); continue
+            l = luma(px.T)
+            out.append(float(np.std(l) / max(np.mean(l), 1e-6)))
+        return out
+
+    if len(ROWS) > 6:
+        cn = contrast(6)
+        # MONOTONICITY, not a ratio. The ripple's contrast ratio is strongly
+        # dependent on where you sample — measured 2.6x over a disc at 0.45 of
+        # the sphere's diameter, falling to 1.4x at 0.90 as the sphere's own
+        # shading gradient dilutes it — so any threshold on the magnitude is
+        # really a threshold on the sampling. What the feature actually predicts
+        # is that contrast rises with coatFactor, and rising across all seven
+        # columns is a strong statement even when each step is small.
+        good = monotone(cn, +1, slack=0.0005) and cn[6] > cn[0]
+        print("\ncoat normal map (contrast std/mean, ripple comes in with coatFactor):")
+        print("  " + " ".join(f"{v:6.3f}" for v in cn))
+        print(f"  {'OK  ' if good else 'FAIL'}  monotone rise {cn[0]:.3f} -> {cn[6]:.3f}")
+        ok = ok and good
+
     print("\nresponse directions:")
     for name, r, what, pred in checks:
         good = pred(means[r])

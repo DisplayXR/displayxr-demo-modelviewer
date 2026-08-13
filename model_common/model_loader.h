@@ -56,7 +56,7 @@ enum ModelTexSlot {
     MTS_SPECULAR, MTS_SPECULAR_COLOR, MTS_TRANSMISSION, MTS_THICKNESS,
     MTS_SCATTER_STRENGTH, MTS_MULTISCATTER_COLOR,
     MTS_COAT_COLOR, MTS_COAT_ANISOTROPY,
-    MTS_DIFFUSE_ROUGHNESS, MTS_FUZZ,
+    MTS_DIFFUSE_ROUGHNESS, MTS_FUZZ, MTS_COAT_NORMAL,
     MTS_COUNT
 };
 
@@ -182,6 +182,7 @@ struct ModelMaterial {
     int coatAnisotropyTex = -1;      // B = strength, RG = rotation vector
     int diffuseRoughnessTex = -1;    // R (KHR_materials_diffuse_roughness)
     int fuzzTex = -1;                // R (KHR_materials_fuzz)
+    int coatNormalTex = -1;          // tangent-space normal for the coat layer
 
     // Per-slot UV transforms, indexed by ModelTexSlot. Identity by default, so a
     // texture without the extension samples exactly as it did before.

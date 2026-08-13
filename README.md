@@ -63,7 +63,7 @@ difference.
 | `KHR_materials_iridescence` | ✅ factors — full thin-film model, no thickness texture |
 | `KHR_materials_transmission` | ✅ factor **+ `transmissionTexture`** (R) — refracts the rendered scene, roughness-blurred |
 | `KHR_materials_volume` | ✅ factors **+ `thicknessTexture`** (G) — thickness-driven refraction + Beer-Lambert attenuation |
-| `KHR_materials_coat` *(draft)* | ✅ factors **+ textures** (`coatTexture` R, `coatRoughnessTexture` G, `coatColorTexture` RGB, `coatAnisotropyTexture` B/RG) — coloured tint, darkening, anisotropy, tunable IOR. No `coatNormalTexture`; darkening uses one R form, see below |
+| `KHR_materials_coat` *(draft)* | ✅ factors **+ textures** (`coatTexture` R, `coatRoughnessTexture` G, `coatColorTexture` RGB, `coatAnisotropyTexture` B/RG, `coatNormalTexture`) — coloured tint, darkening, anisotropy, tunable IOR, and a coat-only shading normal. Every property in the spec's table is implemented |
 | `KHR_materials_diffuse_roughness` *(draft)* | ⚠️ factor **+ `diffuseRoughnessTexture`** (R) — Fujii energy-preserving Oren-Nayar for direct light; IBL uses the spec's normal-bend approximation |
 | `KHR_materials_fuzz` *(draft)* | ⚠️ factors **+ textures** (`fuzzTexture` R, `fuzzColorTexture` RGB, `fuzzRoughnessTexture` A) — replaces sheen, layered above the coat, weight separate from colour. Limited by the sheen LUT, see below |
 | `KHR_materials_scatter` *(draft)* | ⚠️ factors **+ `scatterStrengthTexture`** (A) **+ `multiscatterColorTexture`** (RGB) — subsurface/multiple scattering. Volumetric mode is approximated with the spec-sanctioned thin-walled model; see the limits below |
@@ -124,11 +124,13 @@ all raised upstream:
   `coatColor × coatDarkening` to the base *outside* the weighted mix, so a
   material with `coatFactor: 0` would still be tinted and darkened by a coat
   that is not there. We scale by the weight instead.
-- **One Fresnel form for darkening.** The spec gives separate R for direct light
-  and for IBL; by the time the coat lobe runs, the two lobes are already summed
-  into one colour, so the direct-light form is applied to both. It over-darkens
-  the ambient term near the terminator. Splitting the lobes is deferred while
-  coat is draft.
+- **The spec's hemisphere average is 6.3x too high.** It computes the
+  hemisphere-averaged reflectance for darkening as `F_0 + 0.5*F_90` = 0.54,
+  describing it as "halfway between F_0 and F_90" — but that is not a hemisphere
+  average, which for a Schlick Fresnel is `F_0 + (1-F_0)*0.0476` = 0.086. Taken
+  literally it darkens ambient light 48% against direct light's 8%, putting a
+  hard dark band on the unlit side of every coated surface. We use the true
+  average; `DXR_MODELVIEWER_COAT_SPEC_HEMI=1` restores the literal formula.
 
 **Diffuse roughness is a separate roughness.** The diffuse substrate gets a
 microfacet model instead of pure Lambert, so a rough diffuse surface
@@ -172,7 +174,7 @@ roughness, specular,
 transmission and volume — each samples the channel its extension specifies and
 multiplies the corresponding factor. Absent maps bind to 1×1 white, the
 multiplicative identity, so a factors-only material behaves exactly as before.
-Still **not** read: `clearcoatNormalTexture` / `coatNormalTexture`, `anisotropyTexture`,
+Still **not** read: `clearcoatNormalTexture` (coat's equivalent IS read), `anisotropyTexture`,
 `iridescenceTexture` and `iridescenceThicknessTexture`. Those are partial
 implementations rather than missing ones, so they do **not** trip the
 ignored-extension warning — this table is the reference.
@@ -302,6 +304,7 @@ stands in. Every row shares one light neutral base; row 0 is plain
 | 3 | `coatDarkeningFactor` 0 → 1, coat 0.5 |
 | 4 | `coatIor` 1.0 → 2.0 (f0 0 → 0.111) |
 | 5 | `coatAnisotropyStrength` 0 → 1 |
+| 6 | `coatNormalTexture` ripple, `coatFactor` 0 → 1 |
 
 Measure with `python3 scripts/probe_coat_test.py <atlas.png>`. Rows 2 and 3 run
 at coat 0.5 on purpose: at full coat the base is almost entirely displaced by

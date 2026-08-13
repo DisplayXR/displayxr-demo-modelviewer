@@ -90,6 +90,7 @@ layout(set = 1, binding = 15) uniform sampler2D coatColorTex;        // RGB, sRG
 layout(set = 1, binding = 16) uniform sampler2D coatAnisotropyTex;   // B = strength, RG = rotation
 layout(set = 1, binding = 17) uniform sampler2D diffuseRoughTex;     // R
 layout(set = 1, binding = 18) uniform sampler2D fuzzTex;             // R
+layout(set = 1, binding = 19) uniform sampler2D coatNormalTex;       // tangent-space normal
 
 // KHR_texture_transform. Slot indices match the set-1 binding order above, which
 // ModelTexSlot / MaterialTexSlot also mirror (there is a static_assert on that).
@@ -98,7 +99,7 @@ const int XF_BASE_COLOR = 0, XF_MR = 1, XF_NORMAL = 2, XF_OCCLUSION = 3, XF_EMIS
           XF_SPECULAR = 9, XF_SPECULAR_COLOR = 10, XF_TRANSMISSION = 11, XF_THICKNESS = 12,
           XF_SCATTER_STRENGTH = 13, XF_MULTISCATTER_COLOR = 14,
           XF_COAT_COLOR = 15, XF_COAT_ANISOTROPY = 16,
-          XF_DIFFUSE_ROUGHNESS = 17, XF_FUZZ = 18;
+          XF_DIFFUSE_ROUGHNESS = 17, XF_FUZZ = 18, XF_COAT_NORMAL = 19;
 
 // Set 2: image-based lighting (generated from the analytic sky).
 layout(set = 2, binding = 0) uniform samplerCube irradianceMap;   // diffuse
@@ -214,10 +215,15 @@ void cotangentFrame(vec3 N, vec2 uv, out vec3 T, out vec3 B, out bool valid) {
     B *= invmax;
 }
 
-vec3 perturbNormal(vec3 N, vec2 uv, vec3 T, vec3 B, bool valid) {
+// Apply an already-sampled tangent-space normal. Split out from perturbNormal so
+// the coat layer can use its own map (KHR_materials_coat's coatNormalTexture)
+// through exactly the same frame and decode.
+vec3 applyNormalMap(vec3 N, vec3 mapN, vec3 T, vec3 B, bool valid) {
     if (!valid) return N;   // a flat normal map is identity here anyway
-    vec3 mapN = texture(normalTex, uv).xyz * 2.0 - 1.0;
     return normalize(mat3(T, B, N) * mapN);
+}
+vec3 perturbNormal(vec3 N, vec2 uv, vec3 T, vec3 B, bool valid) {
+    return applyNormalMap(N, texture(normalTex, uv).xyz * 2.0 - 1.0, T, B, valid);
 }
 
 // ── KHR_materials_anisotropy ────────────────────────────────────────────────
@@ -623,6 +629,31 @@ void main() {
             coatAnisoRot += atan(ta.g * 2.0 - 1.0, ta.r * 2.0 - 1.0);
         }
 
+        // KHR_materials_coat's coatNormalTexture — the coat gets its OWN shading
+        // normal, so a smooth varnish over a bumpy base stays smooth.
+        //
+        // Perturbed from the GEOMETRIC normal, not the base's shaded one: the
+        // coat is a layer on the surface, not a modification of the base's
+        // microsurface, so it should not inherit the base's bumps. Absent map =
+        // flat = Ng.
+        //
+        // Gated on hasCoat, which keeps every KHR_materials_clearcoat asset on
+        // the base normal exactly as before — that extension has a
+        // clearcoatNormalTexture too and this lobe never read it, so switching
+        // those assets to Ng here would be an unrelated behavioural change
+        // smuggled in on a coat commit.
+        vec3 Nc = N;
+        if (hasCoat) {
+            Nc = applyNormalMap(Ng, texture(coatNormalTex, xfUV(XF_COAT_NORMAL, inUV)).xyz * 2.0 - 1.0,
+                                frameT, frameB, frameValid);
+        }
+        // Every coat-lobe dot product is against Nc. Shadowing the outer names
+        // inside this block is deliberate: it makes it a compile error to reach
+        // for the base normal's dots by accident anywhere below.
+        float ndotv = max(dot(Nc, V), 1e-4);
+        float ndotl = max(dot(Nc, L), 0.0);
+        float ndoth = max(dot(Nc, H), 0.0);
+
         float ca = clearcoatRoughness * clearcoatRoughness;
         float ccF = (ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - ndotv, 0.0, 1.0), 5.0)) * clearcoatFactor;
         float ccFd = (ccF0 + (1.0 - ccF0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0));
@@ -638,7 +669,7 @@ void main() {
         if (coatAnisoStr > 0.0 && frameValid) {
             vec2 cdir = vec2(cos(coatAnisoRot), sin(coatAnisoRot));
             vec3 cT = normalize(frameT * cdir.x + frameB * cdir.y);
-            vec3 cB = normalize(cross(N, cT));
+            vec3 cB = normalize(cross(Nc, cT));
             float cat = mix(ca, 1.0, coatAnisoStr * coatAnisoStr);
             float cab = ca;
             float ccD = D_GGX_anisotropic(ndoth, dot(cT, H), dot(cB, H), cat, cab);
@@ -652,7 +683,7 @@ void main() {
         }
 
         vec2 ccAb = texture(brdfLUT, vec2(ndotv, clearcoatRoughness)).rg;
-        vec3 ccIbl = textureLod(prefilteredMap, reflect(-V, N), clearcoatRoughness * maxLod).rgb
+        vec3 ccIbl = textureLod(prefilteredMap, reflect(-V, Nc), clearcoatRoughness * maxLod).rgb
                    * (ccF0 * ccAb.x + ccAb.y);
 
         // What the base sees through the coat: tint, then darkening. Both are

@@ -1524,6 +1524,7 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
             viewOr(m.coatAnisotropyTex,     coatAnisoDefaultTex_.view),
             viewOr(m.diffuseRoughnessTex,   whiteTex_.view),
             viewOr(m.fuzzTex,               whiteTex_.view),
+            viewOr(m.coatNormalTex,         flatNormalTex_.view),
         };
         materialSets_.push_back(makeMaterialSet(v));
     }
@@ -1531,6 +1532,7 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     for (uint32_t i = 0; i < MTEX_COUNT; ++i) dflt[i] = whiteTex_.view;
     dflt[MTEX_NORMAL] = flatNormalTex_.view;
     dflt[MTEX_COAT_ANISOTROPY] = coatAnisoDefaultTex_.view;
+    dflt[MTEX_COAT_NORMAL] = flatNormalTex_.view;
     defaultMatSet_ = makeMaterialSet(dflt);
 
     modelLoaded_ = true;

@@ -169,8 +169,8 @@ void parseMaterialExtensions(const tinygltf::Material& mat, ModelMaterial& mm,
         readTexSlot(*v, "coatColorTexture", mm, MTS_COAT_COLOR, mm.coatColorTex, resolveTex);
         readTexSlot(*v, "coatAnisotropyTexture", mm, MTS_COAT_ANISOTROPY,
                     mm.coatAnisotropyTex, resolveTex);
-        // coatNormalTexture is not read, matching the clearcoat lobe this shares
-        // — the coat shades with the base normal. Listed in the README's gaps.
+        readTexSlot(*v, "coatNormalTexture", mm, MTS_COAT_NORMAL,
+                    mm.coatNormalTex, resolveTex);
     }
     if (const tinygltf::Value* v = ext("KHR_materials_sheen")) {
         extVec3(*v, "sheenColorFactor", mm.sheenColorFactor);
