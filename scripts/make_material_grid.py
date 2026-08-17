@@ -502,7 +502,7 @@ EXTENSIONS_USED = [
 
 
 def build_glb(row_specs=None, textured=None, extensions=None, scene_name="material_grid",
-              extra_png=None):
+              extra_png=None, cols=None, generator=None):
     """Build a sweep grid: one row per (name, doc, make) spec, STEPS columns wide.
 
     Parameterised so a second sweep can be emitted without cloning the builder —
@@ -514,6 +514,14 @@ def build_glb(row_specs=None, textured=None, extensions=None, scene_name="materi
     row_specs = ROWS if row_specs is None else row_specs
     textured = TEXTURED if textured is None else textured
     extensions = EXTENSIONS_USED if extensions is None else extensions
+    # Column count is per-asset. It defaults to STEPS so material_grid.glb —
+    # the frozen regression baseline — is still emitted byte-for-byte.
+    cols = STEPS if cols is None else cols
+    # asset.generator names whichever script actually emitted the file; the
+    # Khronos conformance assets are built by a different one.
+    generator = ("DisplayXR model-viewer material grid "
+                 "(scripts/make_material_grid.py, issue #70)"
+                 if generator is None else generator)
     pos, nrm, uv, tan, idx = uv_sphere(RADIUS, LON, LAT)
 
     pos_b = b"".join(struct.pack("<3f", *p) for p in pos)
@@ -562,7 +570,6 @@ def build_glb(row_specs=None, textured=None, extensions=None, scene_name="materi
 
     materials, meshes, nodes, layout = [], [], [], []
     rows = len(row_specs) + (1 if textured else 0)
-    cols = STEPS
     for r, (name, doc, make) in enumerate(row_specs):
         for c in range(cols):
             t = c / (cols - 1)
@@ -597,8 +604,7 @@ def build_glb(row_specs=None, textured=None, extensions=None, scene_name="materi
 
     gltf = {
         "asset": {"version": "2.0",
-                  "generator": "DisplayXR model-viewer material grid "
-                               "(scripts/make_material_grid.py, issue #70)"},
+                  "generator": generator},
         "extensionsUsed": extensions,
         "scene": 0,
         "scenes": [{"name": scene_name, "nodes": list(range(len(nodes)))}],

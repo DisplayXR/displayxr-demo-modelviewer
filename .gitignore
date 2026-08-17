@@ -19,3 +19,7 @@ android/.cxx/
 # Python bytecode caches (compiled artifacts; go stale against .py edits)
 __pycache__/
 *.py[cod]
+
+# Khronos sample-asset submission staging (generated; regenerate with
+# scripts/make_khronos_conformance_assets.py)
+khronos_submission/
