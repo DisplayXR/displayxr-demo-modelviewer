@@ -52,7 +52,7 @@ from make_material_grid import (           # noqa: E402
     m_coat_clearcoat_ref, m_coat_factor, m_coat_color, m_coat_darkening,
     m_coat_ior, m_coat_anisotropy, m_coat_normal,
     m_sheen_ref, m_fuzz_factor, m_fuzz_black, m_fuzz_rough,
-    m_diffuse_rough, m_diffuse_rough_spec,
+    pbr,
 )
 
 # Eight, not seven, so the paired control row divides evenly into four pairs.
@@ -101,9 +101,69 @@ FUZZ_ROWS_UPSTREAM = [
     ("fuzz_rough",  "fuzzRoughnessFactor 0.05 -> 1",                                   m_fuzz_rough),
 ]
 
+
+# ---- KHR_materials_diffuse_roughness ---------------------------------------
+# The in-tree rows sweep a light neutral (DIFF_BASE) and read almost flat. Two
+# reasons, both fixed here rather than upstream, because the in-tree asset is a
+# frozen baseline.
+#
+# 1. A near-white base under a bright sky sits at the top of the range, so a
+#    real radiometric change has nowhere to go perceptually. This uses a
+#    mid-tone clay instead. NOT a dark one: the Oren-Nayar interreflection term
+#    scales with albedo, so going dark would cut the very signal being shown.
+# 2. A gradient across eight spheres is the wrong way to present an effect this
+#    small. Row 0 pairs "extension absent" against "roughness 1.0" as touching
+#    neighbours, so the whole delta lands in one A/B comparison instead of being
+#    spread thin. Same device as the coat asset's mapping control.
+DIFF_UPSTREAM_BASE = (0.45, 0.28, 0.21)
+
+# Four albedos rather than four copies of one: the effect scales with albedo, so
+# the row shows that dependence instead of repeating itself four times.
+DIFF_PAIR_ALBEDOS = [
+    (0.12, 0.10, 0.09),
+    (0.28, 0.20, 0.16),
+    (0.45, 0.28, 0.21),
+    (0.72, 0.60, 0.52),
+]
+
+
+def diffuse_albedo_control(t):
+    """CONTROL: extension ABSENT vs roughness 1.0, adjacent, at four albedos.
+
+    Even columns carry no extension at all, so they are plain glTF 2.0 Lambertian
+    diffuse; odd columns are the same material with diffuseRoughnessFactor at 1.0.
+    A pair shares a row, so it shares a height and an environment, and the only
+    difference between the two spheres is the extension itself.
+    """
+    c = int(round(t * (COLS - 1)))
+    albedo = DIFF_PAIR_ALBEDOS[c // 2]
+    mat = {"pbrMetallicRoughness": pbr(albedo, 0.0, 0.95)}
+    if c % 2 == 1:
+        mat["extensions"] = {"KHR_materials_diffuse_roughness": {
+            "diffuseRoughnessFactor": 1.0}}
+    return mat
+
+
+def diffuse_matte(t):
+    """diffuseRoughnessFactor 0 -> 1 on a matte mid-tone base."""
+    return {"pbrMetallicRoughness": pbr(DIFF_UPSTREAM_BASE, 0.0, 0.95),
+            "extensions": {"KHR_materials_diffuse_roughness": {
+                "diffuseRoughnessFactor": t}}}
+
+
+def diffuse_gloss(t):
+    """The same sweep on a SEMI-GLOSS base. diffuse_roughness must not touch the
+    specular lobe -- if this row tracked row 1 exactly, the two roughnesses would
+    be coupled, which is the one thing the extension exists to separate."""
+    return {"pbrMetallicRoughness": pbr(DIFF_UPSTREAM_BASE, 0.0, 0.35),
+            "extensions": {"KHR_materials_diffuse_roughness": {
+                "diffuseRoughnessFactor": t}}}
+
+
 DIFFUSE_ROWS_UPSTREAM = [
-    ("diffuse_rough_matte", "diffuseRoughnessFactor 0 -> 1, matte base", m_diffuse_rough),
-    ("diffuse_rough_gloss", "diffuseRoughnessFactor 0 -> 1, gloss base", m_diffuse_rough_spec),
+    ("albedo_control", "CONTROL: absent|roughness 1.0 pairs at four albedos", diffuse_albedo_control),
+    ("diffuse_matte",  "diffuseRoughnessFactor 0 -> 1, matte base",           diffuse_matte),
+    ("diffuse_gloss",  "diffuseRoughnessFactor 0 -> 1, semi-gloss base",      diffuse_gloss),
 ]
 
 
@@ -209,51 +269,90 @@ so it renders identically either way and does not depend on the resolution.
 """
 
 DIFFUSE_DESC = """\
-A parameter sweep for `KHR_materials_diffuse_roughness`. Two rows of eight
-spheres sweeping `diffuseRoughnessFactor` from 0 to 1.
+A parameter sweep for `KHR_materials_diffuse_roughness`. Three rows of eight
+spheres over a mid-tone clay base.
 
-The extension changes how the diffuse lobe falls off with view angle, replacing
-glTF's purely Lambertian diffuse response. That is a subtle effect and it is easy
-to bury, so the two rows differ only in what surrounds it:
+The extension replaces glTF's purely Lambertian diffuse with a view-dependent
+one, flattening the falloff and lifting the terminator. It is a genuinely small
+effect, and this asset is built around that fact rather than in spite of it.
 
-| Row | Base |
+## Row 0 is the control, and it is how to read this asset
+
+A gradient across eight spheres is the wrong way to present a change of a few
+levels -- nobody can see it. So row 0 places the two endpoints **side by side**:
+**even columns carry no extension at all** (plain glTF 2.0 Lambertian diffuse),
+and **odd columns are the same material with `diffuseRoughnessFactor` at 1.0**.
+Each pair shares a row, so it shares a height and an environment, and the only
+difference within a pair is the extension itself.
+
+The four pairs use four different base albedos rather than four copies of one,
+and deliberately do NOT assert a trend across them. Whether the effect scales
+with albedo is exactly what distinguishes implementations: the full Oren-Nayar
+model and EON carry an interreflection term that grows with albedo, while
+normalised "qualitative" variants largely do not. So the row is a discriminator
+rather than a target -- what a conforming implementation must show is a visible
+difference *inside* each pair, at every albedo.
+
+This also gives the cheapest conformance check in the asset, and the first one to
+run: at `diffuseRoughnessFactor` 0 the material must be **indistinguishable**
+from an even column. If it is not, the parameter is being applied where it
+should not be.
+
+## Rows
+
+| Row | Content |
 |---|---|
-| 0 | Matte neutral - the diffuse response in isolation |
-| 1 | Glossier base - the same sweep with a specular highlight competing |
+| 0 | control pairs: extension absent, then `diffuseRoughnessFactor` 1.0, at four albedos |
+| 1 | matte base, `diffuseRoughnessFactor` 0 to 1 |
+| 2 | semi-gloss base, `diffuseRoughnessFactor` 0 to 1 |
 
-Row 0 is the one to measure. Row 1 exists because the realistic authoring case has
-a specular lobe present, and an implementation that applies diffuse roughness to
-the wrong term tends to look plausible on row 0 and wrong on row 1.
-
-At `diffuseRoughnessFactor` 0 the material must be indistinguishable from a base
-glTF 2.0 material with the extension absent. That is the cheapest conformance
-check in the asset and the first one to run.
+Row 2 exists because the realistic authoring case has a specular lobe present.
+`diffuse_roughness` must not touch the specular lobe -- if row 2 tracked row 1
+exactly, the two roughnesses would be coupled, which is the one thing this
+extension exists to separate. An implementation that applies the parameter to
+the wrong term tends to look plausible on row 1 and wrong on row 2.
 
 ## Expect a small effect, and check it by measurement
 
-This is the least visually dramatic of the three assets, and that is a property
-of the model rather than of the asset. Measured on our own implementation, as
-mean luma (Rec. 709, 0-255) of a patch at each sphere's centre, sweeping
-`diffuseRoughnessFactor` from 0 to 1 across the row:
+Measured on our own implementation, as mean luma (Rec. 709, 0-255) of a patch at
+each sphere's centre:
 
-| Row | leftmost | rightmost | change |
+| Row 0 pair (base albedo) | extension absent | roughness 1.0 | delta |
 |---|---|---|---|
-| 0, matte base | 175.1 | 183.5 | **+8.4** |
-| 1, glossy base | 214.7 | 212.9 | -1.8 |
+| 0.12 | 79.1 | 85.6 | **+6.4** |
+| 0.28 | 109.0 | 113.7 | **+4.7** |
+| 0.45 | 127.8 | 131.1 | **+3.2** |
+| 0.72 | 173.4 | 178.5 | **+5.1** |
 
-The numbers are specific to our environment and tone curve, so do not match them
-directly. What should reproduce is the **shape**: row 0 brightens monotonically
-across the sweep, and the effect on row 1 is far smaller and of the opposite
-sign, because the diffuse lobe is a smaller share of that material's response.
-An implementation where row 0 is flat has almost certainly not wired the
-parameter through; one where row 0 changes by tens of levels has likely applied
-it to the wrong term.
+| Sweep row | leftmost | rightmost | change |
+|---|---|---|---|
+| 1, matte | 129.3 | 133.1 | **+3.9** |
+| 2, semi-gloss | 212.7 | 211.9 | -0.8 |
 
-Note on defaults: the extension's README parameter table and its JSON schema
-currently disagree on the default for `diffuseRoughnessFactor` (`0.0` versus
-`1.0`). Every column here sets the value explicitly, so this asset is unaffected
-by the resolution - but a viewer that renders row 0's leftmost sphere differently
-from a no-extension material has likely applied the schema default somewhere.
+These are specific to our environment, exposure and tone curve, so do not match
+them directly. Two things should reproduce. Every pair in row 0 differs, in the
+same direction -- the rough sphere is lighter. And row 2 moves far less than row
+1, and may move the other way, because the diffuse lobe is a smaller share of a
+glossier material's response.
+
+Note that our deltas are NOT monotonic in albedo. That is consistent with the
+model we implement: Fujii's energy-preserving qualitative Oren-Nayar rather than
+EON, which is a substitution the specification permits and which drops the
+albedo-dependent interreflection term. An implementation of EON should be
+expected to differ here, and that difference is informative rather than a
+failure.
+
+## What this asset can and cannot test
+
+The **normative** part of this extension is the direct-light diffuse BRDF. How
+the parameter affects image-based lighting is explicitly left to the
+implementation -- the specification offers several options and notes that the
+cheapest is also the least correct. A viewer whose lighting is dominated by an
+environment map is therefore exercising implementation-defined behaviour more
+than specified behaviour, and two conforming renderers may legitimately differ
+on these spheres by more than they differ on a direct-lit scene. This asset
+cannot resolve that on its own; it is worth knowing before treating any single
+number here as a pass or fail.
 """
 
 MODELS = [
