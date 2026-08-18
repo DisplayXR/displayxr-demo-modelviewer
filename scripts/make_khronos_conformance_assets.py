@@ -286,12 +286,10 @@ Each pair shares a row, so it shares a height and an environment, and the only
 difference within a pair is the extension itself.
 
 The four pairs use four different base albedos rather than four copies of one,
-and deliberately do NOT assert a trend across them. Whether the effect scales
-with albedo is exactly what distinguishes implementations: the full Oren-Nayar
-model and EON carry an interreflection term that grows with albedo, while
-normalised "qualitative" variants largely do not. So the row is a discriminator
-rather than a target -- what a conforming implementation must show is a visible
-difference *inside* each pair, at every albedo.
+because the effect is albedo-dependent and a single albedo would say nothing
+about that. What a conforming implementation must show is a visible difference
+*inside* every pair, in the same direction -- the rough sphere is lighter -- with
+the absolute difference growing from the darkest pair to the lightest.
 
 This also gives the cheapest conformance check in the asset, and the first one to
 run: at `diffuseRoughnessFactor` 0 the material must be **indistinguishable**
@@ -317,30 +315,29 @@ the wrong term tends to look plausible on row 1 and wrong on row 2.
 Measured on our own implementation, as mean luma (Rec. 709, 0-255) of a patch at
 each sphere's centre:
 
-| Row 0 pair (base albedo) | extension absent | roughness 1.0 | delta |
-|---|---|---|---|
-| 0.12 | 79.1 | 85.6 | **+6.4** |
-| 0.28 | 109.0 | 113.7 | **+4.7** |
-| 0.45 | 127.8 | 131.1 | **+3.2** |
-| 0.72 | 173.4 | 178.5 | **+5.1** |
+| Row 0 pair (base albedo) | extension absent | roughness 1.0 | delta | relative |
+|---|---|---|---|---|
+| 0.12 | 82.0 | 85.5 | **+3.6** | +4.4% |
+| 0.28 | 112.6 | 117.9 | **+5.3** | +4.7% |
+| 0.45 | 132.3 | 139.2 | **+6.9** | +5.2% |
+| 0.72 | 181.1 | 190.5 | **+9.4** | +5.2% |
 
 | Sweep row | leftmost | rightmost | change |
 |---|---|---|---|
-| 1, matte | 129.3 | 133.1 | **+3.9** |
-| 2, semi-gloss | 212.7 | 211.9 | -0.8 |
+| 1, matte | 131.3 | 136.7 | **+5.4** |
+| 2, semi-gloss | 215.9 | 212.5 | **-3.4** |
 
 These are specific to our environment, exposure and tone curve, so do not match
-them directly. Two things should reproduce. Every pair in row 0 differs, in the
-same direction -- the rough sphere is lighter. And row 2 moves far less than row
-1, and may move the other way, because the diffuse lobe is a smaller share of a
-glossier material's response.
+them directly. Three things should reproduce. Every pair in row 0 differs in the
+same direction, the rough sphere being the lighter one. The absolute difference
+grows with base albedo, while the *relative* difference stays near 5% across the
+whole range. And row 2 moves in the opposite direction to row 1, because the
+diffuse lobe is a smaller share of a glossier material's response.
 
-Note that our deltas are NOT monotonic in albedo. That is consistent with the
-model we implement: Fujii's energy-preserving qualitative Oren-Nayar rather than
-EON, which is a substitution the specification permits and which drops the
-albedo-dependent interreflection term. An implementation of EON should be
-expected to differ here, and that difference is informative rather than a
-failure.
+Note that we implement Fujii's energy-preserving qualitative Oren-Nayar rather
+than EON, which the specification permits and which we state plainly; the two
+models weight the interreflection term differently, so an EON implementation may
+reasonably show a steeper albedo trend than the one tabulated here.
 
 ## What this asset can and cannot test
 
