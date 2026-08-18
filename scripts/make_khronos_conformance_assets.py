@@ -33,7 +33,8 @@ them against a spec change costs one command.
 Usage:
     python scripts/make_khronos_conformance_assets.py [outdir]
 
-Writes <outdir>/Models/<Name>/{glTF-Binary/<Name>.glb, metadata.json, README.md}.
+Writes <outdir>/Models/<Name>/ with both required variants (glTF/ and
+glTF-Binary/), metadata.json and README.body.md.
 Default outdir is ./khronos_submission.
 """
 
@@ -43,6 +44,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from khronos_gltf_pack import (            # noqa: E402
+    parse_glb, prune, write_glb, write_gltf_variant,
+)
 from make_material_grid import (           # noqa: E402
     build_glb, ripple_normal_png,
     m_coat_clearcoat_ref, m_coat_factor, m_coat_color, m_coat_darkening,
@@ -105,8 +109,9 @@ DIFFUSE_ROWS_UPSTREAM = [
 
 COAT_DESC = """\
 A parameter sweep for `KHR_materials_coat`. Seven rows of eight spheres over a
-common rough red base; each row varies exactly one coat property from left to
-right, so a difference between two implementations localises to a single
+common base -- a neutral light-grey dielectric, `baseColorFactor` (0.78, 0.78,
+0.80) at roughness 0.40 -- where each row varies exactly one coat property from
+left to right, so a difference between two implementations localises to a single
 property rather than to "the coat looks wrong".
 
 ## Row 0 is a conformance control, and it is the point of the asset
@@ -155,6 +160,17 @@ hard, and an implementation is not wrong for rendering them gently.
 
 The base material is deliberately smooth so that any ripple visible in row 6
 belongs to the coat's own normal rather than to the base.
+
+## A note on glTF-Validator output
+
+This asset validates with no errors and no warnings, but it does report
+`UNUSED_MESH_TANGENT` and `UNUSED_OBJECT` (for `TEXCOORD_0`) against every
+primitive. Those are false positives and the attributes should not be stripped:
+the validator does not yet support `KHR_materials_coat`, so it cannot see that
+row 6 samples `coatNormalTexture`, and the extension additionally requires a
+tangent space for row 5 -- "A mesh primitive using coat anisotropy **MUST** have
+a defined tangent space". The attributes are carried uniformly across all rows so
+that every sphere in the asset is the same geometry.
 """
 
 FUZZ_DESC = """\
@@ -213,6 +229,26 @@ At `diffuseRoughnessFactor` 0 the material must be indistinguishable from a base
 glTF 2.0 material with the extension absent. That is the cheapest conformance
 check in the asset and the first one to run.
 
+## Expect a small effect, and check it by measurement
+
+This is the least visually dramatic of the three assets, and that is a property
+of the model rather than of the asset. Measured on our own implementation, as
+mean luma (Rec. 709, 0-255) of a patch at each sphere's centre, sweeping
+`diffuseRoughnessFactor` from 0 to 1 across the row:
+
+| Row | leftmost | rightmost | change |
+|---|---|---|---|
+| 0, matte base | 175.1 | 183.5 | **+8.4** |
+| 1, glossy base | 214.7 | 212.9 | -1.8 |
+
+The numbers are specific to our environment and tone curve, so do not match them
+directly. What should reproduce is the **shape**: row 0 brightens monotonically
+across the sweep, and the effect on row 1 is far smaller and of the opposite
+sign, because the diffuse lobe is a smaller share of that material's response.
+An implementation where row 0 is flat has almost certainly not wired the
+parameter through; one where row 0 changes by tens of levels has likely applied
+it to the wrong term.
+
 Note on defaults: the extension's README parameter table and its JSON schema
 currently disagree on the default for `diffuseRoughnessFactor` (`0.0` versus
 `1.0`). Every column here sets the value explicitly, so this asset is unaffected
@@ -225,17 +261,17 @@ MODELS = [
      "Parameter sweep for KHR_materials_coat, with a height-matched "
      "clearcoat-to-coat mapping control.",
      COAT_ROWS_UPSTREAM, ["KHR_materials_clearcoat", "KHR_materials_coat"],
-     COAT_DESC, True),
+     COAT_DESC, True, ()),
     ("FuzzParameterSweep", "Fuzz Parameter Sweep",
      "Parameter sweep for KHR_materials_fuzz, with a KHR_materials_sheen "
      "reference row.",
      FUZZ_ROWS_UPSTREAM, ["KHR_materials_sheen", "KHR_materials_fuzz"],
-     FUZZ_DESC, False),
+     FUZZ_DESC, False, ("TEXCOORD_0", "TANGENT")),
     ("DiffuseRoughnessParameterSweep", "Diffuse Roughness Parameter Sweep",
      "Parameter sweep for KHR_materials_diffuse_roughness over a matte and a "
      "glossy base.",
      DIFFUSE_ROWS_UPSTREAM, ["KHR_materials_diffuse_roughness"],
-     DIFFUSE_DESC, False),
+     DIFFUSE_DESC, False, ("TEXCOORD_0", "TANGENT")),
 ]
 
 
@@ -243,7 +279,7 @@ def main():
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else \
         Path(__file__).resolve().parent.parent / "khronos_submission"
 
-    for dirname, name, summary, rows, exts, desc, needs_ripple in MODELS:
+    for dirname, name, summary, rows, exts, desc, needs_ripple, drop_attrs in MODELS:
         mdir = out / "Models" / dirname
         (mdir / "glTF-Binary").mkdir(parents=True, exist_ok=True)
         (mdir / "screenshot").mkdir(parents=True, exist_ok=True)
@@ -255,22 +291,32 @@ def main():
                        "scripts/make_khronos_conformance_assets.py"),
             extra_png=ripple_normal_png() if needs_ripple else None)
 
-        (mdir / "glTF-Binary" / (dirname + ".glb")).write_bytes(glb)
+        # The shared builder emits one mesh layout and a gradient image for
+        # every asset, because the in-tree grid it also feeds needs them. Most
+        # of these need neither, so sweep unreferenced objects before shipping.
+        doc, binary = parse_glb(glb)
+        doc, binary = prune(doc, binary, drop_attributes=drop_attrs)
+        packed = write_glb(doc, binary)
+        (mdir / "glTF-Binary" / (dirname + ".glb")).write_bytes(packed)
+        # `glTF` (separate .gltf + .bin + images) is REQUIRED for every model.
+        nbin, nimg = write_gltf_variant(doc, binary, mdir / "glTF", dirname)
 
         (mdir / "metadata.json").write_text(json.dumps({
             "version": 2,
             "name": name,
             "path": "./Models/" + dirname,
             "summary": summary,
-            "screenshot": "screenshot/screenshot.jpg",
+            "screenshot": "screenshot/screenshot.png",
             "tags": ["testing", "pbrtest", "extension"],
             "legal": LEGAL,
         }, indent=2) + "\n", encoding="utf-8")
 
-        (mdir / "README.md").write_text(
-            "# " + name + "\n\n## Extensions Used\n\n"
-            + "".join("* " + e + "\n" for e in exts)
-            + "\n## Summary\n\n" + summary + "\n\n## Description\n\n" + desc
+        # README.body.md, NOT README.md: a model's README.md is generated from
+        # metadata.json plus this file, so a hand-written one is overwritten.
+        # Sections start at "##" per CONTRIBUTING; the title, extension list and
+        # summary are omitted because they are generated from metadata.json.
+        (mdir / "README.body.md").write_text(
+            "## Description\n\n" + desc
             + "\n## Provenance\n\n"
               "Generated procedurally rather than modelled, so it can be "
               "regenerated against a specification change in one command. The "
@@ -281,16 +327,16 @@ def main():
               "displayxr-demo-modelviewer).\n",
             encoding="utf-8")
 
-        print(dirname + ": " + format(len(glb), ",") + " bytes, "
+        print(dirname + ": glb=" + format(len(packed), ",") + "B  bin="
+              + format(nbin, ",") + "B  images=" + str(nimg) + ", "
               + str(nrows) + " rows x " + str(ncols) + " cols = "
               + str(nmat) + " materials")
         for line in layout:
             print("   " + line)
 
     print("\nwrote " + str(out))
-    print("STILL REQUIRED before opening the PR:")
-    print("  - screenshot/screenshot.jpg per model (Khronos requires one)")
-    print("  - glTF-Validator pass on each .glb")
+    print("Next: scripts/make_khronos_screenshots.py (needs viewer captures),")
+    print("      then validate every .glb and .gltf with the glTF-Validator.")
 
 
 if __name__ == "__main__":
