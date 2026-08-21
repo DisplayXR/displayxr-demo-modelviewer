@@ -38,6 +38,7 @@
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z; DXR_RECENTER_PIN)
 #include "toast.h"             // dxr::ToastState — transient on-screen confirmation
 #include "zone_default.h"      // dxr::FullWindowZone — zones-by-default (#63 / INV-5.6)
+#include "auto_fit.h"          // dxr::AutoFitVHeight — shared width-aware load-time framing
 
 #include <atomic>
 #include <cstdarg>   // ToastF varargs
@@ -238,6 +239,12 @@ static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
+// The app window, published as soon as CreateAppWindow() returns. Auto-fit
+// needs the *live* client rect (its aspect is what the width rule keys off),
+// and the WM_SIZE-maintained statics above still hold the requested creation
+// size until the first resize lands. Null before window creation and after
+// teardown — callers must fall back to the statics.
+static HWND g_appHwnd = nullptr;
 
 // 3DGS state
 static ModelRenderer g_modelRenderer;
@@ -336,11 +343,11 @@ static std::vector<XrSwapchainImageVulkanKHR> g_animBtnSwapImages;
 // Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
 static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
-// Initial virtual-display height as a multiple of the model's height: the
-// display-centric rig frames the (centered) model with 1.4× its height, i.e.
-// ~20% headroom top and bottom — enough that the window title bar doesn't
-// clip the subject.
-static constexpr float kAutoFitVerticalComfort = 1.4f;
+// Load-time framing is the shared width-aware rule from displayxr-common
+// (dxr::AutoFitVHeight, default dxr::kAutoFitDefaultFill = 80%): the model
+// spans at most 80% of the viewport in BOTH axes, so a wide asset is bound by
+// width instead of overflowing the sides. There is no separate vertical
+// comfort multiplier — the fill fraction IS the headroom.
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -359,6 +366,25 @@ static dxr::RecenterControl g_recenter;
 // model load funnels through). Defined with the rest of the MCP block below.
 static void UpdateMcpAnimationTools();
 
+// Viewport the auto-fit rule frames against, in pixels. The demo's display
+// zone is the full window (dxr::FullWindowZone), so that viewport is the
+// window client rect; only its aspect matters to dxr::AutoFitVHeight. Prefer
+// the live rect — a load can run before the first WM_SIZE (the bundled scene
+// auto-loads during init) — and fall back to the WM_SIZE statics when there
+// is no window yet or the rect comes back degenerate. (0,0) is a legal
+// result: AutoFitVHeight then degrades to the height-only fit.
+static void GetAutoFitViewportPx(float& outW, float& outH) {
+    RECT client = {};
+    if (g_appHwnd && GetClientRect(g_appHwnd, &client) &&
+        client.right > client.left && client.bottom > client.top) {
+        outW = (float)(client.right - client.left);
+        outH = (float)(client.bottom - client.top);
+        return;
+    }
+    outW = (float)g_windowWidth;
+    outH = (float)g_windowHeight;
+}
+
 // Compute robust scene bounds (5th–95th percentile per axis) and stage
 // new display-rig pose + vHeight on g_inputState. Display orientation is
 // kept identity (forward = world −Z): splats have no canonical front, and
@@ -369,13 +395,16 @@ static void ApplyAutoFitForLoadedScene_locked() {
     // Gate the right-justified animation button on whether this model has clips.
     g_hasAnimations.store(g_modelRenderer.hasAnimations());
     float center[3], extent[3];
-    // Full model AABB: center for the rig position, extent[1] for the height fit.
+    // Full model AABB: center for the rig position, extent[0]/extent[1] (FULL
+    // sizes, not half-extents) for the width-aware fit.
     bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
     if (ok) {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
-        float vh = extent[1] * kAutoFitVerticalComfort;
+        float viewportW = 0.0f, viewportH = 0.0f;
+        GetAutoFitViewportPx(viewportW, viewportH);
+        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH);
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
@@ -386,9 +415,19 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // macOS:1407 — the user can drag with LMB if a particular asset's
         // authored orientation is off.
         g_fitYaw = 0.0f;
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+        // Which axis bound the fit: width wins when the model is wider than
+        // the viewport aspect can hold at the height-only vHeight. With no
+        // usable viewport the rule degrades to height-only.
+        const bool haveViewport = (viewportW > 0.0f && viewportH > 0.0f);
+        const float aspect = haveViewport ? (viewportW / viewportH) : 0.0f;
+        const char* boundBy = !haveViewport ? "height (no viewport)"
+                            : (extent[0] / aspect > extent[1]) ? "width" : "height";
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent W=%.3f H=%.3f D=%.3f "
+                 "viewport=%.0fx%.0f (aspect %.3f) bound-by=%s fill=%.0f%% vHeight=%.3f yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+                 extent[0], extent[1], extent[2],
+                 viewportW, viewportH, aspect, boundBy,
+                 dxr::kAutoFitDefaultFill * 100.0f, vh, g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
 
@@ -2812,6 +2851,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ShutdownLogging();
         return 1;
     }
+    // Publish for GetAutoFitViewportPx — the bundled scene auto-loads further
+    // down in init, before the message loop, and its framing needs the real
+    // client rect.
+    g_appHwnd = hwnd;
 
     // Try to load sim_display_set_output_mode
     {
@@ -3232,6 +3275,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     vkDestroyDevice(vkDevice, nullptr);
     vkDestroyInstance(vkInstance, nullptr);
 
+    g_appHwnd = nullptr;
     DestroyWindow(hwnd);
     UnregisterClass(WINDOW_CLASS, hInstance);
 

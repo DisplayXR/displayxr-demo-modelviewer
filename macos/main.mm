@@ -59,6 +59,7 @@
 #include "projection_depth.h"
 #include "model_renderer.h"
 #include "atlas_capture.h"
+#include "auto_fit.h"    // dxr::AutoFitVHeight — shared width-aware load-time framing
 
 // ============================================================================
 // Logging
@@ -144,11 +145,11 @@ struct InputState {
 // percentile-based extent — see ApplyAutoFitForLoadedScene().
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
-// Initial virtual-display height as a multiple of the model's height: the
-// display-centric rig frames the (centered) model with 1.4× its height, i.e.
-// ~20% headroom top and bottom — enough that the window title bar doesn't
-// clip the subject.
-static constexpr float kAutoFitVerticalComfort = 1.4f;
+// Load-time framing is the shared width-aware rule from displayxr-common
+// (dxr::AutoFitVHeight, default dxr::kAutoFitDefaultFill = 80%): the model
+// spans at most 80% of the viewport in BOTH axes, so a wide asset is bound by
+// width instead of overflowing the sides. There is no separate vertical
+// comfort multiplier — the fill fraction IS the headroom.
 
 // Cached auto-fit result for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -2008,13 +2009,27 @@ static void ApplyAutoFitForLoadedScene() {
     UpdateMcpAnimationTools(); // (un)register the agent animation tools (#22)
     float center[3], extent[3];
     // Robust AABB (5th–95th percentile per axis): center for the rig position,
-    // extent[1] for the height fit. Percentile trim rejects stray outlier
-    // vertices that would otherwise inflate the frame.
+    // extent[0]/extent[1] (FULL sizes, not half-extents) for the width-aware
+    // fit. Percentile trim rejects stray outlier vertices that would otherwise
+    // inflate the frame.
     if (g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent)) {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
-        float vh = extent[1] * kAutoFitVerticalComfort;
+        // Viewport the fit frames against: the demo's display zone is the full
+        // window, so that's the content view. Only the aspect matters, so the
+        // backing scale factor is irrelevant here. Falls back to the cached
+        // drawable dims before the window exists; (0,0) is legal and degrades
+        // dxr::AutoFitVHeight to the height-only fit.
+        float viewportW = (float)g_windowW, viewportH = (float)g_windowH;
+        if (g_window) {
+            NSSize cs = [[g_window contentView] bounds].size;
+            if (cs.width > 0.0 && cs.height > 0.0) {
+                viewportW = (float)cs.width;
+                viewportH = (float)cs.height;
+            }
+        }
+        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH);
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
         g_fitVHeight = vh;
 
@@ -2023,9 +2038,18 @@ static void ApplyAutoFitForLoadedScene() {
         g_fitYaw = 0.0f;
 
         g_fitValid = true;
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+        // Which axis bound the fit: width wins when the model is wider than
+        // the viewport aspect can hold at the height-only vHeight.
+        const bool haveViewport = (viewportW > 0.0f && viewportH > 0.0f);
+        const float aspect = haveViewport ? (viewportW / viewportH) : 0.0f;
+        const char *boundBy = !haveViewport ? "height (no viewport)"
+                            : (extent[0] / aspect > extent[1]) ? "width" : "height";
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent W=%.3f H=%.3f D=%.3f "
+                 "viewport=%.0fx%.0f (aspect %.3f) bound-by=%s fill=%.0f%% vHeight=%.3f yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+                 extent[0], extent[1], extent[2],
+                 viewportW, viewportH, aspect, boundBy,
+                 dxr::kAutoFitDefaultFill * 100.0f, vh, g_fitYaw * 57.2957795f);
     } else {
         g_fitValid = false;
     }
