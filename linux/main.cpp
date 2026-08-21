@@ -65,6 +65,7 @@
 #include "projection_depth.h"
 #include "model_renderer.h"
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (DXR_RECENTER_PIN on Linux)
+#include "auto_fit.h"          // dxr::AutoFitVHeight — shared width-aware load-time framing
 #include "model_loader.h"
 
 // ============================================================================
@@ -118,7 +119,9 @@ static void ComputeRigPosition(float out[3]) {
 }
 
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
-static constexpr float kAutoFitVerticalComfort = 1.4f;
+// Load-time framing is the shared width-aware rule from displayxr-common
+// (dxr::AutoFitVHeight, default 80% fill in BOTH axes) — no separate vertical
+// comfort multiplier; the fill fraction IS the headroom.
 
 // ============================================================================
 // Inline math — column-major float[16] (mirrors macos/main.mm)
@@ -770,10 +773,21 @@ static void ApplyAutoFitForLoadedScene() {
     float center[3], extent[3];
     if (g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent)) {
         g_camPos[0] = center[0]; g_camPos[1] = center[1]; g_camPos[2] = center[2];
-        float vh = extent[1] * kAutoFitVerticalComfort;
+        // Viewport: this leg is hosted-NULL, so g_windowW/H is the runtime's
+        // presentation surface (the panel, or the X window when we own one) —
+        // set during init, before the first load. Only its aspect matters.
+        const float viewportW = (float)g_windowW, viewportH = (float)g_windowH;
+        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH);
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM;
         g_viewParams.virtualDisplayHeight = vh;
-        LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) vHeight=%.3f", center[0], center[1], center[2], vh);
+        const bool haveViewport = (viewportW > 0.0f && viewportH > 0.0f);
+        const float aspect = haveViewport ? (viewportW / viewportH) : 0.0f;
+        const char* boundBy = !haveViewport ? "height (no viewport)"
+                            : (extent[0] / aspect > extent[1]) ? "width" : "height";
+        LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extent W=%.3f H=%.3f "
+                 "viewport=%.0fx%.0f (aspect %.3f) bound-by=%s vHeight=%.3f",
+                 center[0], center[1], center[2], extent[0], extent[1],
+                 viewportW, viewportH, aspect, boundBy, vh);
     } else {
         g_viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
     }

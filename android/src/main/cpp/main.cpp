@@ -173,6 +173,13 @@ std::atomic<bool> g_picked_pending{false};
 // Live window pixel size (from the rig raw channel) for tap → fraction mapping.
 std::atomic<uint32_t> g_win_px_w{0};
 std::atomic<uint32_t> g_win_px_h{0};
+// Panel pixel size of the active rendering mode (view px × the mode's tile
+// grid — the anamorphic per-view scale cancels, so this is the real display
+// aspect). Filled by enumerate_rendering_modes(), which runs before the first
+// model load; the auto-fit rule uses it as the viewport until the live canvas
+// rect arrives with the first frame.
+uint32_t g_disp_px_w = 0;
+uint32_t g_disp_px_h = 0;
 
 constexpr int64_t kUiHideMs = 5000;  // idle time before the bar starts fading
 constexpr int64_t kUiFadeMs = 400;   // fade-out duration
@@ -256,7 +263,11 @@ std::atomic<float> g_scene_push{1.5f};
 // the model to ~kTargetSize metres so it fits the display + the 0.01–100 clip.
 std::atomic<float> g_scene_scale{1.0f};
 float g_fit_scale = 1.0f;             // auto-fit scale; pinch-zoom multiplies around it
-constexpr float kTargetSize = 0.95f;  // fill the view like the Windows auto-fit (model.height*1.4)
+constexpr float kTargetSize = 0.95f;  // normalized world size of the largest model axis
+// Shared load-time framing fraction: the model spans at most this much of the
+// viewport in BOTH axes. Mirrors displayxr-common auto_fit.h
+// dxr::kAutoFitDefaultFill — keep the two in step.
+constexpr float kAutoFitFill = 0.8f;
 // Flip the splat vertically (some splats are trained Y-up vs Y-down).
 bool g_flip_y = false;  // glTF is Y-up already (the butterfly point cloud was upside-down)
 // Slow turntable spin about Y (radians/frame). 0 = static. Auto-spin runs until
@@ -771,6 +782,10 @@ enumerate_rendering_modes()
 		if (m.isActive) {
 			g_rmode_current.store(m.modeIndex, std::memory_order_relaxed);
 			g_rmode_requestable = m.isRequestable;
+			// Panel px = per-view px × the tile grid (the mode's anamorphic
+			// view scale cancels out), i.e. the aspect the user actually sees.
+			g_disp_px_w = m.viewWidthPixels * (m.tileColumns > 0 ? m.tileColumns : 1);
+			g_disp_px_h = m.viewHeightPixels * (m.tileRows > 0 ? m.tileRows : 1);
 		}
 		LOGI("RMODE[%u] idx=%u \"%s\" views=%u scale=(%.3f,%.3f) hw3D=%d tiles=%ux%u "
 		     "%ux%u active=%d requestable=%d",
@@ -954,17 +969,44 @@ load_model_path(const char *path)
 		// (#396 W7): under XR_DXR_view_rig the world is display-anchored — the
 		// virtual display plane sits at the identity rig pose (origin), so the
 		// model frames AT screen depth with NO forward push, and the rig's
-		// virtual display height fits the scaled model (extent_y * 1.4, the
-		// desktop auto-fit factor — model fills ~71% of screen height).
+		// virtual display height fits the scaled model.
 		// Without the rig keep the legacy fixed push (raw views, 0.01/100 clips).
 		g_fit_scale = (maxe > 1e-4f) ? kTargetSize / maxe : 1.0f;
 		g_scene_scale.store(g_fit_scale, std::memory_order_relaxed);
 		g_scene_push.store(g_has_view_rig ? 0.0f : 0.45f, std::memory_order_relaxed);
-		const float vh = ext[1] * g_fit_scale * 1.4f;
-		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize * 1.4f;
-		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) push=%.2f rig_vh=%.2f",
-		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
-		     ext[0], ext[1], ext[2], g_scene_push.load(std::memory_order_relaxed), g_rig_vh);
+
+		// Width-aware fit: the scaled model caps at kAutoFitFill of the
+		// viewport in BOTH axes, so a wide model is bound by width instead of
+		// overflowing the sides. Live canvas px when a frame has landed, else
+		// the active mode's panel px (this runs before the first frame).
+		// Mirrors displayxr-common auto_fit.h AutoFitVHeight — inlined because
+		// the Android leg does not pull displayxr-common.
+		uint32_t vp_w = g_win_px_w.load(std::memory_order_relaxed);
+		uint32_t vp_h = g_win_px_h.load(std::memory_order_relaxed);
+		if (vp_w == 0 || vp_h == 0) {
+			vp_w = g_disp_px_w;
+			vp_h = g_disp_px_h;
+		}
+		const float fit_w = ext[0] * g_fit_scale;
+		const float fit_h = ext[1] * g_fit_scale;
+		float vh = fit_h / kAutoFitFill;
+		const bool have_vp = (vp_w > 0 && vp_h > 0);
+		const float vp_aspect = have_vp ? ((float)vp_w / (float)vp_h) : 0.0f;
+		if (have_vp && fit_w > 0.0f) {
+			const float vh_for_width = fit_w / (kAutoFitFill * vp_aspect);
+			if (vh_for_width > vh) {
+				vh = vh_for_width;
+			}
+		}
+		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize / kAutoFitFill;
+		const char *bound_by = !have_vp                      ? "height (no viewport)"
+		                       : (fit_w / vp_aspect > fit_h) ? "width"
+		                                                     : "height";
+		LOGI("scene center=(%.2f,%.2f,%.2f) extent W=%.2f H=%.2f D=%.2f "
+		     "viewport=%ux%u (aspect %.3f) bound-by=%s push=%.2f rig_vh=%.2f",
+		     g_scene_center[0], g_scene_center[1], g_scene_center[2], ext[0], ext[1], ext[2],
+		     vp_w, vp_h, vp_aspect, bound_by,
+		     g_scene_push.load(std::memory_order_relaxed), g_rig_vh);
 	}
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	return true;
