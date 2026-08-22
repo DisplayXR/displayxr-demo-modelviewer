@@ -418,7 +418,7 @@ void main() {
     //   G = gl_FrontFacing
     //   B = 0                    ("geometry was here"; the probe clear has B=1)
     // No display transform is applied — the value is a number, not a colour.
-    if (ubo.viewport.z > 0.5) {
+    if (ubo.tone.w > 1.5) {  // select==2 (#92/#98 facing probe)
         float dnv = dot(N, V);
         outColor = vec4(0.5 + 0.5 * dnv, gl_FrontFacing ? 1.0 : 0.0, 0.0, 1.0);
         outSceneLinear = outColor;
@@ -821,7 +821,7 @@ void main() {
     // exactly once, so a correct sample makes every transmissive surface
     // reproduce the pixels behind it and visually vanish. Enable with
     // DXR_MODELVIEWER_TRANSMISSION_PROBE=1.
-    bool probe = ubo.tone.w > 0.5;
+    bool probe = ubo.tone.w > 0.5 && ubo.tone.w < 1.5;  // select==1 (#75)
     if (transmissionFactor > 0.0) {
         // Ray through the volume. thickness 0 (a thin surface) degenerates to
         // sampling straight behind the fragment, which is the correct

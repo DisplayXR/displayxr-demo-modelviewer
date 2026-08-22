@@ -1277,14 +1277,24 @@ render_frame()
 				     view_raw.canvasRectPx.extent.height);
 				for (uint32_t pi = 0; pi < (located < kViewCount ? located : kViewCount); ++pi) {
 					const float r2d = 57.2957795f;
+					// #98 A/B: tan_w / tan_h are what set the SIGN of proj m00/m05.
+					// A negative tan_w or tan_h mirrors the frustum and reverses
+					// framebuffer-space winding -> gl_FrontFacing inverts.
+					const float p_tw = std::tan(views[pi].fov.angleRight) - std::tan(views[pi].fov.angleLeft);
+					const float p_th = std::tan(views[pi].fov.angleUp) - std::tan(views[pi].fov.angleDown);
 					LOGI("VIEWPROBE   view[%u]%s pose=(%.4f,%.4f,%.4f) "
-					     "fov L=%.3f R=%.3f U=%.3f D=%.3f hcen=%.4f vcen=%.4f",
+					     "quat=(%.4f,%.4f,%.4f,%.4f) "
+					     "fov L=%.3f R=%.3f U=%.3f D=%.3f hcen=%.4f vcen=%.4f "
+					     "tan_w=%.5f tan_h=%.5f m00=%+.4f m05=%+.4f",
 					     pi, pi < view_count ? "*" : " ", views[pi].pose.position.x,
 					     views[pi].pose.position.y, views[pi].pose.position.z,
+					     views[pi].pose.orientation.x, views[pi].pose.orientation.y,
+					     views[pi].pose.orientation.z, views[pi].pose.orientation.w,
 					     views[pi].fov.angleLeft * r2d, views[pi].fov.angleRight * r2d,
 					     views[pi].fov.angleUp * r2d, views[pi].fov.angleDown * r2d,
 					     (views[pi].fov.angleLeft + views[pi].fov.angleRight) * 0.5f * r2d,
-					     (views[pi].fov.angleUp + views[pi].fov.angleDown) * 0.5f * r2d);
+					     (views[pi].fov.angleUp + views[pi].fov.angleDown) * 0.5f * r2d,
+					     p_tw, p_th, 2.0f / p_tw, 2.0f / p_th);
 				}
 				for (uint32_t pi = 0; pi < view_raw.eyeCountOutput && pi < 8; ++pi) {
 					LOGI("VIEWPROBE   rawEye[%u]=(%.4f,%.4f,%.4f)", pi,
@@ -1337,6 +1347,15 @@ render_frame()
 					} else {
 						const float aspect = (float)tile_w / (float)tile_h;
 						projM = projection_matrix_from_fov(views[i].fov, aspect, 0.01f, 100.0f);
+					}
+					if (probe) {
+						// #98 A/B: the matrix actually handed to renderEye.
+						LOGI("VIEWPROBE   projM[%u] m00=%+.5f m05=%+.5f m08=%+.5f "
+						     "m09=%+.5f m10=%+.5f m11=%+.5f m14=%+.5f rig=%d "
+						     "tile=(%u,%u %ux%u)",
+						     i, projM.m[0], projM.m[5], projM.m[8], projM.m[9],
+						     projM.m[10], projM.m[11], projM.m[14],
+						     (int)g_has_view_rig, tile_x, tile_y, tile_w, tile_h);
 					}
 					// Render tile i into its (tile_x,tile_y) sub-rect of the atlas.
 					g_model.renderEye(

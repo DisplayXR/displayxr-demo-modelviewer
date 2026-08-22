@@ -1753,10 +1753,13 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.tone[0] = std::pow(2.0f, exposureEV_);
     ub.tone[1] = (float)(int)toneCurve_;
     ub.tone[2] = envIsHdri_ ? 0.0f : 1.0f;
-    ub.tone[3] = transmissionProbe_ ? 1.0f : 0.0f;
+    // #98: tone.w is a SELECT, not a flag — 0 = normal, 1 = transmission probe
+    // (#75), 2 = facing probe (#92/#98). The facing probe used to ride
+    // ubo.viewport.z, which the Kulla-Conty switch below already owns and
+    // unconditionally overwrote two lines later, so it never reached the shader.
+    ub.tone[3] = facingProbe_ ? 2.0f : (transmissionProbe_ ? 1.0f : 0.0f);
     ub.viewport[0] = (width_  > 0) ? (float)vpWidth_  / (float)width_  : 1.0f;
     ub.viewport[1] = (height_ > 0) ? (float)vpHeight_ / (float)height_ : 1.0f;
-    ub.viewport[2] = facingProbe_ ? 1.0f : 0.0f;
     // DXR_MODELVIEWER_KULLA_CONTY=1 switches the scatter lobe to the spec's
     // multi->single scatter albedo remap, so the two can be MEASURED against the
     // conformance references rather than argued about. See pbr.frag.
