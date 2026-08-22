@@ -853,6 +853,29 @@ create_swapchains()
 	}
 	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
 
+	// #98 probe (prop-gated, one-shot): dump the FULL offered format list plus the
+	// chosen format and the app's srgb flag, so an OOP-vs-in-process A/B can tell
+	// whether the two runtime paths advertise different swapchain formats.
+	// `adb shell setprop debug.dxr.mv.fmtprobe 1`
+	{
+		char probe_prop[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.mv.fmtprobe", probe_prop) > 0 && probe_prop[0] == '1') {
+			char buf[1024];
+			int n = 0;
+			n += snprintf(buf + n, sizeof(buf) - n, "FMTPROBE count=%u list=", format_count);
+			for (uint32_t i = 0; i < format_count && n < (int)sizeof(buf) - 16; ++i) {
+				n += snprintf(buf + n, sizeof(buf) - n, "%lld%s", (long long)formats[i],
+				              (i + 1 < format_count) ? "," : "");
+			}
+			LOGI("%s", buf);
+			const bool is_srgb = (g_swapchain_format == VK_FORMAT_R8G8B8A8_SRGB ||
+			                      g_swapchain_format == VK_FORMAT_B8G8R8A8_SRGB ||
+			                      g_swapchain_format == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
+			LOGI("FMTPROBE chosen=%d (0x%x) srgb=%d", (int)g_swapchain_format,
+			     (uint32_t)g_swapchain_format, is_srgb ? 1 : 0);
+		}
+	}
+
 	// ONE atlas swapchain, sized worst-case over all modes × orientations
 	// (multiview-tiling invariant). Allocated once here and never reallocated on a
 	// mode switch / rotation; each frame the app renders the active mode's tiles
