@@ -602,21 +602,20 @@ bool ModelRenderer::createPipeline() {
 
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE;       // two-sided shading handles back faces
-    // #99 EXPERIMENT, default OFF. DXR_MODELVIEWER_CULL_BACKFACES=1|2 turns on
-    // back-face culling (1 = cull VK_CULL_MODE_BACK, 2 = cull FRONT — which of
-    // the two is the geometric back face depends on the same negative-viewport
-    // facing parity #87/#92 is about, so the side is chosen by measurement, not
-    // theory). This exists to quantify how much of the orientation-dependent
-    // frame-time swing in #99 is back-face fragment work; it is NOT a shipping
-    // path and stays off unless the variable is set.
-    if (const char *cull = std::getenv("DXR_MODELVIEWER_CULL_BACKFACES")) {
-        if (cull[0] == '1') rs.cullMode = VK_CULL_MODE_BACK_BIT;
-        else if (cull[0] == '2') rs.cullMode = VK_CULL_MODE_FRONT_BIT;
-        if (rs.cullMode != VK_CULL_MODE_NONE)
-            std::fprintf(stderr, "[modelviewer] #99 experiment: cullMode=%s\n",
-                         cull[0] == '1' ? "BACK" : "FRONT");
+    // Base variant: CULL_NONE. This is what a doubleSided material and the
+    // fullscreen skybox (which shares this state, and whose single triangle
+    // would be culled outright otherwise) both need. The single-sided variant
+    // is built from the same struct with cullMode flipped, further down.
+    rs.cullMode = VK_CULL_MODE_NONE;
+    // #99 kill switch: DXR_MODELVIEWER_CULL=0 collapses both variants back to
+    // CULL_NONE, restoring the pre-#99 render exactly, with no rebuild.
+    if (const char *cull = std::getenv("DXR_MODELVIEWER_CULL")) {
+        cullSingleSided_ = (cull[0] != '0');
+        cullExemptTransmissive_ = (std::strcmp(cull, "all") != 0);
     }
+    std::fprintf(stderr, "[modelviewer] back-face culling: %s (transmissive %s)\n",
+                 cullSingleSided_ ? "on" : "OFF (DXR_MODELVIEWER_CULL=0)",
+                 cullExemptTransmissive_ ? "exempt" : "culled too");
     // Front-face winding is PER-PLATFORM, and both sides are empirical.
     //
     // The #87 analysis (unconditional CLOCKWISE, v0.21.1) held on macOS: under
@@ -721,6 +720,53 @@ bool ModelRenderer::createPipeline() {
         vkDestroyShaderModule(device_, svs, nullptr);
         vkDestroyShaderModule(device_, sfs, nullptr);
         if (spr != VK_SUCCESS) { std::fprintf(stderr, "ModelRenderer: failed to create skybox pipeline (%d)\n", spr); return false; }
+    }
+
+    // Single-sided variant (#99). Built LAST, after the skybox has been cloned
+    // from the CULL_NONE state, so flipping cullMode here cannot reach it.
+    //
+    // WHICH side to cull is per-platform, and NOT simply "BACK". It is tempting
+    // to argue that cullMode is defined relative to frontFace, so BACK must be
+    // right whatever frontFace says — that argument is wrong, and measuring it
+    // is what caught it. The #87/#92 frontFace constants were chosen to make
+    // gl_FrontFacing come out right for pbr.frag's TWO-SIDED NORMAL FLIP, which
+    // is a different criterion from "which winding is geometrically front".
+    //
+    // Measured, same build, both directions:
+    //   Android / native Vulkan (frontFace CCW): CULL_BACK is correct — the
+    //     helmet renders solid; CULL_FRONT shows its interior.
+    //   macOS / MoltenVK (frontFace CW): CULL_BACK is WRONG — it punches a hole
+    //     through sample.glb's visor (mean diff 23.09 vs the unculled capture)
+    //     and deletes transmission_test.glb's backdrop quad, whose winding is
+    //     glTF-correct CCW-front. CULL_FRONT is the correct side there.
+    //
+    // So the cull side tracks the platform's frontFace inversion: glTF says a
+    // front face is CCW, so cull the winding the platform does NOT call front.
+#ifdef __APPLE__
+    constexpr VkCullModeFlags kBackFaceCull = VK_CULL_MODE_FRONT_BIT;  // frontFace = CW
+#else
+    constexpr VkCullModeFlags kBackFaceCull = VK_CULL_MODE_BACK_BIT;   // frontFace = CCW
+#endif
+    if (cullSingleSided_) {
+        VkShaderModule vs2 = createShaderModule(device_, pbr_vert_data, sizeof(pbr_vert_data));
+        VkShaderModule fs2 = createShaderModule(device_, pbr_frag_data, sizeof(pbr_frag_data));
+        if (vs2 == VK_NULL_HANDLE || fs2 == VK_NULL_HANDLE) return false;
+        VkPipelineShaderStageCreateInfo st3[2] = {stages[0], stages[1]};
+        st3[0].module = vs2;
+        st3[1].module = fs2;
+        VkPipelineRasterizationStateCreateInfo rsCull = rs;
+        rsCull.cullMode = kBackFaceCull;
+        VkGraphicsPipelineCreateInfo gp3 = gpci;
+        gp3.pStages = st3;
+        gp3.pRasterizationState = &rsCull;
+        VkResult cpr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp3, nullptr,
+                                                 &pipelineSingleSided_);
+        vkDestroyShaderModule(device_, vs2, nullptr);
+        vkDestroyShaderModule(device_, fs2, nullptr);
+        if (cpr != VK_SUCCESS) {
+            std::fprintf(stderr, "ModelRenderer: failed to create single-sided pipeline (%d)\n", cpr);
+            return false;
+        }
     }
 
     // Descriptor pool + set + the host-visible uniform buffer.
@@ -2246,7 +2292,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    // The model pipeline is bound per primitive now (drawPrimitive picks the
+    // cull variant); only the geometry bindings are frame-wide here.
     VkDeviceSize voff = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
     vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
@@ -2256,10 +2303,21 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // Transmissive primitives are NOT sorted back-to-front — the extension
     // explicitly says correct ordering isn't required of realtime renderers, and
     // sorting would cost more than it buys for a material demo.
+    // #99: single-sided materials (the glTF default) cull their back faces.
+    // Tracked so the bind only happens when the variant actually changes.
+    VkPipeline boundPipe = VK_NULL_HANDLE;
     auto drawPrimitive = [&](const ModelPrimitive& p) {
         PushBlock pb{};
         ModelMaterial m;  // defaults if material == -1
         if (p.material >= 0 && p.material < (int)materials_.size()) m = materials_[p.material];
+        // A material with no index (-1) uses ModelMaterial's default, which is
+        // doubleSided — the safe side for geometry we know nothing about.
+        VkPipeline want = (cullSingleSided_ && !m.doubleSided && !cullExempt(m))
+                              ? pipelineSingleSided_ : pipeline_;
+        if (want != boundPipe) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
+            boundPipe = want;
+        }
         std::memcpy(pb.baseColorFactor, m.baseColorFactor, sizeof(pb.baseColorFactor));
         pb.mrParams[0] = m.metallic;
         pb.mrParams[1] = m.roughness;
@@ -2341,9 +2399,9 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
         vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
         vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
+        boundPipe = VK_NULL_HANDLE;   // new render pass — force a rebind
         for (const auto& p : primitives_) if (transmits(p)) drawPrimitive(p);
     } else {
         // Transparent-background mode has no opaque scene to refract, so the
@@ -2478,6 +2536,7 @@ void ModelRenderer::cleanup() {
     if (materialExtBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, materialExtBuffer_);
     if (descriptorPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
+    if (pipelineSingleSided_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipelineSingleSided_, nullptr); pipelineSingleSided_ = VK_NULL_HANDLE; }
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
     if (pipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (dsLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, dsLayout_, nullptr); dsLayout_ = VK_NULL_HANDLE; }

@@ -1822,14 +1822,15 @@ android_main(struct android_app *app)
 			g_pinch_rearm = false;
 			LOGI("pinch re-arm: OFF (debug.dxr.mv.pinchrearm=0)");
 		}
-		// #99 back-face-cull EXPERIMENT — diagnostic, OFF by default. The
-		// shared renderer reads this as an env var; Android has no env, so
-		// bridge the system prop into one before the renderer is created.
+		// #99 back-face culling. ON by default in the shared renderer;
+		// `setprop debug.dxr.mv.cull 0` is the kill switch and
+		// `... all` drops the transmissive exemption (measurement only).
+		// The renderer reads an env var and Android has no environment, so
+		// bridge the prop into one before the renderer is created.
 		char cull[PROP_VALUE_MAX] = {};
-		if (__system_property_get("debug.dxr.mv.cull", cull) > 0 &&
-		    (cull[0] == '1' || cull[0] == '2')) {
-			setenv("DXR_MODELVIEWER_CULL_BACKFACES", cull, 1);
-			LOGI("#99 experiment: back-face culling ON (debug.dxr.mv.cull=%s)", cull);
+		if (__system_property_get("debug.dxr.mv.cull", cull) > 0 && cull[0] != '\0') {
+			setenv("DXR_MODELVIEWER_CULL", cull, 1);
+			LOGI("#99 back-face culling: DXR_MODELVIEWER_CULL=%s", cull);
 		}
 		// #99 drag probe — diagnostic, OFF unless explicitly asked for.
 		char dp[PROP_VALUE_MAX] = {};

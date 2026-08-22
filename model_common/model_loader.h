@@ -73,6 +73,15 @@ struct ModelMaterial {
     int occlusionTex = -1;
     int emissiveTex = -1;
 
+    // glTF: a material is SINGLE-sided unless it says otherwise, and a
+    // single-sided material's back faces must not be rendered (spec 3.9.4).
+    // The default here is `true` — the opposite of glTF's — on purpose: only
+    // the glTF backend actually knows this flag, and STL/OBJ/FBX/USD assets
+    // carry no reliable winding, so they keep the renderer's historical
+    // two-sided behaviour rather than silently losing faces. The glTF loader
+    // overwrites it from `material.doubleSided`.
+    bool doubleSided = true;
+
     // ── KHR_materials_* (issue #70 phase 2) ──────────────────────────────────
     // Defaults are the glTF-specified "extension absent" values, so a material
     // that declares none of these behaves exactly as it did before the

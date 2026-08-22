@@ -647,6 +647,9 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         mm.normalTex             = resolveTex(mat.normalTexture.index);
         mm.occlusionTex          = resolveTex(mat.occlusionTexture.index);
         mm.emissiveTex           = resolveTex(mat.emissiveTexture.index);
+        // glTF default is false (single-sided) — tinygltf already defaults the
+        // field, so this is a straight copy, not a fallback.
+        mm.doubleSided           = mat.doubleSided;
         // KHR_texture_transform on the five core maps. tinygltf parses these into
         // typed structs, so the extension comes off their own `extensions` map
         // rather than out of the material's — same data, different accessor.
