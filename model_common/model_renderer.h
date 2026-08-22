@@ -345,7 +345,24 @@ private:
     // ── Pipeline ──────────────────────────────────────────────────────────
     VkDescriptorSetLayout dsLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    // Two raster variants of the SAME shaders, selected per primitive by its
+    // material's glTF doubleSided flag (#99). The flag is deliberately NOT in
+    // the UBO or the push block — that is the layout-drift hazard #81 was, and
+    // a cull mode is pipeline state anyway.
+    VkPipeline pipeline_ = VK_NULL_HANDLE;             // doubleSided: CULL_NONE
+    VkPipeline pipelineSingleSided_ = VK_NULL_HANDLE;  // default:     CULL_BACK
+    bool cullSingleSided_ = true;                      // DXR_MODELVIEWER_CULL=0 → off
+    bool cullExemptTransmissive_ = true;               // DXR_MODELVIEWER_CULL=all → off
+    // A transmissive material's back faces are not hidden surface: the glass
+    // lobe shades what the viewer sees THROUGH the object, and KHR_materials_
+    // transmission assets are routinely authored single-sided while still
+    // meant to show both interfaces. Exempted from culling unless
+    // DXR_MODELVIEWER_CULL=all says otherwise (that mode exists to MEASURE
+    // whether the exemption is load-bearing, not to ship).
+    bool cullExempt(const ModelMaterial& m) const {
+        return cullExemptTransmissive_ &&
+               (m.transmissionFactor > 0.0f || m.volumeThickness > 0.0f);
+    }
     VkPipeline skyboxPipeline_ = VK_NULL_HANDLE;   // analytic-sky background (opaque mode)
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
