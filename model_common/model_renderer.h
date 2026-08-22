@@ -209,12 +209,18 @@ private:
         float lightDir[4];     // .xyz = light direction, .w = clipFar (view-space; 0=off)
         float invViewProj[16]; // inverse(viewProj), for the skybox ray reconstruction
         float tone[4];         // x=exposure (2^EV), y=curve id, z=directional-light scale,
-                               // w=transmission probe (issue #75; 0 = normal shading)
+                               // w=probe SELECT (not a bool): 0 = normal shading,
+                               //   1 = transmission probe (#75), 2 = facing probe (#92/#98)
         // The internal colour target is the size of the whole SWAPCHAIN IMAGE,
         // but each eye renders into only the top-left viewport of it. Scene-
         // colour sampling (transmission) therefore has to scale clip-space UVs
         // by the viewport's fraction of the image, or it reads past the region
         // that was actually rendered. x,y = viewport/image ratio.
+        // z = DXR_MODELVIEWER_KULLA_CONTY, w = DXR_MODELVIEWER_COAT_SPEC_HEMI.
+        // NEITHER is spare — #98 lost a device round to treating .z as unused
+        // padding: the flag was silently overwritten a few lines later in
+        // updateUniforms() and the "probe" readback was decoding the SHADED
+        // image, which produced confident, entirely fictional numbers.
         float viewport[4];
     };
 
@@ -338,6 +344,40 @@ private:
     // Reusing the shader's own tone/encode tail is deliberate — a probe with a
     // hand-copied display transform can drift away from the one it is testing.
     bool       transmissionProbe_ = false;
+    // DXR_MODELVIEWER_FACING_PROBE=1 (desktop env) / `debug.dxr.mv.facingprobe`
+    // = 1 (Android system property) — the issues #92/#98 facing measurement.
+    // Read ONCE at init; off means the renderer behaves byte-for-byte as before.
+    //
+    // A negative-height viewport reverses Vulkan's signed-area facing test, so
+    // createPipeline()'s frontFace constant has to match it. When it does not,
+    // gl_FrontFacing is false on EVERY visible fragment, pbr.frag's two-sided
+    // flip inverts N, and the whole scene shades at grazing incidence (the #87
+    // signature: materials render as environment mirrors). Inference cannot
+    // separate the two cases; only dot(N,V) head-on can, and it must be ~+1.
+    //
+    // On: shading is replaced by the raw encoding pbr.frag documents, the sky
+    // is skipped, the colour clear is B=1 so "the probe hit background, not
+    // geometry" is distinguishable, and readFacingProbe() copies the centre
+    // block back and logs the mean (throttled — never per-frame).
+    bool       facingProbe_ = false;
+    // DXR_MODELVIEWER_GRAY_PROBE=1 / `debug.dxr.mv.grayprobe` — the #98
+    // transfer-function measurement. Paints the whole tile a flat
+    // display-referred 0.5 grey (byte 128 in a UNORM target) so the panel can be
+    // screencapped and compared against the app-side image with ONE number,
+    // with no scaling, weave or content to argue about. Implies facingProbe_,
+    // whose readback + throttle it reuses.
+    bool       grayProbe_ = false;
+    // 0 = use the compiled-in per-platform winding, 1 = force CLOCKWISE,
+    // 2 = force COUNTER_CLOCKWISE. DXR_MODELVIEWER_FRONT_FACE=cw|ccw, or the
+    // Android property `debug.dxr.mv.frontface`. The kill switch for the
+    // winding block in createPipeline(): a wrong call there is undone with a
+    // setprop instead of a rebuild + reinstall.
+    int        frontFaceOverride_ = 0;
+    ModelBuffer facingProbeBuf_;           // host-visible readback staging
+    uint32_t   facingProbeFrame_ = 0;      // frames since the last probe log
+    uint32_t   facingProbePixels_ = 0;     // pixels in the last readback
+    static constexpr uint32_t kFacingProbeEvery = 120; // log 1 frame in N
+    void readFacingProbe();                // after the queue idles in renderEye
     bool createTransmissionTarget(uint32_t w, uint32_t h);
     void captureSceneColor(VkCommandBuffer cmd, uint32_t w, uint32_t h);
     void writeIblSet();                    // (re)write set 2, incl. the transmission image

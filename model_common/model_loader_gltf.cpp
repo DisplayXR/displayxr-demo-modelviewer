@@ -15,6 +15,18 @@
 #define TINYGLTF_NO_STB_IMAGE        // supply a custom image loader (below) that calls
 #define TINYGLTF_NO_STB_IMAGE_WRITE  // the stb already linked from common/ — avoids a
 #include <tiny_gltf.h>               // duplicate stb implementation (and stb-config bugs)
+#include <cstdio>
+
+// Diagnostics have to reach logcat on Android — a NativeActivity has no
+// console, so a std::printf here is a message nobody will ever read. Same text,
+// routed per platform. Init/one-off only; nothing here is per-frame.
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define MV_LOG(...) __android_log_print(ANDROID_LOG_WARN, "model_viewer_vk_android", __VA_ARGS__)
+#else
+#define MV_LOG(...) std::printf(__VA_ARGS__)
+#endif
+
 #include "stb_image.h"               // declarations only; impl is in common/d3d11_renderer.cpp
 
 #include <glm/glm.hpp>
@@ -30,6 +42,9 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+
+
+
 
 namespace {
 
@@ -533,9 +548,9 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         ? loader.LoadBinaryFromFile(&model, &err, &warn, path)
         : loader.LoadASCIIFromFile(&model, &err, &warn, path);
 
-    if (!warn.empty()) std::fprintf(stderr, "[model_loader] warn: %s\n", warn.c_str());
+    if (!warn.empty()) MV_LOG("[model_loader] warn: %s\n", warn.c_str());
     if (!ok) {
-        std::fprintf(stderr, "[model_loader] error: %s\n",
+        MV_LOG("[model_loader] error: %s\n",
                      err.empty() ? "unknown parse error" : err.c_str());
         return false;
     }
@@ -586,8 +601,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
                 if (i) list += ", ";
                 list += out.unsupportedExtensions[i];
             }
-            std::fprintf(stderr,
-                "[model_loader] NOT IMPLEMENTED — %zu extension(s) declared by this "
+            MV_LOG("[model_loader] NOT IMPLEMENTED — %zu extension(s) declared by this "
                 "asset are ignored; affected materials render as their base "
                 "metallic-roughness layer: %s\n",
                 out.unsupportedExtensions.size(), list.c_str());
@@ -601,7 +615,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         const tinygltf::Image& img = model.images[i];
         if (img.image.empty() || img.width <= 0 || img.height <= 0 ||
             img.bits != 8 || img.pixel_type != TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-            std::fprintf(stderr, "[model_loader] image %zu skipped (w=%d h=%d bits=%d comp=%d)\n",
+            MV_LOG("[model_loader] image %zu skipped (w=%d h=%d bits=%d comp=%d)\n",
                          i, img.width, img.height, img.bits, img.component);
             continue;
         }
@@ -678,7 +692,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
 
     out.primitiveCount = (uint32_t)out.primitives.size();
     if (out.primitiveCount == 0 || out.vertices.empty()) {
-        std::fprintf(stderr, "[model_loader] '%s' has no drawable triangle geometry\n", gltfPath);
+        MV_LOG("[model_loader] '%s' has no drawable triangle geometry\n", gltfPath);
         return false;
     }
 
@@ -797,8 +811,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         if (!anim.channels.empty()) out.animations.push_back(std::move(anim));
     }
 
-    std::fprintf(stderr,
-        "[model_loader] '%s': %u prims, %zu verts, %zu indices, %zu materials, "
+    MV_LOG("[model_loader] '%s': %u prims, %zu verts, %zu indices, %zu materials, "
         "%zu nodes, %zu animations\n",
         gltfPath, out.primitiveCount, out.vertices.size(), out.indices.size(),
         out.materials.size(), out.nodes.size(), out.animations.size());

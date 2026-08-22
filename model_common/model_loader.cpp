@@ -12,6 +12,18 @@
  */
 
 #include "model_loader.h"
+#include <cstdio>
+
+// Diagnostics have to reach logcat on Android — a NativeActivity has no
+// console, so a std::printf here is a message nobody will ever read. Same text,
+// routed per platform. Init/one-off only; nothing here is per-frame.
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define MV_LOG(...) __android_log_print(ANDROID_LOG_WARN, "model_viewer_vk_android", __VA_ARGS__)
+#else
+#define MV_LOG(...) std::printf(__VA_ARGS__)
+#endif
+
 #include "model_loader_backends.h"
 
 #include <algorithm>
@@ -19,6 +31,9 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+
+
+
 
 namespace {
 
@@ -64,9 +79,9 @@ bool model_loader_load(const char* path, ModelData& out) {
 #endif
         default:
 #if defined(__ANDROID__)
-            std::fprintf(stderr, "[model_loader] '%s': only glTF is supported on Android\n", path);
+            MV_LOG("[model_loader] '%s': only glTF is supported on Android\n", path);
 #else
-            std::fprintf(stderr, "[model_loader] '%s': unsupported format\n", path);
+            MV_LOG("[model_loader] '%s': unsupported format\n", path);
 #endif
             return false;
     }

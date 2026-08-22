@@ -31,8 +31,12 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 lightDir;     // .xyz = light dir, .w = clipFar (view-space; 0=off)
     mat4 invViewProj;  // (skybox only)
     vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale,
-                       // w=transmission probe (issue #75; 0 = normal shading)
-    vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target
+                       // w=probe select: 0 = normal shading, 1 = transmission
+                       //   probe (#75), 2 = facing probe (#92/#98),
+                       //   3 = transfer-function probe (flat mid-grey, #98)
+    vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target,
+                       // z = DXR_MODELVIEWER_KULLA_CONTY, w = DXR_MODELVIEWER_COAT_SPEC_HEMI
+                       // (NEITHER of these is a spare lane — see model_renderer.h)
 } ubo;
 
 layout(push_constant) uniform Push {
@@ -369,6 +373,7 @@ void main() {
 
     vec3 V = normalize(ubo.cameraPos.xyz - inWorldPos);
     vec3 Ng = normalize(inNormal);
+    vec3 NgRaw = Ng;   // pre-flip geometric normal, for the facing probe below
     // Two-sided: flip the normal for genuinely back-facing triangles (cull is
     // NONE) using the rasterizer's winding, NOT dot(N,V). The view test wrongly
     // flips large flat *front* faces seen near edge-on, sending their normal to
@@ -377,11 +382,13 @@ void main() {
     // to a view test — that regression has already been paid for once.
     //
     // gl_FrontFacing is geometric ONLY when the pipeline's front-face constant
-    // matches the platform's measured facing parity — which differs between
-    // MoltenVK (clockwise, #87) and native Vulkan (counter-clockwise, #92).
-    // Getting it wrong inverts the normal on every visible fragment and turns
-    // all materials into environment mirrors; see the winding block in
-    // ModelRenderer::createPipeline() before touching either side.
+    // is right. It is VK_FRONT_FACE_COUNTER_CLOCKWISE on every platform — the
+    // negative-height viewport in renderEye does NOT reverse the facing test on
+    // any stack that has been measured (MoltenVK, native Vulkan, Adreno), so
+    // glTF's CCW winding survives it. Getting it wrong inverts the normal on
+    // every visible fragment and turns all materials into environment mirrors;
+    // read the winding block in ModelRenderer::createPipeline() — and run the
+    // facing probe — before touching it.
     if (!gl_FrontFacing) Ng = -Ng;
     vec3 frameT, frameB; bool frameValid;
     // An authored TANGENT is continuous across UV seams and well-defined at
@@ -403,6 +410,46 @@ void main() {
     float ndotl = max(dot(N, L), 0.0);
     float ndotv = max(dot(N, V), 1e-4);
     float ndoth = max(dot(N, H), 0.0);
+
+    // ── Facing probe (issues #92 / #98) ───────────────────────────────────
+    // ubo.tone.w == 2 turns every SHADED fragment into a raw measurement of the
+    // rasterizer's facing parity and skips shading entirely. The negative-height
+    // viewport in renderEye reverses Vulkan's signed-area facing test, so the
+    // pipeline's frontFace constant has to match it per platform; when it does
+    // NOT, gl_FrontFacing is false on every visible fragment, the two-sided flip
+    // above inverts N, and dot(N,V) goes to -1 head-on instead of +1 (the whole
+    // #87 signature). This is the one measurement that settles which way a
+    // platform lands. Encoding, read back by ModelRenderer::readFacingProbe():
+    //   R = 0.5 + 0.5*dot(N, V)      shading normal, AFTER the two-sided flip
+    //   G = gl_FrontFacing
+    //   B = 0.5 + 0.5*dot(NgRaw, V)  raw vertex normal, BEFORE the flip
+    //   A = 1                        "geometry was here" (the probe clear is A=0)
+    // R vs B is what separates the two candidate stories: if B decodes positive
+    // head-on (the mesh really is facing us) while R decodes negative, the flip
+    // is firing on fragments it should not, i.e. the winding constant is wrong.
+    // If B is negative too, we are genuinely looking at back faces and the
+    // facing parity is fine. No display transform — these are numbers, not
+    // colours.
+    // ubo.tone.w == 3 is the TRANSFER-FUNCTION probe (#98): paint a flat
+    // display-referred mid-grey (0.5 -> byte 128 in a UNORM target) over the
+    // whole tile. renderEye clears to the same value and skips the sky, so the
+    // frame that reaches the panel is a flat field — immune to the scaling and
+    // the weave that make a screencap of real content useless as a colour
+    // measurement. Read one byte back: 128 means the chain passed the value
+    // through, ~188 means something encoded it a second time.
+    if (ubo.tone.w > 2.5) {
+        outColor = vec4(0.5, 0.5, 0.5, 1.0);
+        outSceneLinear = outColor;
+        return;
+    }
+    if (ubo.tone.w > 1.5) {
+        outColor = vec4(0.5 + 0.5 * dot(N, V),
+                        gl_FrontFacing ? 1.0 : 0.0,
+                        0.5 + 0.5 * dot(NgRaw, V),
+                        1.0);
+        outSceneLinear = outColor;
+        return;
+    }
 
 
     float ior                = MAT.p0.x;
@@ -800,7 +847,7 @@ void main() {
     // exactly once, so a correct sample makes every transmissive surface
     // reproduce the pixels behind it and visually vanish. Enable with
     // DXR_MODELVIEWER_TRANSMISSION_PROBE=1.
-    bool probe = ubo.tone.w > 0.5;
+    bool probe = ubo.tone.w > 0.5 && ubo.tone.w < 1.5;   // transmission probe ONLY
     if (transmissionFactor > 0.0) {
         // Ray through the volume. thickness 0 (a thin surface) degenerates to
         // sampling straight behind the fragment, which is the correct

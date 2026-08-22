@@ -837,8 +837,31 @@ create_swapchains()
 		log_xr_result("xrEnumerateSwapchainFormats(fill)", res);
 		return false;
 	}
-	const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
-	for (int64_t pref : preferred) {
+	for (uint32_t i = 0; i < format_count; ++i) {
+		LOGI("swapchain format[%u] = %lld (0x%llx)", i, (long long)formats[i],
+		     (unsigned long long)formats[i]);
+	}
+	// INV-4.6 says an app should request an sRGB swapchain; this leg has always
+	// hardcoded UNORM instead, and that single choice is what decides WHO applies
+	// the linear->sRGB encode: with UNORM the shader does it (updateUniforms sets
+	// ubo.cameraPos.w = 1), with an sRGB format the shader skips it and the
+	// blit's hardware write does it. The desktop legs take the runtime-preferred
+	// format (displayxr-common SelectColorSwapchainFormat), so the two platforms
+	// can land on different sides of that fork. Switchable so the difference can
+	// be MEASURED on the panel rather than argued from the spec:
+	//     adb shell setprop debug.dxr.mv.srgbswapchain 1
+	// #98.
+	bool prefer_srgb = false;
+	{
+		char v[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.mv.srgbswapchain", v) > 0)
+			prefer_srgb = (v[0] == '1' && v[1] == '\0');
+	}
+	const int64_t preferred_unorm[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
+	const int64_t preferred_srgb[]  = {VK_FORMAT_R8G8B8A8_SRGB,  VK_FORMAT_B8G8R8A8_SRGB};
+	const int64_t *preferred = prefer_srgb ? preferred_srgb : preferred_unorm;
+	LOGI("swapchain format preference: %s (#98 probe)", prefer_srgb ? "SRGB" : "UNORM");
+	for (int64_t pref : {preferred[0], preferred[1]}) {
 		for (uint32_t i = 0; i < format_count && g_swapchain_format == VK_FORMAT_UNDEFINED; ++i) {
 			if (formats[i] == pref) {
 				g_swapchain_format = (VkFormat)pref;
