@@ -603,6 +603,20 @@ bool ModelRenderer::createPipeline() {
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;       // two-sided shading handles back faces
+    // #99 EXPERIMENT, default OFF. DXR_MODELVIEWER_CULL_BACKFACES=1|2 turns on
+    // back-face culling (1 = cull VK_CULL_MODE_BACK, 2 = cull FRONT — which of
+    // the two is the geometric back face depends on the same negative-viewport
+    // facing parity #87/#92 is about, so the side is chosen by measurement, not
+    // theory). This exists to quantify how much of the orientation-dependent
+    // frame-time swing in #99 is back-face fragment work; it is NOT a shipping
+    // path and stays off unless the variable is set.
+    if (const char *cull = std::getenv("DXR_MODELVIEWER_CULL_BACKFACES")) {
+        if (cull[0] == '1') rs.cullMode = VK_CULL_MODE_BACK_BIT;
+        else if (cull[0] == '2') rs.cullMode = VK_CULL_MODE_FRONT_BIT;
+        if (rs.cullMode != VK_CULL_MODE_NONE)
+            std::fprintf(stderr, "[modelviewer] #99 experiment: cullMode=%s\n",
+                         cull[0] == '1' ? "BACK" : "FRONT");
+    }
     // Front-face winding is PER-PLATFORM, and both sides are empirical.
     //
     // The #87 analysis (unconditional CLOCKWISE, v0.21.1) held on macOS: under

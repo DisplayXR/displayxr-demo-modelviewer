@@ -277,6 +277,35 @@ std::atomic<float> g_user_yaw{0.0f};    // single-finger horizontal drag → yaw
 std::atomic<float> g_user_pitch{0.0f};  // single-finger vertical drag → pitch
 std::atomic<bool> g_user_rotated{false};
 
+// ── #99 drag probe (setprop debug.dxr.mv.dragprobe 1) ───────────────────────
+// Diagnostic only, OFF by default. While a single-finger drag is in flight it
+// records ONE sample per rendered frame — {yaw, frame dt, MOVE events consumed
+// by that frame} — into a fixed ring, and dumps the whole series in a single
+// burst when the finger lifts. Deliberately NOT a per-frame log: #99 is about
+// smoothness, so logging inside the frame would change what it measures.
+bool g_drag_probe = false;
+std::atomic<bool> g_drag_active{false};    // a one-finger drag is in progress
+std::atomic<uint32_t> g_touch_moves{0};    // free-running ACTION_MOVE counter
+std::atomic<bool> g_probe_reset{false};    // ACTION_DOWN  → clear the ring
+std::atomic<bool> g_probe_dump{false};     // ACTION_UP    → dump the ring
+struct DragProbeSample {
+	float yaw_deg;    // model yaw this frame
+	uint32_t dt_us;   // wall time since the previous recorded frame
+	uint32_t moves;   // touch MOVE events that landed since that frame
+	uint32_t render_us;  // wall time inside the renderEye loop (all tiles)
+};
+constexpr int kDragProbeMax = 480;
+DragProbeSample g_drag_probe_buf[kDragProbeMax];
+int g_drag_probe_n = 0;                    // render thread only
+
+int64_t
+now_us_mono()
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
 std::atomic<int> g_display_rotation{0};
 std::atomic<bool> g_runtime_unavailable{false};
 uint64_t g_frame_count = 0;
@@ -1234,6 +1263,61 @@ render_frame()
 			        : (float)(g_frame_count - g_spin_base.load(std::memory_order_relaxed)) *
 			              g_spin_speed;
 			const Mat4 splat_model = build_splat_model(yaw);
+			// #99 drag probe: one sample per rendered frame while a drag is in
+			// flight; the burst dump happens after the frame (see below).
+			if (g_drag_probe) {
+				static int64_t probe_prev_us = 0;
+				static uint32_t probe_prev_moves = 0;
+				const int64_t t_us = now_us_mono();
+				if (g_probe_reset.exchange(false, std::memory_order_relaxed)) {
+					g_drag_probe_n = 0;
+					probe_prev_us = 0;
+				}
+				const uint32_t mv = g_touch_moves.load(std::memory_order_relaxed);
+				if (g_drag_active.load(std::memory_order_relaxed) &&
+				    g_drag_probe_n < kDragProbeMax) {
+					g_drag_probe_buf[g_drag_probe_n++] = {
+					    yaw * 57.2957795f,
+					    (uint32_t)(probe_prev_us ? (t_us - probe_prev_us) : 0),
+					    mv - probe_prev_moves, 0u};
+				}
+				probe_prev_us = t_us;
+				probe_prev_moves = mv;
+				// Finger lifted → dump the whole series in one burst. 8 samples
+				// per line: yaw(deg) / frame dt(ms) / MOVEs consumed.
+				if (g_probe_dump.exchange(false, std::memory_order_relaxed) &&
+				    g_drag_probe_n > 0) {
+					uint32_t dt_min = 0xffffffffu, dt_max = 0, dt_sum = 0, dt_n = 0;
+					for (int i = 0; i < g_drag_probe_n; ++i) {
+						const uint32_t d = g_drag_probe_buf[i].dt_us;
+						if (d == 0) continue;
+						if (d < dt_min) dt_min = d;
+						if (d > dt_max) dt_max = d;
+						dt_sum += d;
+						++dt_n;
+					}
+					LOGI("dragprobe: samples are yaw/dt_ms/render_ms/moves");
+					LOGI("dragprobe: n=%d yaw %.1f->%.1f deg  dt ms min=%.1f avg=%.1f max=%.1f",
+					     g_drag_probe_n, g_drag_probe_buf[0].yaw_deg,
+					     g_drag_probe_buf[g_drag_probe_n - 1].yaw_deg,
+					     dt_n ? dt_min / 1000.0 : 0.0,
+					     dt_n ? (double)dt_sum / dt_n / 1000.0 : 0.0,
+					     dt_n ? dt_max / 1000.0 : 0.0);
+					char line[512];
+					for (int i = 0; i < g_drag_probe_n; i += 8) {
+						int n = snprintf(line, sizeof(line), "dragprobe[%03d]", i);
+						for (int j = i; j < i + 8 && j < g_drag_probe_n; ++j) {
+							n += snprintf(line + n, sizeof(line) - (size_t)n,
+							              " %.1f/%.1f/%.1f/%u", g_drag_probe_buf[j].yaw_deg,
+							              g_drag_probe_buf[j].dt_us / 1000.0,
+							              g_drag_probe_buf[j].render_us / 1000.0,
+							              g_drag_probe_buf[j].moves);
+						}
+						LOGI("%s", line);
+					}
+					g_drag_probe_n = 0;
+				}
+			}
 			// Advance glTF animation (bind pose if the model has none). ~60 fps dt.
 			g_model.updateAnimation(1.0f / 60.0f);
 
@@ -1253,6 +1337,7 @@ render_frame()
 				res = xrWaitSwapchainImage(g_views[0].swapchain, &wait_img);
 			}
 			if (res == XR_SUCCESS) {
+				const int64_t render_t0 = g_drag_probe ? now_us_mono() : 0;
 				for (uint32_t i = 0; i < view_count; ++i) {
 					const uint32_t tile_x = (i % cols) * tile_w;
 					const uint32_t tile_y = (i / cols) * tile_h;
@@ -1287,6 +1372,13 @@ render_frame()
 					projection_views[i].subImage.imageRect.offset = {(int32_t)tile_x, (int32_t)tile_y};
 					projection_views[i].subImage.imageRect.extent = {(int32_t)tile_w, (int32_t)tile_h};
 					projection_views[i].subImage.imageArrayIndex = 0;
+				}
+				// #99 probe: attribute this frame's renderEye cost to the
+				// sample recorded above (renderEye ends in vkQueueWaitIdle, so
+				// this is real GPU time, not just record time).
+				if (g_drag_probe && g_drag_probe_n > 0) {
+					g_drag_probe_buf[g_drag_probe_n - 1].render_us =
+					    (uint32_t)(now_us_mono() - render_t0);
 				}
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
@@ -1568,6 +1660,8 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
 		drag_x = x0;
 		drag_y = y0;
 		drag_valid = true;
+		g_drag_active.store(true, std::memory_order_relaxed);   // #99 probe
+		g_probe_reset.store(true, std::memory_order_relaxed);
 		// Seed user yaw from the turntable angle so the first drag doesn't snap.
 		if (!g_user_rotated.load(std::memory_order_relaxed)) {
 			g_user_yaw.store(
@@ -1576,6 +1670,7 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
 			    std::memory_order_relaxed);
 		}
 	} else if (action == kMove && drag_valid) {
+		g_touch_moves.fetch_add(1, std::memory_order_relaxed);  // #99 probe
 		const float dx = x0 - drag_x, dy = y0 - drag_y;
 		drag_x = x0;
 		drag_y = y0;
@@ -1588,6 +1683,8 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
 		g_user_rotated.store(true, std::memory_order_relaxed);
 	} else if (action == kUp) {
 		drag_valid = false;
+		g_drag_active.store(false, std::memory_order_relaxed);  // #99 probe
+		g_probe_dump.store(true, std::memory_order_relaxed);
 	}
 }
 
@@ -1704,6 +1801,21 @@ android_main(struct android_app *app)
 			g_use_ws_ui = (prop[0] == '1');
 		}
 		LOGI("button UI: %s", g_use_ws_ui ? "window-space layer (#506 test)" : "Kotlin widget bar");
+		// #99 back-face-cull EXPERIMENT — diagnostic, OFF by default. The
+		// shared renderer reads this as an env var; Android has no env, so
+		// bridge the system prop into one before the renderer is created.
+		char cull[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.mv.cull", cull) > 0 &&
+		    (cull[0] == '1' || cull[0] == '2')) {
+			setenv("DXR_MODELVIEWER_CULL_BACKFACES", cull, 1);
+			LOGI("#99 experiment: back-face culling ON (debug.dxr.mv.cull=%s)", cull);
+		}
+		// #99 drag probe — diagnostic, OFF unless explicitly asked for.
+		char dp[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.mv.dragprobe", dp) > 0 && dp[0] == '1') {
+			g_drag_probe = true;
+			LOGI("drag probe: ON (debug.dxr.mv.dragprobe=1)");
+		}
 	}
 	app->onAppCmd = handle_cmd;
 	// Touch is NOT consumed via app->onInputEvent: the runtime's MonadoView
