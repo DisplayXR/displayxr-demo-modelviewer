@@ -32,7 +32,8 @@ layout(set = 0, binding = 0) uniform UBO {
     mat4 invViewProj;  // (skybox only)
     vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale,
                        // w=transmission probe (issue #75; 0 = normal shading)
-    vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target
+    vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target,
+                       // z = facing probe (#92/#98; 0 = normal shading), w = unused
 } ubo;
 
 layout(push_constant) uniform Push {
@@ -403,6 +404,26 @@ void main() {
     float ndotl = max(dot(N, L), 0.0);
     float ndotv = max(dot(N, V), 1e-4);
     float ndoth = max(dot(N, H), 0.0);
+
+    // ── Facing probe (issues #92 / #98) ───────────────────────────────────
+    // ubo.viewport.z turns every SHADED fragment into a raw measurement of the
+    // rasterizer's facing parity and skips shading entirely. The negative-height
+    // viewport in renderEye reverses Vulkan's signed-area facing test, so the
+    // pipeline's frontFace constant has to match it per platform; when it does
+    // NOT, gl_FrontFacing is false on every visible fragment, the two-sided flip
+    // above inverts N, and dot(N,V) goes to -1 head-on instead of +1 (the whole
+    // #87 signature). This is the one measurement that settles which way a
+    // platform lands. Encoding, read back by ModelRenderer::readFacingProbe():
+    //   R = 0.5 + 0.5*dot(N,V)   (head-on must decode to ~+1)
+    //   G = gl_FrontFacing
+    //   B = 0                    ("geometry was here"; the probe clear has B=1)
+    // No display transform is applied — the value is a number, not a colour.
+    if (ubo.viewport.z > 0.5) {
+        float dnv = dot(N, V);
+        outColor = vec4(0.5 + 0.5 * dnv, gl_FrontFacing ? 1.0 : 0.0, 0.0, 1.0);
+        outSceneLinear = outColor;
+        return;
+    }
 
 
     float ior                = MAT.p0.x;
