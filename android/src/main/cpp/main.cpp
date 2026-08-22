@@ -284,6 +284,10 @@ std::atomic<bool> g_user_rotated{false};
 // burst when the finger lifts. Deliberately NOT a per-frame log: #99 is about
 // smoothness, so logging inside the frame would change what it measures.
 bool g_drag_probe = false;
+// Re-arm a one-finger drag when a pinch drops back to one finger. ON by
+// default (it fixes a dead-rotation bug); `setprop debug.dxr.mv.pinchrearm 0`
+// restores the old behaviour without a rebuild.
+bool g_pinch_rearm = true;
 std::atomic<bool> g_drag_active{false};    // a one-finger drag is in progress
 std::atomic<uint32_t> g_touch_moves{0};    // free-running ACTION_MOVE counter
 std::atomic<bool> g_probe_reset{false};    // ACTION_DOWN  → clear the ring
@@ -1656,19 +1660,31 @@ Java_com_displayxr_model_1viewer_1vk_1android_MainActivity_nativeOnTouch(
 
 	// ── one finger: drag to orbit (horizontal = yaw, vertical = pitch) ──
 	constexpr float kYawPerPx = 0.01f, kPitchPerPx = 0.01f, kPitchLimit = 1.3f;
-	if (action == kDown) {
-		drag_x = x0;
-		drag_y = y0;
+	// Anchor the gesture on the pointer that is actually down, and seed the
+	// user yaw from the turntable angle so the first drag doesn't snap.
+	auto arm_drag = [&](float ax, float ay) {
+		drag_x = ax;
+		drag_y = ay;
 		drag_valid = true;
 		g_drag_active.store(true, std::memory_order_relaxed);   // #99 probe
-		g_probe_reset.store(true, std::memory_order_relaxed);
-		// Seed user yaw from the turntable angle so the first drag doesn't snap.
 		if (!g_user_rotated.load(std::memory_order_relaxed)) {
 			g_user_yaw.store(
 			    (float)(g_frame_count - g_spin_base.load(std::memory_order_relaxed)) *
 			        g_spin_speed,
 			    std::memory_order_relaxed);
 		}
+	};
+	if (action == kDown) {
+		arm_drag(x0, y0);
+		g_probe_reset.store(true, std::memory_order_relaxed);   // #99 probe
+	} else if (action == kMove && !drag_valid && g_pinch_rearm) {
+		// Re-arm after a pinch. ACTION_POINTER_UP still reports pointerCount==2,
+		// so the `count >= 2` arm above had already cleared drag_valid and only
+		// ACTION_DOWN used to set it again — which left rotation dead from the
+		// moment a second finger lifted until the user let go completely and
+		// touched down afresh. Re-anchoring on the surviving pointer here costs
+		// one no-op frame and no jump (dx/dy are measured from this sample on).
+		arm_drag(x0, y0);
 	} else if (action == kMove && drag_valid) {
 		g_touch_moves.fetch_add(1, std::memory_order_relaxed);  // #99 probe
 		const float dx = x0 - drag_x, dy = y0 - drag_y;
@@ -1801,6 +1817,11 @@ android_main(struct android_app *app)
 			g_use_ws_ui = (prop[0] == '1');
 		}
 		LOGI("button UI: %s", g_use_ws_ui ? "window-space layer (#506 test)" : "Kotlin widget bar");
+		char pr[PROP_VALUE_MAX] = {};
+		if (__system_property_get("debug.dxr.mv.pinchrearm", pr) > 0 && pr[0] == '0') {
+			g_pinch_rearm = false;
+			LOGI("pinch re-arm: OFF (debug.dxr.mv.pinchrearm=0)");
+		}
 		// #99 back-face-cull EXPERIMENT — diagnostic, OFF by default. The
 		// shared renderer reads this as an env var; Android has no env, so
 		// bridge the system prop into one before the renderer is created.
