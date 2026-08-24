@@ -26,6 +26,7 @@
 // plain C with no platform deps, so it serves as the decl source on Android.
 #include <openxr/XR_DXR_cocoa_window_binding.h>
 
+#include <algorithm>
 #include <atomic>
 #include <android/native_window.h>
 #include <vector>
@@ -1257,8 +1258,18 @@ render_frame()
 				clock_gettime(CLOCK_MONOTONIC, &ts_dbnc);
 				const int64_t now_dbnc =
 				    (int64_t)ts_dbnc.tv_sec * 1000000000ll + ts_dbnc.tv_nsec;
+				// Gate on a RELATIVE aspect change, not an absolute epsilon.
+				// Measured: rotating passes through 1600x2500 (nav-bar insets)
+				// and HOLDS it for ~770 ms before settling at 1600x2560 -- far
+				// too long for a time debounce to absorb without making every
+				// real rotation feel laggy. But that transient is only a 2.4%
+				// aspect change, while an actual rotation is ~156%. Below this
+				// threshold a refit costs more than it buys: the animation is
+				// visible, the framing gain is not.
+				constexpr float kMinAspectChange = 0.05f; // 5%
 				const bool differs =
-				    g_fit_vp_aspect > 0.0f && std::fabs(a - g_fit_vp_aspect) > 1e-3f;
+				    g_fit_vp_aspect > 0.0f &&
+				    std::fabs(a - g_fit_vp_aspect) / g_fit_vp_aspect > kMinAspectChange;
 				if (!differs) {
 					s_pending_since_ns = 0;
 				} else if (std::fabs(a - s_pending_a) > 1e-3f) {
@@ -1557,13 +1568,40 @@ render_frame()
 	}
 
 	g_frame_count++;
-	if ((g_frame_count % 120) == 0) {
-		static auto last = std::chrono::steady_clock::now();
-		auto now = std::chrono::steady_clock::now();
-		double ms = std::chrono::duration<double, std::milli>(now - last).count() / 120.0;
-		last = now;
-		LOGI("frame %llu  ~%.1f ms/frame (%.1f fps)", (unsigned long long)g_frame_count,
-		     ms, ms > 0.0 ? 1000.0 / ms : 0.0);
+	// Frame PACING, not just the average: the auto-spin advances a fixed angle
+	// per frame, so a stuttering spin is by definition irregular frame delivery,
+	// and a 120-frame mean cannot see it. Keep every dt in the window and report
+	// the distribution -- max, p95, and how many frames ran long -- so a
+	// "stutters" report can be matched to numbers instead of argued about.
+	{
+		static auto last_frame = std::chrono::steady_clock::now();
+		static float dts[120];
+		static int ndt = 0;
+		const auto now = std::chrono::steady_clock::now();
+		const float dt = std::chrono::duration<float, std::milli>(now - last_frame).count();
+		last_frame = now;
+		if (ndt < 120) dts[ndt++] = dt;
+		if ((g_frame_count % 120) == 0) {
+			float sum = 0.0f, mx = 0.0f;
+			for (int i = 0; i < ndt; ++i) { sum += dts[i]; if (dts[i] > mx) mx = dts[i]; }
+			const float mean = ndt > 0 ? sum / (float)ndt : 0.0f;
+			// p95 via a partial sort of a copy; 120 floats, trivially cheap.
+			float sorted[120];
+			for (int i = 0; i < ndt; ++i) sorted[i] = dts[i];
+			std::sort(sorted, sorted + ndt);
+			const float p50 = ndt > 0 ? sorted[ndt / 2] : 0.0f;
+			const float p95 = ndt > 0 ? sorted[(ndt * 95) / 100] : 0.0f;
+			int over2x = 0, over40 = 0;
+			for (int i = 0; i < ndt; ++i) {
+				if (dts[i] > 2.0f * p50) over2x++;
+				if (dts[i] > 40.0f) over40++;
+			}
+			LOGI("frame %llu  mean %.1f ms (%.1f fps)  p50 %.1f  p95 %.1f  max %.1f  "
+			     ">2xmedian %d  >40ms %d  [n=%d]",
+			     (unsigned long long)g_frame_count, mean, mean > 0.0f ? 1000.0f / mean : 0.0f,
+			     p50, p95, mx, over2x, over40, ndt);
+			ndt = 0;
+		}
 	}
 	return true;
 }
