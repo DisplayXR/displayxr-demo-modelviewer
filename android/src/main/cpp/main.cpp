@@ -782,10 +782,26 @@ enumerate_rendering_modes()
 		if (m.isActive) {
 			g_rmode_current.store(m.modeIndex, std::memory_order_relaxed);
 			g_rmode_requestable = m.isRequestable;
-			// Panel px = per-view px × the tile grid (the mode's anamorphic
-			// view scale cancels out), i.e. the aspect the user actually sees.
-			g_disp_px_w = m.viewWidthPixels * (m.tileColumns > 0 ? m.tileColumns : 1);
-			g_disp_px_h = m.viewHeightPixels * (m.tileRows > 0 ? m.tileRows : 1);
+			// Panel px = per-view px / the mode's view scale. This is
+			// displayxr-common's dxr::PanelPixelsFromView (common/auto_fit.h);
+			// inlined because the Android build cannot link displayxr_common_lib
+			// (it carries Win32/AppKit sources) — adopting displayxr::rules is
+			// the follow-up.
+			//
+			// It is NOT per-view px × the tile grid. That yields the ATLAS, and
+			// the two agree only when view_scale == 1/tile_count. This panel
+			// breaks it: 2x1 tiles at scale 0.750x0.750 on a 2560x1600 panel
+			// gives per-view 1920x1200, so the tile form reported 3840x1200 —
+			// aspect 3.200 where the panel is 1.600. The runtime's own DP log
+			// agrees: "HW_GEO: view=1920x1200 (aspect 1.600) tiles=2x1
+			// atlas=3840x1200". A 2x-too-wide aspect halves AutoFitVHeight's
+			// extentW/(fill*aspect) term, so the width cap stopped binding and
+			// the load-time fit silently degraded to height-only — which this
+			// very function's own log line confessed as "bound-by=height".
+			const float sx = m.viewScaleX > 0.0f ? m.viewScaleX : 1.0f;
+			const float sy = m.viewScaleY > 0.0f ? m.viewScaleY : 1.0f;
+			g_disp_px_w = (uint32_t)((float)m.viewWidthPixels / sx + 0.5f);
+			g_disp_px_h = (uint32_t)((float)m.viewHeightPixels / sy + 0.5f);
 		}
 		LOGI("RMODE[%u] idx=%u \"%s\" views=%u scale=(%.3f,%.3f) hw3D=%d tiles=%ux%u "
 		     "%ux%u active=%d requestable=%d",
