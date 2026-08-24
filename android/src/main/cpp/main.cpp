@@ -1267,9 +1267,16 @@ render_frame()
 				// threshold a refit costs more than it buys: the animation is
 				// visible, the framing gain is not.
 				constexpr float kMinAspectChange = 0.05f; // 5%
+				// A load with NO viewport yet (the canvas arrives with the
+				// first frame, so the load-time fit was height-only and stored
+				// aspect 0) must count as "differs": the first valid aspect IS
+				// the refit that replaces that bootstrap. Guarding on a prior
+				// aspect > 0 here silently disabled the mechanism for exactly
+				// that case -- caught on device as `zone=0x0` at load followed
+				// by no refit ever, on rotation or otherwise.
 				const bool differs =
-				    g_fit_vp_aspect > 0.0f &&
-				    std::fabs(a - g_fit_vp_aspect) / g_fit_vp_aspect > kMinAspectChange;
+				    (g_fit_vp_aspect <= 0.0f) ||
+				    (std::fabs(a - g_fit_vp_aspect) / g_fit_vp_aspect > kMinAspectChange);
 				if (!differs) {
 					s_pending_since_ns = 0;
 				} else if (std::fabs(a - s_pending_a) > 1e-3f) {
