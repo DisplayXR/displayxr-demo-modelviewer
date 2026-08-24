@@ -220,6 +220,52 @@ now_ms()
 bool g_has_view_rig = false;
 float g_rig_vh = 1.33f;  // virtual display height (app units); refit per model
 
+// ── Viewport-change refit ───────────────────────────────────────────────────
+// vHeight is a function of (content, viewport), so it must be re-derived
+// whenever the viewport changes -- rotation loudly (a 2560x1600 panel held
+// portrait is a 1600x2560 viewport), a zone-rect change quietly. Policy and
+// rationale: displayxr-common common/auto_fit.h, "WHEN TO RECOMPUTE".
+//
+// The user's deviation is preserved for free here: pinch drives g_scene_scale,
+// which is CONTENT-side, while g_rig_vh is VIEWPORT-side. Moving only the base
+// leaves the model's world size untouched, so a zoomed-in user keeps their
+// apparent size across a rotation instead of the subject jumping.
+//
+// Scalar mirror of dxr::FitTransition (same SmoothStep curve, same "starts
+// landed" convention). Inlined because the Android build cannot link
+// displayxr_common_lib -- adopting the header-only displayxr::rules target is
+// the follow-up that retires every copy of this.
+float g_fit_ext_w = 0.0f;   // cached CONTENT extents (already fit-scaled)
+float g_fit_ext_h = 0.0f;
+float g_fit_vp_aspect = 0.0f; // aspect the current base was derived from
+float g_refit_from = 0.0f;
+float g_refit_to = 0.0f;
+float g_refit_t = 1.0f;      // 1 = landed
+constexpr float kRefitDurationS = 0.2f;
+
+inline float
+refit_curve(float x)
+{
+	if (x <= 0.0f) return 0.0f;
+	if (x >= 1.0f) return 1.0f;
+	return x * x * (3.0f - 2.0f * x);
+}
+
+//! Seconds since the previous call. Clamped so a backgrounded app does not
+//! land the move instantly on resume -- that is the snap this avoids.
+inline float
+refit_dt_s()
+{
+	static int64_t prev_ns = 0;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	const int64_t now_ns = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+	if (prev_ns == 0) { prev_ns = now_ns; return 0.0f; }
+	const float dt = (float)(now_ns - prev_ns) * 1e-9f;
+	prev_ns = now_ns;
+	return (dt > 0.1f) ? 0.1f : dt;
+}
+
 constexpr uint32_t kViewCount = 2;
 
 struct PerView
@@ -1031,6 +1077,12 @@ load_model_path(const char *path)
 			}
 		}
 		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize / kAutoFitFill;
+		// Cache for the viewport-change refit. The extents are CONTENT
+		// properties, so a rotation re-derives the base without re-measuring.
+		g_fit_ext_w = fit_w;
+		g_fit_ext_h = fit_h;
+		g_fit_vp_aspect = have_vp ? vp_aspect : 0.0f;
+		g_refit_t = 1.0f; // landed
 		const char *bound_by = !have_vp                      ? "height (no viewport)"
 		                       : (fit_w / vp_aspect > fit_h) ? "width"
 		                                                     : "height";
@@ -1182,6 +1234,40 @@ render_frame()
 		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
 		XrViewDisplayRawDXR view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 		const XrPosef rig_pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		// Viewport-change refit: the live canvas rect is orientation-aware, so
+		// a rotation shows up here as a new aspect. Gate on the ASPECT, not the
+		// pixel size -- an intermediate size mid-rotation that lands on the same
+		// aspect must not retrigger -- and RETARGET in flight rather than
+		// restarting, so a two-step settle cannot snap back.
+		{
+			const uint32_t cw = g_win_px_w.load(std::memory_order_relaxed);
+			const uint32_t ch = g_win_px_h.load(std::memory_order_relaxed);
+			if (cw > 0 && ch > 0 && g_fit_ext_h > 0.0f) {
+				const float a = (float)cw / (float)ch;
+				if (g_fit_vp_aspect > 0.0f &&
+				    std::fabs(a - g_fit_vp_aspect) > 1e-3f) {
+					float vh = g_fit_ext_h / kAutoFitFill;
+					const float vh_w = g_fit_ext_w / (kAutoFitFill * a);
+					if (vh_w > vh) vh = vh_w;
+					if (vh > 1e-3f) {
+						g_refit_from = g_rig_vh;
+						g_refit_to = vh;
+						g_refit_t = 0.0f;
+						g_fit_vp_aspect = a;
+						LOGI("refit: viewport=%ux%u aspect=%.3f base %.2f -> %.2f "
+						     "(scene scale %.2f preserved)",
+						     cw, ch, a, g_refit_from, vh,
+						     g_scene_scale.load(std::memory_order_relaxed));
+					}
+				}
+			}
+			if (g_refit_t < 1.0f) {
+				g_refit_t += refit_dt_s() / kRefitDurationS;
+				if (g_refit_t > 1.0f) g_refit_t = 1.0f;
+				g_rig_vh = g_refit_from +
+				           (g_refit_to - g_refit_from) * refit_curve(g_refit_t);
+			}
+		}
 		const float rig_vh = g_rig_vh;
 		if (g_has_view_rig) {
 			display_rig.pose = rig_pose;
