@@ -27,6 +27,7 @@
 #include <openxr/XR_DXR_cocoa_window_binding.h>
 
 #include <atomic>
+#include <android/native_window.h>
 #include <vector>
 #include <chrono>
 #include <cmath>
@@ -180,6 +181,13 @@ std::atomic<uint32_t> g_win_px_h{0};
 // rect arrives with the first frame.
 uint32_t g_disp_px_w = 0;
 uint32_t g_disp_px_h = 0;
+// The app's own window, captured at APP_CMD_INIT_WINDOW. Unlike g_disp_px
+// (the NATIVE panel, which is 2560x1600 whichever way up the device is held)
+// this tracks ORIENTATION, so it is the correct load-time viewport before the
+// live canvas rect arrives. A portrait launch is 1600x2560 = aspect 0.625,
+// where the panel would claim 1.600 and leave the fit height-bound.
+std::atomic<uint32_t> g_native_win_px_w{0};
+std::atomic<uint32_t> g_native_win_px_h{0};
 
 constexpr int64_t kUiHideMs = 5000;  // idle time before the bar starts fading
 constexpr int64_t kUiFadeMs = 400;   // fade-out duration
@@ -997,8 +1005,16 @@ load_model_path(const char *path)
 		// the active mode's panel px (this runs before the first frame).
 		// Mirrors displayxr-common auto_fit.h AutoFitVHeight — inlined because
 		// the Android leg does not pull displayxr-common.
+		// Live canvas > app window > native panel. The panel is LAST because
+		// it is orientation-blind: display-derived px stay 2560x1600 in
+		// portrait, where the real viewport is 1600x2560, and the fit then
+		// stays height-bound and the model overflows sideways.
 		uint32_t vp_w = g_win_px_w.load(std::memory_order_relaxed);
 		uint32_t vp_h = g_win_px_h.load(std::memory_order_relaxed);
+		if (vp_w == 0 || vp_h == 0) {
+			vp_w = g_native_win_px_w.load(std::memory_order_relaxed);
+			vp_h = g_native_win_px_h.load(std::memory_order_relaxed);
+		}
 		if (vp_w == 0 || vp_h == 0) {
 			vp_w = g_disp_px_w;
 			vp_h = g_disp_px_h;
@@ -1479,6 +1495,16 @@ handle_cmd(struct android_app *app, int32_t cmd)
 	switch (cmd) {
 	case APP_CMD_INIT_WINDOW:
 		LOGI("APP_CMD_INIT_WINDOW (window=%p)", app->window);
+		if (app->window != nullptr) {
+			const int32_t nw = ANativeWindow_getWidth(app->window);
+			const int32_t nh = ANativeWindow_getHeight(app->window);
+			if (nw > 0 && nh > 0) {
+				g_native_win_px_w.store((uint32_t)nw, std::memory_order_relaxed);
+				g_native_win_px_h.store((uint32_t)nh, std::memory_order_relaxed);
+				LOGI("window px = %dx%d (aspect %.3f) — load-time fit viewport",
+				     nw, nh, (float)nw / (float)nh);
+			}
+		}
 		if (g_instance == XR_NULL_HANDLE) {
 			bool ok =
 			    create_instance(app) &&
