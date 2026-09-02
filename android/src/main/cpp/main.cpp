@@ -1408,6 +1408,48 @@ render_frame()
 				if (tile_w > max_tw) tile_w = max_tw;
 				if (tile_h > max_th) tile_h = max_th;
 			}
+			// ── #100 view probe (OFF by default; `setprop debug.dxr.mv.viewprobe 1`) ──
+			// Every 120 frames dump the active mode's tiling + the runtime's
+			// per-view pose/FOV so 2D (view_count=1) and 3D (2) can be compared.
+			// `hcen` is the frustum's horizontal asymmetry in degrees: ~0 means a
+			// centred frustum, non-zero means an off-axis (eye-offset) one.
+			bool probe = false;
+			if ((g_frame_count % 120) == 0) {
+				char pv[PROP_VALUE_MAX] = {0};
+				if (__system_property_get("debug.dxr.mv.viewprobe", pv) > 0 && atoi(pv) != 0)
+					probe = true;
+			}
+			if (probe) {
+				const uint32_t pm = g_rmode_current.load(std::memory_order_relaxed);
+				LOGI("VIEWPROBE mode=%u(%s) located=%u vc=%u grid=%ux%u scale=(%.3f,%.3f) "
+				     "canvas=%ux%u tile=%ux%u atlas=%ux%u rawEyes=%u tracking=%d "
+				     "canvasRect=(%d,%d %dx%d)",
+				     pm, (pm < 8 && g_rmode_names[pm][0]) ? g_rmode_names[pm] : "?", located,
+				     view_count, cols, rows,
+				     (pm < 8) ? g_rmode_scale_x[pm] : 0.0f, (pm < 8) ? g_rmode_scale_y[pm] : 0.0f,
+				     g_win_px_w.load(std::memory_order_relaxed),
+				     g_win_px_h.load(std::memory_order_relaxed), tile_w, tile_h,
+				     g_views[0].width, g_views[0].height, view_raw.eyeCountOutput,
+				     (int)view_raw.isTracking, view_raw.canvasRectPx.offset.x,
+				     view_raw.canvasRectPx.offset.y, view_raw.canvasRectPx.extent.width,
+				     view_raw.canvasRectPx.extent.height);
+				for (uint32_t pi = 0; pi < (located < kViewCount ? located : kViewCount); ++pi) {
+					const float r2d = 57.2957795f;
+					LOGI("VIEWPROBE   view[%u]%s pose=(%.4f,%.4f,%.4f) "
+					     "fov L=%.3f R=%.3f U=%.3f D=%.3f hcen=%.4f vcen=%.4f",
+					     pi, pi < view_count ? "*" : " ", views[pi].pose.position.x,
+					     views[pi].pose.position.y, views[pi].pose.position.z,
+					     views[pi].fov.angleLeft * r2d, views[pi].fov.angleRight * r2d,
+					     views[pi].fov.angleUp * r2d, views[pi].fov.angleDown * r2d,
+					     (views[pi].fov.angleLeft + views[pi].fov.angleRight) * 0.5f * r2d,
+					     (views[pi].fov.angleUp + views[pi].fov.angleDown) * 0.5f * r2d);
+				}
+				for (uint32_t pi = 0; pi < view_raw.eyeCountOutput && pi < 8; ++pi) {
+					LOGI("VIEWPROBE   rawEye[%u]=(%.4f,%.4f,%.4f)", pi,
+					     view_raw.rawEyes[pi].x, view_raw.rawEyes[pi].y,
+					     view_raw.rawEyes[pi].z);
+				}
+			}
 			// Splat model (recenter + flip + spin + push) — same for both eyes.
 			const float yaw =
 			    g_user_rotated.load(std::memory_order_relaxed)
