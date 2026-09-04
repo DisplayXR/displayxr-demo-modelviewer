@@ -672,6 +672,22 @@ static bool McpJsonGetNumber(const char* json, const char* key, double& out) {
     return true;
 }
 
+// Extract "key": true|false. False when the key is absent or its value is not
+// a JSON boolean — so an omitted argument keeps whatever default the caller
+// pre-loaded into `out` (set_transparent_background relies on that to toggle).
+static bool McpJsonGetBool(const char* json, const char* key, bool& out) {
+    std::string pat = "\"" + std::string(key) + "\"";
+    const char* k = strstr(json, pat.c_str());
+    if (!k) return false;
+    const char* c = strchr(k + pat.size(), ':');
+    if (!c) return false;
+    c++;
+    while (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r') c++;
+    if (strncmp(c, "true", 4) == 0)  { out = true;  return true; }
+    if (strncmp(c, "false", 5) == 0) { out = false; return true; }
+    return false;
+}
+
 // Late (un)registration of the animation tools. They exist only while a model
 // with clips is loaded, so each transition makes the runtime broadcast the MCP
 // tool-list change to connected agents. Called from
@@ -798,6 +814,7 @@ static std::string McpDispatchToolCall(const std::string& toolName,
                  "\"active_animation_name\":%s,\"animation_playing\":%s,"
                  "\"camera\":{\"azimuth_deg\":%.1f,\"elevation_deg\":%.1f,"
                  "\"position\":[%.3f,%.3f,%.3f],\"zoom\":%.2f},"
+                 "\"transparent_background\":%s,"
                  "\"rendering_mode\":%u,\"session_running\":%s}",
                  McpJsonEscape(file).c_str(),
                  g_modelRenderer.hasModel() ? "true" : "false",
@@ -806,6 +823,7 @@ static std::string McpDispatchToolCall(const std::string& toolName,
                  hasClip ? ci : -1, clipJson.c_str(),
                  (hasClip && playing) ? "true" : "false",
                  azDeg, elDeg, px, py, pz, zoom,
+                 g_transparentBg.load() ? "true" : "false",
                  g_xr ? g_xr->currentModeIndex : 0u,
                  (g_xr && g_xr->sessionRunning) ? "true" : "false");
         result = buf;
@@ -854,6 +872,23 @@ static std::string McpDispatchToolCall(const std::string& toolName,
             g_inputState.resetViewRequested = true;  // applied by the render loop next frame
             result = "{\"framed\":true}";
         }
+    } else if (toolName == "set_transparent_background") {
+        // Same code path as Ctrl+T: raise the shared input handler's request
+        // flag and let the render loop stay the single place that flips
+        // g_transparentBg, logs, toasts, and posts kBorderlessMsg. Omitting
+        // 'enabled' toggles; passing it makes the call idempotent — the flag is
+        // raised only when the target differs from the live state.
+        const bool current = g_transparentBg.load();
+        bool want = !current;               // no 'enabled' → toggle, like Ctrl+T
+        McpJsonGetBool(a, "enabled", want); // absent/non-boolean keeps the toggle target
+        const bool changing = (want != current);
+        if (changing) {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.transparentBgToggleRequested = true;
+        }
+        snprintf(buf, sizeof(buf), "{\"transparent_background\":%s,\"changed\":%s}",
+                 want ? "true" : "false", changing ? "true" : "false");
+        result = buf;
     } else if (toolName == "list_animations") {
         const int n = g_modelRenderer.animationCount();
         std::string clips = "[";
@@ -968,8 +1003,9 @@ static void RegisterModelViewerMcpTools(XrSessionManager& xr) {
     statusTool.description =
         "Read the viewer's live state: loaded model file and primitive count, "
         "animation clip count + active clip + playing flag, camera orbit "
-        "(azimuth/elevation in degrees, world position, zoom factor), active "
-        "rendering-mode index, and whether the XR session is running.";
+        "(azimuth/elevation in degrees, world position, zoom factor), the "
+        "transparent-background flag, active rendering-mode index, and whether "
+        "the XR session is running.";
     statusTool.inputSchemaJson = "{\"type\":\"object\"}";
     XrResult t2 = g_pfnRegisterMcpTool(xr.session, &statusTool);
 
@@ -999,13 +1035,28 @@ static void RegisterModelViewerMcpTools(XrSessionManager& xr) {
     frameTool.inputSchemaJson = "{\"type\":\"object\"}";
     XrResult t4 = g_pfnRegisterMcpTool(xr.session, &frameTool);
 
+    XrMCPToolInfoDXR transparencyTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+    transparencyTool.name = "set_transparent_background";
+    transparencyTool.description =
+        "Turn the transparent background on or off — the agent equivalent of "
+        "Ctrl+T: with it on, the model is composited over the desktop instead "
+        "of the viewer's opaque background, and the window goes borderless. "
+        "Omit 'enabled' to toggle the current state. The flip is applied by the "
+        "render thread on the next frame, so the returned value is the "
+        "REQUESTED state — read the settled one back with get_status.";
+    transparencyTool.inputSchemaJson =
+        "{\"type\":\"object\",\"properties\":{"
+        "\"enabled\":{\"type\":\"boolean\",\"description\":\"Target state; omit to toggle.\"}}}";
+    XrResult t5 = g_pfnRegisterMcpTool(xr.session, &transparencyTool);
+
     g_mcpToolsReady = true;
     // Install the app dispatcher on the shared PollEvents hook (common v2.1.0):
     // PollEvents fetches the call args, invokes this, and submits the result —
     // so the model viewer no longer forks PollEvents to route its tool calls.
     xr.mcpToolHandler = McpDispatchToolCall;
     LOG_INFO("XR_DXR_mcp_tools: appId=modelviewer load_model=%d get_status=%d "
-             "set_orbit=%d frame_model=%d", t1, t2, t3, t4);
+             "set_orbit=%d frame_model=%d set_transparent_background=%d",
+             t1, t2, t3, t4, t5);
 
     // Sync the animation tools with whatever model is already loaded (the
     // bundled sample may have loaded before this call, depending on ordering).
