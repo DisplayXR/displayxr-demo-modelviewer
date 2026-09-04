@@ -59,8 +59,15 @@ from make_material_grid import (           # noqa: E402
 COLS = 8
 PAIR_VALUES = [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
 
+# The upstream tooling renders credits from these fields directly -- omit
+# licenseUrl/text and the generated LICENSE.md reads "[undefined]()". spdx and
+# icon are what the REUSE compliance job and the listing tables consume.
 LEGAL = [{
     "license": "CC0-1.0",
+    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/legalcode",
+    "text": "Creative Commons Zero v1.0 Universal",
+    "spdx": "CC0-1.0",
+    "icon": "https://licensebuttons.net/p/zero/1.0/88x31.png",
     "year": "2026",
     "artist": "DisplayXR",
     "what": "Entire Model",
@@ -404,6 +411,7 @@ def main():
             "summary": summary,
             "screenshot": "screenshot/screenshot.png",
             "tags": ["testing", "pbrtest", "extension"],
+            "createReadme": True,
             "legal": LEGAL,
         }, indent=2) + "\n", encoding="utf-8")
 
@@ -412,6 +420,11 @@ def main():
         # Sections start at "##" per CONTRIBUTING; the title, extension list and
         # summary are omitted because they are generated from metadata.json.
         (mdir / "README.body.md").write_text(
+            "## Screenshot\n\n"
+            "![screenshot](screenshot/screenshot_large.png)\n"
+            "<br/>_Rendered by the [DisplayXR Model Viewer]"
+            "(https://github.com/DisplayXR/displayxr-demo-modelviewer) "
+            "under its procedural sky environment._\n\n"
             "## Description\n\n" + desc
             + "\n## Provenance\n\n"
               "Generated procedurally rather than modelled, so it can be "
