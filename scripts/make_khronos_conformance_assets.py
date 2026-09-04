@@ -71,7 +71,7 @@ LEGAL = [{
     "year": "2026",
     "artist": "DisplayXR",
     "what": "Entire Model",
-    "owner": "Leia Inc.",
+    "owner": "DisplayXR",
 }]
 
 
