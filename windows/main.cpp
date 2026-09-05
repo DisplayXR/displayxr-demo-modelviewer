@@ -26,6 +26,7 @@
 #include "input_handler.h"
 #include "xr_session.h"
 #include "model_renderer.h"
+#include "gltf_siblings.h"   // .gltf external buffer/image URI policy (#114)
 #include "display3d_view.h"
 #include "projection_depth.h"
 
@@ -1415,6 +1416,222 @@ static bool SrcUrlAllowed(const std::string& finalUrl, bool fromProtocol) {
     return a.ok() && a.srcKind == dxr::LaunchSrcKind::Url;
 }
 
+// ── Multi-file .gltf: fetch the buffers and images the JSON points at (#114) ─
+//
+// A `.gltf` is JSON that POINTS at its payload — `buffers[].uri` and
+// `images[].uri` are paths relative to the .gltf itself — so downloading the
+// one file the URL names loads nothing. Every sibling is fetched through the
+// SAME FetchUrlToCache policy (final-URL re-check, byte cap, timeouts) with an
+// extra same-origin requirement, and placed under a per-asset directory
+// `<cache>\<sha1(url)>\` at the relative path the JSON spells, so the tree on
+// disk mirrors the server's and tinygltf resolves it with no rewriting. The
+// URI validator (model_common/gltf_siblings.*) is the security boundary: it
+// refuses anything absolute, off-origin, or able to climb out of that
+// directory. Nothing here runs for `.glb` — it is self-contained by
+// definition.
+
+//! What a .gltf may legally reference. NOT the SrcAllowedExtensions() list: a
+//! buffer/image is payload, never another model.
+static const std::vector<std::string>& GltfSiblingAllowedExtensions() {
+    static const std::vector<std::string> kExts = {".bin",   ".png",  ".jpg", ".jpeg",
+                                                   ".webp", ".ktx2", ".basis"};
+    return kExts;
+}
+
+static bool ReadWholeFile(const std::wstring& path, std::string* out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart > (64ll << 20)) {
+        CloseHandle(h);
+        return false;  // a .gltf JSON document is never 64 MiB
+    }
+    std::string data((size_t)size.QuadPart, '\0');
+    DWORD read = 0;
+    const bool ok = data.empty() ||
+                    (ReadFile(h, data.data(), (DWORD)data.size(), &read, nullptr) &&
+                     read == data.size());
+    CloseHandle(h);
+    if (ok && out) *out = std::move(data);
+    return ok;
+}
+
+static bool FileExistsW(const std::wstring& p) {
+    const DWORD attr = GetFileAttributesW(p.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static uint64_t FileSizeW(const std::wstring& p) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad)) return 0;
+    return ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+}
+
+//! mkdir -p. Best effort, like url_fetch.cpp's own cache-dir creation.
+static void EnsureDirectoriesW(const std::wstring& dir) {
+    std::wstring p;
+    for (size_t i = 0; i < dir.size(); ++i) {
+        p.push_back(dir[i]);
+        if ((dir[i] == L'\\' || i + 1 == dir.size()) && p.size() > 3)
+            CreateDirectoryW(p.c_str(), nullptr);
+    }
+}
+
+//! Last path segment of a URL, query/fragment stripped. Empty if it is not a
+//! plain file name (the .gltf's own name is the only thing taken from the URL,
+//! and it names a file INSIDE the per-asset directory — never the directory).
+static std::string UrlFileName(const std::string& url) {
+    std::string path = url.substr(0, url.find_first_of("?#"));
+    const size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return {};
+    std::string name = path.substr(slash + 1);
+    std::string decoded;
+    if (!gltf_siblings::percent_decode(name, &decoded)) return {};
+    std::string reason;
+    // Reuse the sibling validator: a file name is a one-segment relative
+    // reference, so every rule it enforces is exactly the rule wanted here.
+    if (!gltf_siblings::uri_is_safe_relative(decoded, &reason)) return {};
+    if (decoded.find('/') != std::string::npos) return {};
+    return decoded;
+}
+
+/*!
+ * Turn a downloaded `.gltf` into a complete asset directory and return the
+ * path to load. On failure the reason is logged + toasted and false comes
+ * back — a half-fetched asset is never handed to the loader.
+ *
+ * `gltfCachePath` is the primary download (`<cache>\<sha1>.gltf`); the asset
+ * directory is that path minus its extension.
+ */
+static bool PrepareGltfAsset(const std::string& finalUrl, const std::wstring& gltfCachePath,
+                             bool fromProtocol, uint64_t maxBytes, bool noCache,
+                             uint64_t primaryBytes, std::wstring* loadPath) {
+    const std::wstring assetDir = gltfCachePath.substr(0, gltfCachePath.size() - 5);  // ".gltf"
+    std::string json;
+    if (!ReadWholeFile(gltfCachePath, &json)) {
+        LOG_ERROR("--src: could not read the downloaded .gltf back");
+        ToastF("Download failed - could not read the .gltf");
+        return false;
+    }
+    std::vector<gltf_siblings::SiblingRef> refs;
+    std::string err;
+    if (!gltf_siblings::collect_external_refs(json, finalUrl, &refs, &err)) {
+        LOG_ERROR("--src: .gltf references cannot be fetched: %s", err.c_str());
+        ToastF("Unsupported asset - %s", err.c_str());
+        return false;
+    }
+
+    std::string fileName = UrlFileName(finalUrl);
+    if (fileName.size() < 6 ||
+        gltf_siblings::path_extension(fileName) != ".gltf")
+        fileName = "model.gltf";  // URL ends in a redirect/query with no name
+    const std::wstring gltfInDir = assetDir + L"\\" + dxr::WideFromUtf8(fileName);
+
+    // Pre-flight: every reference must be a payload extension this viewer can
+    // load, and none may collide with the .gltf itself.
+    std::vector<std::wstring> targets;
+    targets.reserve(refs.size());
+    for (const gltf_siblings::SiblingRef& ref : refs) {
+        const std::string ext = gltf_siblings::path_extension(ref.relativePath);
+        const std::vector<std::string>& allowed = GltfSiblingAllowedExtensions();
+        if (std::find(allowed.begin(), allowed.end(), ext) == allowed.end()) {
+            LOG_ERROR("--src: .gltf references '%s' — extension '%s' is not fetchable",
+                      ref.relativePath.c_str(), ext.c_str());
+            ToastF("Unsupported asset - %s", ref.relativePath.c_str());
+            return false;
+        }
+        std::wstring rel = dxr::WideFromUtf8(ref.relativePath);
+        for (wchar_t& c : rel)
+            if (c == L'/') c = L'\\';
+        const std::wstring target = assetDir + L"\\" + rel;
+        if (target == gltfInDir) {
+            LOG_ERROR("--src: .gltf references its own file name ('%s')",
+                      ref.relativePath.c_str());
+            ToastF("Unsupported asset - self-referencing .gltf");
+            return false;
+        }
+        targets.push_back(target);
+    }
+
+    // Cache hit = the directory already holds the .gltf AND every sibling. No
+    // network at all, which is what makes the second undock instant.
+    bool complete = !noCache && FileExistsW(gltfInDir);
+    for (size_t i = 0; complete && i < targets.size(); ++i) complete = FileExistsW(targets[i]);
+    if (complete) {
+        LOG_INFO("--src: glTF asset dir complete (%zu sibling(s), cache hit): %s",
+                 refs.size(), dxr::Utf8FromWide(assetDir).c_str());
+        *loadPath = gltfInDir;
+        return true;
+    }
+
+    EnsureDirectoriesW(assetDir);
+    if (!CopyFileW(gltfCachePath.c_str(), gltfInDir.c_str(), FALSE)) {
+        LOG_ERROR("--src: could not place the .gltf in its asset dir (error %lu)",
+                  (unsigned long)GetLastError());
+        ToastF("Download failed - cache write");
+        return false;
+    }
+
+    uint64_t consumed = primaryBytes ? primaryBytes : FileSizeW(gltfCachePath);
+    const size_t total = refs.size();
+    LOG_INFO("--src: .gltf references %zu external file(s); fetching relative to %s",
+             total, finalUrl.c_str());
+    for (size_t i = 0; i < total; ++i) {
+        const gltf_siblings::SiblingRef& ref = refs[i];
+        const std::wstring& target = targets[i];
+        if (!noCache && FileExistsW(target)) {
+            consumed += FileSizeW(target);
+            LOG_INFO("--src:   [%zu/%zu] %s (cache hit)", i + 1, total,
+                     ref.relativePath.c_str());
+            continue;
+        }
+        ToastF("Downloading %zu/%zu...", i + 1, total);
+        if (consumed >= maxBytes) {
+            LOG_ERROR("--src: asset larger than the download cap (%llu bytes)",
+                      (unsigned long long)maxBytes);
+            ToastF("Download failed - asset larger than the cap");
+            return false;
+        }
+        dxr::UrlFetchOptions opt;
+        opt.cacheDir = assetDir;
+        opt.allowedExtensions = GltfSiblingAllowedExtensions();
+        opt.maxBytes = maxBytes - consumed;  // the CAP IS THE SUM, not per file
+        opt.noCache = noCache;
+        // Same policy as the primary, plus: a sibling may not leave the
+        // .gltf's origin, before OR after a redirect.
+        const std::string origin = finalUrl;
+        opt.urlAllowed = [fromProtocol, origin](const std::string& u) {
+            return SrcUrlAllowed(u, fromProtocol) && gltf_siblings::same_origin(u, origin);
+        };
+        const dxr::UrlFetchResult sr = dxr::FetchUrlToCache(ref.url, opt);
+        if (!sr.ok) {
+            LOG_ERROR("--src: sibling %s failed: %s", ref.url.c_str(), sr.error.c_str());
+            ToastF("Download failed - %s (%s)", ref.relativePath.c_str(), sr.error.c_str());
+            return false;
+        }
+        // FetchUrlToCache names its output by the SHA-1 of the URL; move it to
+        // the path the JSON references so the loader resolves it unmodified.
+        const size_t sep = target.find_last_of(L'\\');
+        if (sep != std::wstring::npos) EnsureDirectoriesW(target.substr(0, sep));
+        if (sr.path != target &&
+            !MoveFileExW(sr.path.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            LOG_ERROR("--src: could not place '%s' (error %lu)", ref.relativePath.c_str(),
+                      (unsigned long)GetLastError());
+            ToastF("Download failed - %s", ref.relativePath.c_str());
+            return false;
+        }
+        consumed += sr.bytes ? sr.bytes : FileSizeW(target);
+        LOG_INFO("--src:   [%zu/%zu] %s <- %s (%llu bytes, %s)", i + 1, total,
+                 ref.relativePath.c_str(), ref.url.c_str(), (unsigned long long)sr.bytes,
+                 sr.fromCache ? "cache hit" : "downloaded");
+    }
+    LOG_INFO("--src: glTF asset complete: %s (%zu sibling(s), %llu bytes total)",
+             dxr::Utf8FromWide(gltfInDir).c_str(), total, (unsigned long long)consumed);
+    *loadPath = gltfInDir;
+    return true;
+}
+
 static void StartSrcFetch(HWND hwnd, const std::string& url, bool fromProtocol,
                           uint64_t maxBytes, bool noCache) {
     if (g_srcFetchInFlight.exchange(true)) {
@@ -1455,9 +1672,22 @@ static void StartSrcFetch(HWND hwnd, const std::string& url, bool fromProtocol,
             g_srcFetchInFlight.store(false);
             return;
         }
-        const std::string path = dxr::NarrowPathForFopen(dxr::Utf8FromWide(r.path));
-        LOG_INFO("--src: %s -> %s (%llu bytes, %s)", url.c_str(), path.c_str(),
-                 (unsigned long long)r.bytes, r.fromCache ? "cache hit" : "downloaded");
+        std::wstring assetPath = r.path;
+        LOG_INFO("--src: %s -> %s (%llu bytes, %s)", url.c_str(),
+                 dxr::Utf8FromWide(r.path).c_str(), (unsigned long long)r.bytes,
+                 r.fromCache ? "cache hit" : "downloaded");
+        // A .gltf is not the asset, it is the manifest — fetch what it points
+        // at (#114) and load the copy inside the completed asset directory.
+        // `.glb` and every single-file format skip this entirely.
+        if (gltf_siblings::path_extension(dxr::Utf8FromWide(r.path)) == ".gltf") {
+            const std::string finalUrl = r.finalUrl.empty() ? url : r.finalUrl;
+            if (!PrepareGltfAsset(finalUrl, r.path, fromProtocol, maxBytes, noCache, r.bytes,
+                                  &assetPath)) {
+                g_srcFetchInFlight.store(false);
+                return;
+            }
+        }
+        const std::string path = dxr::NarrowPathForFopen(dxr::Utf8FromWide(assetPath));
         if (!model_validate_file(path)) {
             // Toast, never MessageBox: a modal dialog from a worker thread
             // under a topmost shaped window is a trap the user cannot see.

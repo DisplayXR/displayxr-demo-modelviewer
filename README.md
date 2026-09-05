@@ -510,7 +510,7 @@ model_viewer_handle_vk_win.exe [flags] [model-path]
 |---|---|
 | `--transparent` | Borderless, topmost and click-through-shaped **from the first frame** — no style flip after the window exists. `Ctrl+T` still toggles it live. |
 | `--rect=X,Y,W,H` | Window rect in physical virtual-screen pixels. The exe is PerMonitorV2, so no DPI scaling is applied to what you pass. With `--transparent` the rect is the window rect exactly; framed, it is the client area. |
-| `--src=<url\|path>` | Asset to load instead of the bundled sample. A URL is downloaded to the cache first (progress shows as a toast). |
+| `--src=<url\|path>` | Asset to load instead of the bundled sample. A URL is downloaded to the cache first (progress shows as a toast). A `.gltf` also has its `buffers[]`/`images[]` fetched relative to its URL — see [Multi-file glTF](#multi-file-gltf-gltf--bin--textures). |
 | `--vh=<metres>` | Virtual display height the asset was authored at. Pins the scale: auto-fit will not re-derive it. |
 | `--title=<suffix>` | **Appended** to the window title, never replaces it. |
 | `--type=model\|splat` | Routing hint. A non-`model` type is forwarded to the sibling viewer. |
@@ -586,6 +586,36 @@ SHA-1 of the requested URL (never by anything in the URL's path, so there is no
 traversal surface). A cache hit skips the network entirely, which is what makes
 the second undock of the same asset instant; `--no-cache` bypasses it. Deleting
 the directory is always safe.
+
+### Multi-file glTF (`.gltf` + `.bin` + textures)
+
+A `.gltf` is JSON that **points at** its payload: `buffers[].uri` and
+`images[].uri` are paths relative to the `.gltf` itself. So a `src=` that names
+a `.gltf` is a manifest, not an asset — the viewer downloads it, reads those
+URIs, and fetches each one **relative to the `.gltf`'s final URL** before
+loading anything. `.glb` (self-contained) and every other single-file format
+are untouched by this.
+
+The siblings land in a **per-asset directory** `…\cache\<sha1-of-the-url>\`,
+each at the relative path the JSON spells (`textures/albedo.jpg` →
+`<sha1>\textures\albedo.jpg`), with the `.gltf` copied in beside them under its
+own file name. The tree on disk therefore mirrors the server's and the loader
+resolves it with no rewriting. A directory that already holds the `.gltf` and
+every file it references is a **cache hit** — no network at all. Progress shows
+as a `Downloading 3/7…` toast; the `--max-bytes` cap applies to the **sum**,
+and any sibling that fails aborts the load rather than showing a half asset.
+
+**Same-origin rule.** A sibling must be a plain **relative** reference and must
+resolve to the same **scheme + host + port** as the `.gltf` — before *and*
+after redirects. Refused outright: anything with a scheme (`https:`, `data:`
+payloads are simply skipped as already-embedded, and a `C:` drive letter parses
+as a scheme too), a leading `/` or `//`, any `..` segment raw or percent-encoded
+(`%2e%2e`), backslashes, `%2f`, control characters, a query or fragment, and
+any extension outside `{.bin .png .jpg .jpeg .webp .ktx2 .basis}`. A downloaded
+JSON document is untrusted input, and this is the only thing standing between
+it and a filesystem write, so it is an allowlist and it is unit-tested directly:
+`ctest --test-dir build -R gltf_uri_tests` (source:
+`model_common/tests/gltf_uri_tests.cpp`).
 
 ## Build from source
 
