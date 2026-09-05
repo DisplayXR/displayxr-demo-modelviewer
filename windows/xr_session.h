@@ -15,12 +15,18 @@
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_display_zones.h>
 #include <openxr/XR_DXR_local_3d_zone.h>
+#include <openxr/XR_DXR_depth_budget.h>
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
 // returns render-ready XrView{pose, fov}; the app deletes its own. App-owned
 // flag (displayxr::common's XrSessionManager carries no app-named fields,
 // #396 W4); set by InitializeOpenXR.
 extern bool g_hasViewRigExt;
+// XR_DXR_depth_budget (#116): optional — older runtimes (incl. today's on
+// this box) don't advertise it, and the app must run unchanged there.
+// Enabling is a pure opt-in; when absent dxr::ResolveClipPlanes(nullptr, ...)
+// reproduces today's hand-rolled clip rule bit-for-bit. Set by InitializeOpenXR.
+extern bool g_hasDepthBudgetExt;
 // XR_DXR_display_zones + XR_DXR_local_3d_zone both present (#63): the
 // zones-by-default full-window zone needs the pair (zone chain + Local2D).
 extern bool g_hasDisplayZonesExt;
