@@ -29,6 +29,7 @@ set(MV_SHADER_NAMES
 # -I regardless, so omitting one here causes stale SPIR-V, not a build error.
 set(MV_SHADER_INCLUDE_NAMES
     sky.glsl
+    room.glsl
     env.glsl
     ibl_common.glsl
     tonemap.glsl

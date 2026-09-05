@@ -1155,7 +1155,7 @@ bool ModelRenderer::genCubeMap(CubeMap& cube, uint32_t size, uint32_t mips,
     if (vkCreateImageView(device_, &cvci, nullptr, &cube.view) != VK_SUCCESS) return false;
 
     // Must match the P block in irradiance.frag / prefilter.frag.
-    struct Push { int32_t face; float roughness; float envIsHdri; };
+    struct Push { int32_t face; float roughness; float envIsHdri; float envIsRoom; };
     FsPipe fp = makeFsPipe(device_, fmt, fragSpv, fragSpvBytes, sizeof(Push), envSetLayout_);
 
     for (uint32_t m = 0; m < mips; ++m) {
@@ -1191,7 +1191,8 @@ bool ModelRenderer::genCubeMap(CubeMap& cube, uint32_t size, uint32_t mips,
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fp.layout,
                                         0, 1, &envSet_, 0, nullptr);
             }
-            Push pcv = {(int32_t)f, rough, envIsHdri_ ? 1.0f : 0.0f};
+            Push pcv = {(int32_t)f, rough, envIsHdri_ ? 1.0f : 0.0f,
+                        envUsesRoom() ? 1.0f : 0.0f};
             vkCmdPushConstants(cmd, fp.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push), &pcv);
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRenderPass(cmd);
@@ -1310,7 +1311,9 @@ void ModelRenderer::destroyCubeMap(CubeMap& cube) {
 }
 
 // (Re)bake the two IBL cubes from whatever environment is currently bound.
-// Called once from createIbl() and again on every setEnvironment(). Blocking —
+// Called once from createIbl(), again on every setEnvironment(), and again on
+// any lighting-mode change that swaps the analytic source (setLightingMode →
+// envUsesRoom: sky.glsl ↔ room.glsl). Blocking —
 // genCubeMap submits and waits per face/mip — so this is a load-time operation,
 // never a per-frame one.
 bool ModelRenderer::bakeIblCubes() {
@@ -1402,15 +1405,17 @@ uint16_t floatToHalf(float f) {
 bool ModelRenderer::setEnvironment(const char* hdriPath) {
     if (!initialized_) return false;
 
-    // Empty/null → revert to the procedural analytic sky.
+    // Empty/null → revert to the analytic environment the lighting mode implies.
     if (hdriPath == nullptr || hdriPath[0] == '\0') {
         if (!envIsHdri_) return true;
         vkQueueWaitIdle(queue_);
         bindEnvEquirect(envDummyTex_.view);
         modelDestroyImage(device_, envEquirect_);
         envIsHdri_ = false;
-        envName_ = "analytic sky";
-        std::printf("ModelRenderer: environment → analytic sky\n");
+        // Dropping an HDRI while lighting=room must land on the ROOM, not on
+        // the sky — envUsesRoom() is the one place that decision is made.
+        envName_ = envUsesRoom() ? "analytic room" : "analytic sky";
+        std::printf("ModelRenderer: environment → %s\n", envName_.c_str());
         return bakeIblCubes();
     }
 
@@ -1507,6 +1512,13 @@ const char* ModelRenderer::toneCurveName() const {
 // ===========================================================================
 // Studio rig - the storefront page's lighting, reproduced.
 //
+// NOTE (room): the page's DEFAULT has since moved to `room` - three.js
+// RoomEnvironment baked to a PMREM, no punctual lights at all - which this
+// viewer reproduces in shaders/room.glsl rather than here, because it is an
+// ENVIRONMENT and belongs in the IBL bake. The studio rig below is still what
+// a page lights with when it asks for env=studio, so it stays exactly as it
+// was. See ModelRenderer::LightingMode.
+//
 // The DisplayXR storefront's inline-3D tile lights every model with three.js's
 // addStudioLights (displayxr-shop-pvt, src/vendor/inline3d/inline3d-model.js):
 // three DirectionalLights plus a HemisphereLight, physically-correct
@@ -1563,14 +1575,44 @@ void normalizeInto(float out[4], const float dir[3], float intensity) {
 }  // namespace
 
 void ModelRenderer::setLightingMode(LightingMode m) {
+    const bool wasRoom = envUsesRoom();
     lightingMode_ = m;
+    // Room swaps the environment the IBL cubes are BAKED from, which nothing
+    // else about a mode does — Sky/Studio/None all read the same sky bake and
+    // differ only in uniforms. So this one transition needs a rebake.
+    //
+    // Rebake on the transition rather than baking both sets at init: a second
+    // pair of cubes is ~1.6 MB of VRAM plus a second descriptor to switch, and
+    // it would pay the room's bake cost on EVERY launch — including the common
+    // one that never presses L. The rebake is the same handful of blocking
+    // fullscreen passes setEnvironment already runs (~100 ms, measured 0.09 s
+    // for room), on an explicit user action or at startup, never per frame.
+    // initialized_ gates the startup call: main() sets the launch mode before
+    // the model loads but AFTER init, and createIbl() bakes for itself.
+    if (envUsesRoom() != wasRoom) {
+        // The HUD's environment line is what makes a capture self-documenting,
+        // so it has to name the source that was actually integrated — "analytic
+        // sky" under a room bake would be a lie in every reference image.
+        envName_ = envUsesRoom() ? "analytic room" : "analytic sky";
+    }
+    if (initialized_ && envUsesRoom() != wasRoom) {
+        if (!bakeIblCubes()) {
+            std::printf("ModelRenderer: IBL rebake for lighting=%s FAILED — "
+                        "the previous environment is gone; expect a black ambient\n",
+                        lightingModeName());
+        }
+    }
     // The grading is PART of the mode. The page runs three.js at unit exposure
     // with NoToneMapping, so Studio has to as well - a filmic knee alone would
     // pull every highlight the rig exists to produce back under 1.0 and undo
     // the comparison. Sky keeps the #70 phase-0 pairing (PBR Neutral needs the
     // +1 EV to reach its knee at all). [ / ] and G still override afterwards;
     // this only sets the mode's starting point.
-    if (m == LightingMode::Studio) {
+    // Room grades like Studio and for the same reason: it is the SAME page,
+    // whose WebGLRenderer is at its NoToneMapping / unit-exposure default. The
+    // room's radiances are physical (a 43-unit panel at 17 m, not a hand-picked
+    // "1.0"), so the match is only a match at 0 EV with no curve.
+    if (m == LightingMode::Studio || m == LightingMode::Room) {
         exposureEV_ = 0.0f;
         toneCurve_  = ToneCurve::Clamp;
     } else {
@@ -1584,6 +1626,7 @@ void ModelRenderer::setLightingMode(LightingMode m) {
 const char* ModelRenderer::lightingModeName() const {
     switch (lightingMode_) {
         case LightingMode::Studio: return "studio";
+        case LightingMode::Room:   return "room";
         case LightingMode::NoLights:   return "none";
         default:                   return "sky";
     }
@@ -1591,13 +1634,15 @@ const char* ModelRenderer::lightingModeName() const {
 
 void ModelRenderer::cycleLightingMode() {
     setLightingMode(lightingMode_ == LightingMode::Sky    ? LightingMode::Studio
-                  : lightingMode_ == LightingMode::Studio ? LightingMode::NoLights
+                  : lightingMode_ == LightingMode::Studio ? LightingMode::Room
+                  : lightingMode_ == LightingMode::Room   ? LightingMode::NoLights
                                                           : LightingMode::Sky);
 }
 
 bool ModelRenderer::parseLightingMode(const std::string& env, LightingMode& out) {
     if (env == "studio") { out = LightingMode::Studio; return true; }
     if (env == "sky")    { out = LightingMode::Sky;    return true; }
+    if (env == "room")   { out = LightingMode::Room;   return true; }
     if (env == "none")   { out = LightingMode::NoLights;   return true; }
     return false;
 }
@@ -1923,7 +1968,13 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     // key scale comes from studio.y, so an HDRI cannot silently unlight it.
     ub.tone[0] = std::pow(2.0f, exposureEV_);
     ub.tone[1] = (float)(int)toneCurve_;
-    ub.tone[2] = (lightingMode_ == LightingMode::NoLights || envIsHdri_) ? 0.0f : 1.0f;
+    // Room is ambient-only by construction: the page has NO punctual light in
+    // room mode, every photon comes from the baked environment. So it gates the
+    // key light off exactly the way None does - leaving it on would add a sun
+    // the page does not have, on top of an environment that already lights the
+    // model.
+    ub.tone[2] = (lightingMode_ == LightingMode::NoLights
+                  || lightingMode_ == LightingMode::Room || envIsHdri_) ? 0.0f : 1.0f;
     ub.tone[3] = transmissionProbe_ ? 1.0f : 0.0f;
     ub.viewport[0] = (width_  > 0) ? (float)vpWidth_  / (float)width_  : 1.0f;
     ub.viewport[1] = (height_ > 0) ? (float)vpHeight_ / (float)height_ : 1.0f;
