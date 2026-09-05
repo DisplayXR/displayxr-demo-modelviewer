@@ -86,6 +86,11 @@ struct ModelRenderer {
     //        keeps the materials it had in the tile. Metal is the case that
     //        makes this visible: crisp specular highlights off three lights
     //        read as metal, a smooth sky reflection reads as matte.
+    // Room   the storefront page's CURRENT default: three.js RoomEnvironment
+    //        baked to a PMREM and used as the whole light source - no punctual
+    //        lights at all, NoToneMapping. Emulated analytically into this
+    //        viewer's own IBL bake (shaders/room.glsl), so the same panel
+    //        reflections travel across a metal body as the page shows.
     // None   no lights at all; the IBL ambient only.
     //
     // The GRADING is part of the mode, not an independent knob — see
@@ -93,12 +98,17 @@ struct ModelRenderer {
     // NoLights, not `None`: <X11/X.h> defines `None` as a macro (0L), and this
     // header is compiled on desktop Linux through the xlib window binding. The
     // CLI/protocol token stays "none" - only the enumerator is spelled around it.
-    enum class LightingMode { Sky = 0, Studio = 1, NoLights = 2 };
+    // Room is appended rather than inserted: the values are not persisted, but
+    // a mode is quoted by NAME everywhere it is user-visible, and renumbering
+    // Studio/NoLights would silently rewrite any hand-set integer in a capture
+    // script. Cycle order is sky -> studio -> room -> none (see
+    // cycleLightingMode), which is not the enumerator order.
+    enum class LightingMode { Sky = 0, Studio = 1, NoLights = 2, Room = 3 };
     void         setLightingMode(LightingMode m);
     LightingMode lightingMode() const { return lightingMode_; }
     const char*  lightingModeName() const;
     void         cycleLightingMode();
-    // "studio" / "sky" / "none" (the LaunchArgs::env vocabulary) -> a mode.
+    // "studio" / "sky" / "room" / "none" (the LaunchArgs::env vocabulary) -> a mode.
     // Returns false for anything else, leaving `out` untouched.
     static bool  parseLightingMode(const std::string& env, LightingMode& out);
 
@@ -270,6 +280,10 @@ private:
     bool createPipeline();
     bool createSamplerAndDefaults();
     bool createIbl();   // BRDF LUT + the env descriptor + the first cube bake
+    // Which analytic environment the generation passes should integrate. An
+    // HDRI, when one is loaded, outranks both - it is an explicit choice by the
+    // person running the viewer, and the lighting mode is not.
+    bool envUsesRoom() const { return !envIsHdri_ && lightingMode_ == LightingMode::Room; }
     bool bakeIblCubes();  // (re)generate irradiance + prefiltered cubes from the active environment
     bool createEnvDescriptor();          // set-0 sampler the generation passes read the HDRI from
     void bindEnvEquirect(VkImageView v); // point that descriptor at an image (HDRI or the 1x1 dummy)

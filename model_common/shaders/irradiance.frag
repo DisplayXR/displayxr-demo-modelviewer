@@ -12,7 +12,7 @@
 
 layout(location = 0) in vec2 inUV;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform P { int face; float roughness; float envIsHdri; } pc;
+layout(push_constant) uniform P { int face; float roughness; float envIsHdri; float envIsRoom; } pc;
 
 void main() {
     vec3 N = dirForFace(pc.face, inUV);
@@ -29,7 +29,7 @@ void main() {
         float sinT = sqrt(Xi.y);
         vec3 l = vec3(cos(phi) * sinT, sin(phi) * sinT, cosT);
         vec3 wd = tx * l.x + ty * l.y + N * l.z;
-        irr += envRadiance(wd, pc.envIsHdri);
+        irr += envRadiance(wd, pc.envIsHdri, pc.envIsRoom);
     }
     outColor = vec4(irr / float(NS), 1.0);
 }

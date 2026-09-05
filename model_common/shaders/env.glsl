@@ -8,7 +8,10 @@
 //     "matches the authoring tool" claim, since the comparison is only
 //     meaningful when both renderers are lit by the SAME environment;
 //   * the procedural analytic sky (sky.glsl) — the fallback when no HDRI is
-//     set, so the viewer still works with zero assets.
+//     set, so the viewer still works with zero assets;
+//   * the analytic RoomEnvironment (room.glsl) — lighting mode `room`, the
+//     storefront page's default environment, so an undocked model is lit by
+//     the same panels the tile reflected.
 //
 // Included ONLY by the generation passes. The main pass never samples this: it
 // reads the cubes these passes bake, and the skybox reads the prefiltered cube
@@ -16,9 +19,12 @@
 //
 // The HDRI is sampled from a sampler2D at set 0 / binding 0. When no HDRI is
 // loaded the renderer still binds a 1x1 dummy there (descriptors must be
-// valid), and pc.envIsHdri selects the analytic sky instead.
+// valid), and pc.envIsHdri selects an analytic source instead — `room` when
+// pc.envIsRoom is set (the lighting mode asked for it), else the sky. An HDRI
+// wins over both: it is an explicit choice by the person running the viewer.
 
 #include "sky.glsl"
+#include "room.glsl"
 
 layout(set = 0, binding = 0) uniform sampler2D equirectMap;
 
@@ -37,8 +43,9 @@ vec2 equirectUv(vec3 d) {
                 acos(clamp(d.y, -1.0, 1.0)) * 0.31830988618);
 }
 
-vec3 envRadiance(vec3 dir, float isHdri) {
+vec3 envRadiance(vec3 dir, float isHdri, float isRoom) {
     vec3 r = (isHdri > 0.5) ? texture(equirectMap, equirectUv(normalize(dir))).rgb
+           : (isRoom > 0.5) ? roomRadiance(dir)
                             : skyRadiance(dir);
     return min(r, vec3(ENV_RADIANCE_CLAMP));
 }
