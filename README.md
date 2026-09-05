@@ -508,18 +508,20 @@ the wrong hive; self-registration is also self-healing after a sibling is
 uninstalled). A page opens the viewer with:
 
 ```
-displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&v=1
+displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&transparent=1&v=1
 ```
 
 `open` is the verb; `v=1` is the grammar version, so a future grammar is
 rejected loudly instead of half-honoured. Every value is percent-encoded by
-the sender (`encodeURIComponent`); `+` is **not** a space. Note there is no
-`transparent` key — the borderless click-through overlay is a `--transparent`
-argv flag, so only a local launcher can ask for one.
+the sender (`encodeURIComponent`); `+` is **not** a space. A protocol launch
+is **transparent by default** (displayxr-common >= v2.9.1) — undocking into a
+floating overlay is what the scheme exists for; `transparent=0` opts out for a
+framed, positionable window. On the command line `--transparent` stays opt-in.
 
 One scheme serves every DisplayXR viewer, so the browser asks the user once. A
 URL whose `type=` is not `model` is handed to the sibling viewer found at
-`HKLM\Software\DisplayXR\Demos\<Key>\InstallPath`; if it is not installed,
+`HKCU` then `HKLM\Software\DisplayXR\Demos\<Key>\InstallPath` (the per-user key
+is a dev override, same precedence as the workspace manifests); if it is not installed,
 the viewer says so and exits. A second launch while one is already running
 does not open a second window — the URL is handed to the running instance over
 `WM_COPYDATA`, which moves it to the new rect and loads the new asset.
