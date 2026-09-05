@@ -312,6 +312,13 @@ static ModelRenderer g_modelRenderer;
 // thread picks it up between frames.
 static std::atomic<bool> g_loadRequested{false};
 static std::string g_pendingLoadPath;
+// True when the queued path came from a --src download rather than from the
+// user. A remote asset must never be able to raise a MODAL dialog on the
+// render thread: under the undock contract the window is topmost and shaped,
+// the box would stop the scene and sit on the panel until someone clicked it,
+// and that someone may be a web page away. Guarded by g_pendingLoadPathMutex
+// with the path it belongs to.
+static bool g_pendingLoadFromUrl = false;
 static std::mutex g_pendingLoadPathMutex;
 // 'I' key: capture the multi-view atlas region (cols × rows × renderW × renderH)
 // of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
@@ -1333,7 +1340,7 @@ static void TryAutoLoadBundledScene(const std::string& overridePath = std::strin
 // extension first; on failure pops a MessageBox and returns false. Used by
 // both the Win32 GetOpenFileNameA path and the #228 spatial picker result
 // drained in the main loop.
-static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
+static bool QueueSceneLoad(HWND hwnd, const std::string& path, bool fromUrl = false) {
     if (!model_validate_file(path)) {
         MessageBoxA(hwnd, "Invalid model file. Supported formats: .glb, .gltf", "Load Error", MB_OK | MB_ICONERROR);
         return false;
@@ -1341,6 +1348,7 @@ static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
     {
         std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
         g_pendingLoadPath = path;
+        g_pendingLoadFromUrl = fromUrl;
     }
     g_loadRequested.store(true, std::memory_order_release);
     LOG_INFO("Queued model load: %s", path.c_str());
@@ -1452,7 +1460,7 @@ static void StartSrcFetch(HWND hwnd, const std::string& url, bool fromProtocol,
         }
         ToastF("%s  %s", r.fromCache ? "Cached" : "Downloaded",
                model_basename(path).c_str());
-        QueueSceneLoad(hwnd, path);
+        QueueSceneLoad(hwnd, path, /*fromUrl=*/true);
         g_srcFetchInFlight.store(false);
     }).detach();
 }
@@ -2125,10 +2133,13 @@ static void RenderThreadFunc(
         // (render) thread for per-frame submissions — see g_pendingLoadPath.
         if (g_loadRequested.exchange(false, std::memory_order_acquire)) {
             std::string path;
+            bool loadFromUrl = false;
             {
                 std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
                 path = std::move(g_pendingLoadPath);
                 g_pendingLoadPath.clear();
+                loadFromUrl = g_pendingLoadFromUrl;
+                g_pendingLoadFromUrl = false;
             }
             if (!path.empty()) {
                 LOG_INFO("Loading model: %s", path.c_str());
@@ -2138,13 +2149,20 @@ static void RenderThreadFunc(
                     LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
                         model_filesize_str(path).c_str());
                     ApplyAutoFitForLoadedScene_locked();
-                    // Success only — the failure path already raises a modal
-                    // MessageBox, so a toast there would be redundant noise.
                     ToastF("Loaded  %s", g_loadedFileName.c_str());
                 } else {
                     LOG_ERROR("Failed to load scene: %s", path.c_str());
-                    MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
-                        "Load Error", MB_OK | MB_ICONERROR);
+                    // A file the USER picked still gets the modal box it
+                    // always got. A file a URL supplied gets a toast: this
+                    // runs on the render thread, so the box stops the scene,
+                    // and under the undock contract it would sit on a topmost
+                    // shaped window that whoever sent the link cannot dismiss.
+                    ToastF("Load failed - %s", model_basename(path).c_str());
+                    if (!loadFromUrl && !LaunchQuiet()) {
+                        MessageBoxA(hwnd,
+                            "Failed to load scene file.\nThe file may be corrupt or unsupported.",
+                            "Load Error", MB_OK | MB_ICONERROR);
+                    }
                 }
             }
         }
