@@ -40,6 +40,13 @@
 #include "zone_default.h"      // dxr::FullWindowZone — zones-by-default (#63 / INV-5.6)
 #include "auto_fit.h"          // dxr::AutoFitVHeight / FitTransition — shared width-aware framing
 #include "auto_fit_canvas.h"   // dxr::AutoFitCanvas — the runtime-resolved viewport (shell tile)
+// ── The undock launch contract (displayxr-common v2.9.0) ──────────────────
+// One grammar + one security policy shared with the splat viewer: a web page
+// or a CAD app spawns this viewer transparent, borderless and topmost at a
+// given screen rect showing a given asset — with no post-creation style flip.
+#include "launch_args.h"       // dxr::ParseLaunchArgsFromCommandLine / LaunchArgs
+#include "url_fetch.h"         // dxr::FetchUrlToCache / DefaultCacheDir
+#include "view_protocol.h"     // dxr::EnsureViewProtocolRegistered / single-instance
 
 #include <atomic>
 #include <cstdarg>   // ToastF varargs
@@ -60,6 +67,53 @@ static const char* APP_NAME = "model_viewer_handle_vk_win";
 
 static const wchar_t* WINDOW_CLASS = L"DisplayXRModelViewerClass";
 static const wchar_t* WINDOW_TITLE = L"DisplayXR 3D Model Viewer";
+
+// ── Launch contract state ────────────────────────────────────────────────
+// Parsed ONCE at the top of WinMain and read-only afterwards, so every
+// consumer below (window creation, auto-fit, the --src fetch) sees the same
+// validated values. A hostile protocol URL never reaches any of them: an
+// entry in `errors` aborts the launch before the window exists.
+static dxr::LaunchArgs g_launch;
+// Held for the process lifetime when THIS process is the single instance —
+// a second launch of the same scheme forwards its URL here by WM_COPYDATA
+// instead of opening a second floating window over the desktop.
+static HANDLE g_singleInstanceMutex = nullptr;
+// Window title. `--title` is a SUFFIX, never a replacement: the base string
+// is load-bearing for the repo's AppActivate-driven capture workflow
+// (CLAUDE.md § Self-verifying a render).
+static std::wstring g_windowTitle;
+// `--vh` pins the virtual display height the asset was authored at. Auto-fit
+// must then NOT re-derive it — the caller is asserting the asset's real-world
+// scale, which is the whole point of undocking a CAD part at 1:1. 0 = no pin.
+static std::atomic<float> g_vhOverride{0.0f};
+// One --src download at a time (a WM_COPYDATA re-drive while a fetch is in
+// flight would otherwise race two workers onto the same toast + load queue).
+static std::atomic<bool> g_srcFetchInFlight{false};
+
+// DXR_LAUNCH_QUIET=1 suppresses every launch-time dialog (refusal,
+// sibling-not-installed, sibling-launch-failed). Those boxes exist for a
+// PERSON: a protocol launch has no console, so without one a rejected link
+// looks identical to a crash. Under an automated check the same box is a
+// liability — it is modal, it sits on the panel until someone clicks OK, and
+// the check that raised it has already exited. So agents and CI set this and
+// read the log line + the exit code instead, which are the authority the box
+// only ever restated. Never suppresses a log line and never changes an exit
+// code. `DXR_LAUNCH_QUIET=0` explicitly disarms it.
+static bool LaunchQuiet() {
+    wchar_t buf[8] = {};
+    const DWORD n = GetEnvironmentVariableW(L"DXR_LAUNCH_QUIET", buf, 8);
+    return n > 0 && n < 8 && buf[0] != L'0';
+}
+
+// Every launch-path MessageBoxW goes through here so the quiet override
+// cannot be forgotten at one call site.
+static void LaunchDialog(const wchar_t* text, const wchar_t* caption, UINT icon) {
+    if (LaunchQuiet()) {
+        LOG_INFO("DXR_LAUNCH_QUIET=1 — dialog suppressed: %ls", text);
+        return;
+    }
+    MessageBoxW(nullptr, text, caption, MB_OK | icon);
+}
 
 // HUD overlay fractions. Layer spans full window height so chrome buttons
 // can sit at the window top while the info panel anchors to the bottom-left
@@ -433,6 +487,15 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
+        // --vh wins over the fit. The caller is asserting the scale the asset
+        // was authored at (a CAD part undocked at 1:1); auto-fit's job is to
+        // guess one when nobody said, not to overrule someone who did.
+        const float vhPin = g_vhOverride.load(std::memory_order_relaxed);
+        if (vhPin > 0.0f) {
+            LOG_INFO("Auto-fit: vHeight pinned to %.3f m by --vh (fit would have used %.3f)",
+                     vhPin, vh);
+            vh = vhPin;
+        }
         g_fitVHeight = vh;
         // Cache the CONTENT half of the fit (extents are model properties) and
         // the viewport this base was derived for, so RefitForViewport can
@@ -472,7 +535,15 @@ static void ApplyAutoFitForLoadedScene_locked() {
     g_inputState.cameraPosZ = ok ? g_fitCenter[2] : 0.0f;
     g_inputState.yaw = ok ? g_fitYaw : 0.0f;
     g_inputState.pitch = 0.0f;
-    g_inputState.viewParams.virtualDisplayHeight = ok ? g_fitVHeight : kFallbackVirtualDisplayHeightM;
+    {
+        const float vhPin = g_vhOverride.load(std::memory_order_relaxed);
+        g_inputState.viewParams.virtualDisplayHeight =
+            (vhPin > 0.0f) ? vhPin
+                           : (ok ? g_fitVHeight : kFallbackVirtualDisplayHeightM);
+        // Keep the Space-reset target on the pin too, so a reset does not
+        // quietly drop back to the fallback on a degenerate-bounds model.
+        if (vhPin > 0.0f) g_fitVHeight = vhPin;
+    }
     g_inputState.viewParams.scaleFactor = 1.0f;
 
     // Per-format orientation correction is now done at load time (PLY loader
@@ -518,6 +589,16 @@ static void ApplyAutoFitForLoadedScene_locked() {
 // request to undo deliberate user state — recentring belongs on Space.
 static void RefitForViewport(float dtSeconds) {
     if (!g_fitValid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // --vh pinned the base: a viewport change must not re-derive it. (The
+    // transition below still runs so an in-flight animation lands.)
+    if (g_vhOverride.load(std::memory_order_relaxed) > 0.0f) {
+        float pinned = 0.0f;
+        if (g_fitTransition.update(dtSeconds, &pinned)) {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.viewParams.virtualDisplayHeight = pinned;
+        }
         return;
     }
     const float extW = g_fitExtentW.load(std::memory_order_relaxed);
@@ -1266,6 +1347,184 @@ static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
     return true;
 }
 
+// ============================================================================
+// --src: fetch a remote asset into the per-user cache, then load it
+// ============================================================================
+// The launch contract lets a page hand the viewer a URL. The download is
+// SYNCHRONOUS (WinHTTP) so it runs on a detached worker; the loaded result
+// crosses back to the render thread through the SAME g_pendingLoadPath queue
+// Ctrl+O, drag-drop and the spatial picker use — loading from the worker would
+// put a second thread on the single VkQueue.
+
+// Everything model_loader.cpp dispatches on. url_fetch.h resolves the cache
+// file's extension against this list (URL path → Content-Type → magic bytes),
+// so an extension NOT here is refused rather than saved under a guess.
+static const std::vector<std::string>& SrcAllowedExtensions() {
+    static const std::vector<std::string> kExts = {
+        ".glb", ".gltf", ".stl", ".obj", ".fbx", ".usdz", ".usd", ".usda", ".usdc"};
+    return kExts;
+}
+
+//! Percent-encode every byte that is not an unreserved URL character, so the
+//! result can be embedded in a query value the parser will decode verbatim.
+static std::string PercentEncodeComponent(const std::string& s) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back((char)c);
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+// Re-apply the launch policy to the FINAL URL after redirects. Re-running the
+// real parser (rather than re-implementing "https or loopback") is the point:
+// there is exactly one copy of the policy, and a redirect chain cannot walk a
+// protocol launch out of it. A protocol launch is re-checked through the
+// protocol form, which is what carries the stricter `fromProtocol` rules.
+static bool SrcUrlAllowed(const std::string& finalUrl, bool fromProtocol) {
+    if (fromProtocol) {
+        const std::string probe =
+            "displayxr-view://open?src=" + PercentEncodeComponent(finalUrl) + "&v=1";
+        const dxr::LaunchArgs a = dxr::ParseLaunchArgs({probe});
+        return a.ok() && a.srcKind == dxr::LaunchSrcKind::Url;
+    }
+    const dxr::LaunchArgs a = dxr::ParseLaunchArgs({std::string("--src=") + finalUrl});
+    return a.ok() && a.srcKind == dxr::LaunchSrcKind::Url;
+}
+
+static void StartSrcFetch(HWND hwnd, const std::string& url, bool fromProtocol,
+                          uint64_t maxBytes, bool noCache) {
+    if (g_srcFetchInFlight.exchange(true)) {
+        LOG_WARN("--src: a download is already in flight — ignoring %s", url.c_str());
+        return;
+    }
+    std::thread([hwnd, url, fromProtocol, maxBytes, noCache]() {
+        dxr::UrlFetchOptions opt;
+        opt.cacheDir = dxr::DefaultCacheDir(L"ModelViewer");
+        opt.allowedExtensions = SrcAllowedExtensions();
+        opt.maxBytes = maxBytes;
+        opt.noCache = noCache;
+        opt.urlAllowed = [fromProtocol](const std::string& finalUrl) {
+            return SrcUrlAllowed(finalUrl, fromProtocol);
+        };
+        // ~4 Hz. The toast chip re-rasterizes on every Show(), and this runs
+        // inside the read loop — a per-chunk toast would cost more than the
+        // download.
+        auto lastToast = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        opt.progress = [&lastToast](uint64_t done, uint64_t total) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastToast < std::chrono::milliseconds(250)) return;
+            lastToast = now;
+            if (total > 0) {
+                ToastF("Downloading... %d%%", (int)((done * 100ull) / total));
+            } else {
+                ToastF("Downloading... %llu KB", (unsigned long long)(done / 1024));
+            }
+        };
+
+        LOG_INFO("--src: fetching %s (max %llu bytes%s%s)", url.c_str(),
+                 (unsigned long long)maxBytes, noCache ? ", no-cache" : "",
+                 fromProtocol ? ", protocol policy" : "");
+        const dxr::UrlFetchResult r = dxr::FetchUrlToCache(url, opt);
+        if (!r.ok) {
+            LOG_ERROR("--src: download failed: %s", r.error.c_str());
+            ToastF("Download failed - %s", r.error.c_str());
+            g_srcFetchInFlight.store(false);
+            return;
+        }
+        const std::string path = dxr::NarrowPathForFopen(dxr::Utf8FromWide(r.path));
+        LOG_INFO("--src: %s -> %s (%llu bytes, %s)", url.c_str(), path.c_str(),
+                 (unsigned long long)r.bytes, r.fromCache ? "cache hit" : "downloaded");
+        if (!model_validate_file(path)) {
+            // Toast, never MessageBox: a modal dialog from a worker thread
+            // under a topmost shaped window is a trap the user cannot see.
+            LOG_ERROR("--src: cached file is not a loadable model: %s", path.c_str());
+            ToastF("Unsupported asset - %s", model_basename(path).c_str());
+            g_srcFetchInFlight.store(false);
+            return;
+        }
+        ToastF("%s  %s", r.fromCache ? "Cached" : "Downloaded",
+               model_basename(path).c_str());
+        QueueSceneLoad(hwnd, path);
+        g_srcFetchInFlight.store(false);
+    }).detach();
+}
+
+// Clamp a requested window rect INTO the 3D panel's desktop rect — never snap
+// TO it. A caller that asked for 800x800 at (300,300) gets exactly that size;
+// only the origin moves, and only far enough to bring the window fully onto
+// the panel. Gated on XR_DXR_display_info v18's isPanelConfirmed: an
+// unconfirmed rect is just the primary monitor's (sim_display, or a platform
+// whose panel-origin plumbing is still open), and clamping onto the WRONG
+// monitor is worse than not clamping at all. An all-zero rect is "unresolved".
+static void ClampRectIntoPanel(int32_t& x, int32_t& y, int32_t w, int32_t h) {
+    if (!g_displayPanelConfirmed) return;
+    const XrRect2Di& r = g_displayDesktopRect;
+    if (r.extent.width <= 0 || r.extent.height <= 0) return;
+    const int32_t left = r.offset.x;
+    const int32_t top = r.offset.y;
+    const int32_t right = left + r.extent.width;
+    const int32_t bottom = top + r.extent.height;
+    const int32_t nx = (w >= r.extent.width) ? left
+                                             : (std::min)((std::max)(x, left), right - w);
+    const int32_t ny = (h >= r.extent.height) ? top
+                                              : (std::min)((std::max)(y, top), bottom - h);
+    if (nx != x || ny != y) {
+        LOG_INFO("Undock rect clamped into panel rect (%d,%d %dx%d): (%d,%d) -> (%d,%d)",
+                 left, top, r.extent.width, r.extent.height, x, y, nx, ny);
+    }
+    x = nx;
+    y = ny;
+}
+
+// Apply a launch that arrived AFTER startup (WM_COPYDATA from a second
+// process the single-instance guard turned away). Only the things a running,
+// possibly-shaped window may legally change: position/size (a SetWindowPos
+// move is not a style change, so transparency rule 2 holds), the vHeight pin,
+// and the asset. Window-owning thread only.
+static void ApplyForwardedLaunch(HWND hwnd, const dxr::LaunchArgs& a) {
+    if (a.hasRect) {
+        int32_t x = a.rectX, y = a.rectY;
+        ClampRectIntoPanel(x, y, a.rectW, a.rectH);
+        // The rect names the CONTENT area, exactly as it does at creation: a
+        // popup's client rect IS its window rect, and a framed window's is
+        // inflated by the non-client area. Applying the raw rect to a framed
+        // window would make the same URL frame the model differently
+        // depending on whether it opened a new window or moved an old one.
+        RECT want = {x, y, x + a.rectW, y + a.rectH};
+        if (!g_borderless.load()) {
+            AdjustWindowRect(&want, (DWORD)GetWindowLong(hwnd, GWL_STYLE), FALSE);
+        }
+        LOG_INFO("Forwarded launch: moving to (%d,%d %dx%d) [content (%d,%d %dx%d)]",
+                 (int)want.left, (int)want.top, (int)(want.right - want.left),
+                 (int)(want.bottom - want.top), x, y, a.rectW, a.rectH);
+        SetWindowPos(hwnd, nullptr, want.left, want.top, want.right - want.left,
+                     want.bottom - want.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (a.hasVh) {
+        LOG_INFO("Forwarded launch: vHeight pinned to %.3f m", a.vh);
+        g_vhOverride.store(a.vh, std::memory_order_relaxed);
+        g_fitVHeight = a.vh;
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        g_inputState.viewParams.virtualDisplayHeight = a.vh;
+        g_inputState.viewParams.scaleFactor = 1.0f;
+    }
+    if (a.srcKind == dxr::LaunchSrcKind::Url) {
+        StartSrcFetch(hwnd, a.src, a.fromProtocol, a.maxBytes, a.noCache);
+    } else if (a.srcKind == dxr::LaunchSrcKind::LocalPath) {
+        QueueSceneLoad(hwnd, dxr::NarrowPathForFopen(a.src));
+    } else if (!a.positionalPath.empty()) {
+        QueueSceneLoad(hwnd, dxr::NarrowPathForFopen(a.positionalPath));
+    }
+}
+
 // Open a file dialog and load a .ply or .spz scene (called from main thread).
 //
 // Path A — workspace + Tier 1 picker available:
@@ -1421,6 +1680,35 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_COPYDATA: {
+        // A second launch of displayxr-view: hit the single-instance mutex and
+        // handed its URL here rather than opening a second floating window.
+        // The payload is UNTRUSTED (any page on an allowed origin can produce
+        // it), so it goes through the same parser + policy the original launch
+        // did — never straight into SetWindowPos or a load.
+        const COPYDATASTRUCT* cds = (const COPYDATASTRUCT*)lParam;
+        if (!cds || cds->dwData != dxr::kViewProtocolCopyDataId) break;
+        std::string url;
+        if (cds->lpData && cds->cbData > 0) {
+            const char* p = (const char*)cds->lpData;
+            url.assign(p, strnlen(p, cds->cbData));
+        }
+        if (url.empty()) {
+            LOG_WARN("WM_COPYDATA: empty displayxr-view payload ignored");
+            return 0;
+        }
+        LOG_INFO("WM_COPYDATA: forwarded launch %s", url.c_str());
+        const dxr::LaunchArgs a = dxr::ParseLaunchArgs({url});
+        for (const std::string& w : a.warnings) LOG_WARN("forwarded launch: %s", w.c_str());
+        if (!a.ok()) {
+            for (const std::string& e : a.errors) LOG_ERROR("forwarded launch: %s", e.c_str());
+            ToastF("Refused - %s", a.errors.front().c_str());
+            return 0;
+        }
+        ApplyForwardedLaunch(hwnd, a);
+        return 0;
+    }
+
     case dxr_capture::kFlashUserMsg:
         // Render thread requested a capture-flash; start it on this thread
         // (the message-pump thread that owns the HWND).
@@ -1551,8 +1839,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int x, int y) {
-    LOG_INFO("Creating application window (%dx%d) at (%d,%d)", width, height, x, y);
+// `borderless` = the undock contract's --transparent: create the window
+// WS_POPUP + topmost from the FIRST frame instead of flipping styles after
+// creation. Transparency rule 2 (#833): never change window styles while the
+// window is shaped — Ctrl+T can only do it because it un-shapes first, and a
+// startup flip would make the undocked window flash a frame it never wanted.
+static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int x, int y,
+                            bool borderless) {
+    LOG_INFO("Creating application window (%dx%d) at (%d,%d) style=%s", width, height, x, y,
+             borderless ? "WS_POPUP topmost (undock)" : "WS_OVERLAPPEDWINDOW");
 
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
@@ -1575,14 +1870,33 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int x, i
         }
     }
 
+    // A popup has no non-client area, so client rect == window rect: do NOT
+    // grow the requested rect. An undock caller placed the window to match a
+    // rect it measured on its own page — inflating it by a title bar and
+    // borders would put the model somewhere else than where the page expects.
+    // NOT WS_VISIBLE: a visible top-level window is ACTIVATED at creation, and
+    // undocking must not pull focus off the page that spawned us. The window
+    // is shown later with SW_SHOWNOACTIVATE, exactly where the framed path
+    // already shows itself — which also spares the user an empty frame for
+    // the couple of seconds OpenXR + Vulkan init takes.
+    const DWORD style = borderless ? WS_POPUP : WS_OVERLAPPEDWINDOW;
     RECT rect = { 0, 0, width, height };
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    if (!borderless) {
+        AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    }
+
+    // WS_EX_TOPMOST while borderless: the undocked model floats over whatever
+    // spawned it (the avatar recipe) — a click that punches through activates
+    // the window behind without ever covering the asset.
+    const DWORD exStyle = WS_EX_NOREDIRECTIONBITMAP | (borderless ? WS_EX_TOPMOST : 0u);
 
     // INV-1.3 (runtime#715): (x, y) is the 3D panel top-left in virtual-screen
     // pixels (XrDisplayDesktopPositionDXR) — open the window on the panel, not
     // the primary monitor. (0,0) = primary/unknown, a safe create position.
-    HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP, WINDOW_CLASS, WINDOW_TITLE,
-        WS_OVERLAPPEDWINDOW,
+    // With --rect it is instead the caller's requested origin.
+    HWND hwnd = CreateWindowEx(exStyle, WINDOW_CLASS,
+        g_windowTitle.empty() ? WINDOW_TITLE : g_windowTitle.c_str(),
+        style,
         x, y,
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, hInstance, nullptr);
@@ -1653,7 +1967,15 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    VkClearColorValue clearColor = {{0.1f, 0.1f, 0.12f, 1.0f}};
+    // Transparent mode punches through on alpha, and the click-through region
+    // is derived from it — so an opaque slate here would park a dark rectangle
+    // over the desktop for as long as no model is loaded (exactly the window
+    // an undock launch spends downloading its --src). Clear to fully
+    // transparent instead; the toast band stays in-region and carries the
+    // progress. Opaque mode keeps the slate it always had.
+    VkClearColorValue clearColor = g_transparentBg.load()
+        ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
+        : VkClearColorValue{{0.1f, 0.1f, 0.12f, 1.0f}};
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
 
@@ -2979,15 +3301,18 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* exInfo) {
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
 
-    // Optional CLI: a single .glb/.gltf path to load at startup instead of the
-    // bundled sample. Trim surrounding whitespace + quotes from the raw cmdline.
-    std::string cliModelPath;
-    if (lpCmdLine && *lpCmdLine) {
-        std::string s(lpCmdLine);
-        size_t a = s.find_first_not_of(" \t\"");
-        size_t b = s.find_last_not_of(" \t\"");
-        if (a != std::string::npos) cliModelPath = s.substr(a, b - a + 1);
-    }
+    (void)lpCmdLine;  // superseded by ParseLaunchArgsFromCommandLine (GetCommandLineW)
+
+    // The undock launch contract (displayxr-common): the legacy positional
+    // model path, the --transparent/--rect/--src/--vh flags, and a
+    // displayxr-view: protocol URL all land in ONE validated struct, under one
+    // security policy shared with the splat viewer. Parsed from
+    // GetCommandLineW rather than WinMain's ANSI lpCmdLine, so non-ASCII paths
+    // survive. Logging is not up yet — errors/warnings are reported below.
+    g_launch = dxr::ParseLaunchArgsFromCommandLine();
+    // The model loaders fopen a narrow path, so convert once here (same
+    // lossiness the old lpCmdLine trim always had — no worse).
+    std::string cliModelPath = dxr::NarrowPathForFopen(g_launch.positionalPath);
 
     SetUnhandledExceptionFilter(CrashHandler);
 
@@ -2996,6 +3321,119 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) ===");
+
+    // ── Launch contract: report, refuse, route, then configure ───────────
+    for (const std::string& w : g_launch.warnings) LOG_WARN("launch: %s", w.c_str());
+    if (!g_launch.ok()) {
+        for (const std::string& e : g_launch.errors) LOG_ERROR("launch: %s", e.c_str());
+        // A protocol launch has no console and no parent reading stderr — the
+        // refusal has to be visible, or a page whose URL was rejected sees
+        // nothing at all and cannot tell "refused" from "crashed". A CLI
+        // launch gets the log plus the exit code.
+        if (g_launch.fromProtocol) {
+            LaunchDialog(dxr::WideFromUtf8(g_launch.errors.front()).c_str(),
+                         L"DisplayXR 3D Model Viewer — launch refused", MB_ICONERROR);
+        }
+        ShutdownLogging();
+        return 2;
+    }
+    LOG_INFO("launch: transparent=%d rect=%s(%d,%d %dx%d) vh=%s(%.4f) src='%s' kind=%d "
+             "type='%s' title='%s' protocol=%d max-bytes=%llu no-cache=%d dpr=%s(%.3f)",
+             (int)g_launch.transparent, g_launch.hasRect ? "yes" : "no",
+             g_launch.rectX, g_launch.rectY, g_launch.rectW, g_launch.rectH,
+             g_launch.hasVh ? "yes" : "no", g_launch.vh,
+             g_launch.src.c_str(), (int)g_launch.srcKind,
+             g_launch.type.c_str(), g_launch.title.c_str(), (int)g_launch.fromProtocol,
+             (unsigned long long)g_launch.maxBytes, (int)g_launch.noCache,
+             g_launch.hasDpr ? "yes" : "no", g_launch.dpr);
+    if (!g_launch.positionalPath.empty())
+        LOG_INFO("launch: positional model path '%s'", cliModelPath.c_str());
+
+    // Self-register the displayxr-view: scheme on EVERY launch, protocol or
+    // not. HKCU, because the installers run elevated and an HKCU write there
+    // lands in the elevating admin's hive. Idempotent, and it leaves a LIVE
+    // sibling that owns the scheme alone (type forwarding covers that).
+    {
+        const bool reg = dxr::EnsureViewProtocolRegistered(dxr::ThisExePath(),
+                                                           L"DisplayXR 3D Model Viewer");
+        LOG_INFO("displayxr-view: protocol association %s", reg ? "OK" : "FAILED");
+    }
+
+    if (g_launch.fromProtocol) {
+        // (a) Not our type — one scheme serves every viewer, so hand the
+        //     IDENTICAL URL to the sibling that owns this asset kind. One
+        //     scheme is what makes the browser ask the user only once.
+        if (!g_launch.type.empty() && g_launch.type != "model") {
+            const std::wstring sibling =
+                dxr::FindSiblingViewer(L"GaussianSplat", L"gaussian_splatting_handle_vk_win.exe");
+            if (sibling.empty()) {
+                LOG_ERROR("launch: type='%s' is not ours and no sibling viewer is installed",
+                          g_launch.type.c_str());
+                LaunchDialog(
+                            L"This link opens a Gaussian splat scene.\n\n"
+                            L"Please install the DisplayXR Gaussian Splat viewer to open it.",
+                            L"DisplayXR 3D Model Viewer", MB_ICONINFORMATION);
+                ShutdownLogging();
+                return 3;
+            }
+            const bool launched =
+                dxr::LaunchViewerWithUrl(sibling, dxr::WideFromUtf8(g_launch.protocolUrl));
+            LOG_INFO("launch: forwarded type='%s' to %ls (%s)", g_launch.type.c_str(),
+                     sibling.c_str(), launched ? "OK" : "FAILED");
+            if (!launched) {
+                LaunchDialog(L"Could not start the DisplayXR Gaussian Splat viewer.",
+                             L"DisplayXR 3D Model Viewer", MB_ICONERROR);
+                ShutdownLogging();
+                return 3;
+            }
+            ShutdownLogging();
+            return 0;
+        }
+
+        // (b) Single instance: a second undock of the same viewer moves and
+        //     re-points the window that is already floating instead of
+        //     stacking another one over the desktop.
+        g_singleInstanceMutex = dxr::AcquireSingleInstanceOrForward(
+            L"Local\\DisplayXR.ModelViewer.Undock", WINDOW_CLASS, g_launch.protocolUrl);
+        if (!g_singleInstanceMutex) {
+            LOG_INFO("launch: handed the URL to the running instance — exiting");
+            ShutdownLogging();
+            return 0;
+        }
+    }
+
+    // Transparent/borderless/topmost FROM FRAME 0 (transparency rule 2: never
+    // change window styles while shaped). These are stores rather than atomic
+    // initialisers because g_launch does not exist until this function runs;
+    // nothing reads either flag before here. Ctrl+T remains the live toggle.
+    if (g_launch.transparent) {
+        g_transparentBg.store(true);
+        g_borderless.store(true);
+        LOG_INFO("launch: --transparent — creating the window borderless + topmost");
+    }
+    // --title is a SUFFIX. The base title is load-bearing for the repo's
+    // AppActivate capture workflow, so it never gets replaced.
+    g_windowTitle = WINDOW_TITLE;
+    if (!g_launch.title.empty()) {
+        g_windowTitle += L" - " + dxr::WideFromUtf8(g_launch.title);
+    }
+    if (g_launch.hasVh) {
+        g_vhOverride.store(g_launch.vh, std::memory_order_relaxed);
+        LOG_INFO("launch: --vh=%.4f m pins the virtual display height (auto-fit will not "
+                 "re-derive it)", g_launch.vh);
+    }
+    // --src=<local path> is just another way to say the positional path.
+    // --src=<url> suppresses the bundled auto-load: the download replaces it,
+    // and auto-loading the helmet first would flash a model the caller never
+    // asked for over the desktop.
+    bool suppressAutoLoad = false;
+    if (g_launch.srcKind == dxr::LaunchSrcKind::LocalPath) {
+        cliModelPath = dxr::NarrowPathForFopen(g_launch.src);
+        LOG_INFO("launch: --src local path '%s'", cliModelPath.c_str());
+    } else if (g_launch.srcKind == dxr::LaunchSrcKind::Url) {
+        suppressAutoLoad = true;
+        cliModelPath.clear();
+    }
 
     // Dynamic-recenter pins: default hard-pin X+Y+Z (modelviewer's historical
     // behaviour); DXR_RECENTER_PIN=XYZ|XY|Z|- overrides for headless testing.
@@ -3028,8 +3466,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight,
-        g_displayDesktopLeft, g_displayDesktopTop);
+    // Placement. Default: the panel's top-left at the historical 1280x720
+    // (INV-1.3). With --rect: exactly the rect the caller measured, in physical
+    // virtual-screen pixels — this exe is PerMonitorV2
+    // (model_viewer_openxr_ext_vk.manifest), so no DPI scaling is applied to
+    // what it was handed.
+    int32_t winX = g_displayDesktopLeft;
+    int32_t winY = g_displayDesktopTop;
+    int32_t winW = (int32_t)g_windowWidth;
+    int32_t winH = (int32_t)g_windowHeight;
+    if (g_launch.hasRect) {
+        winX = g_launch.rectX;
+        winY = g_launch.rectY;
+        winW = g_launch.rectW;
+        winH = g_launch.rectH;
+        LOG_INFO("Undock rect requested: (%d,%d %dx%d)%s%.3f", winX, winY, winW, winH,
+                 g_launch.hasDpr ? "  dpr=" : "  dpr=n/a ", g_launch.hasDpr ? g_launch.dpr : 0.0f);
+        ClampRectIntoPanel(winX, winY, winW, winH);
+        g_windowWidth = (UINT)winW;
+        g_windowHeight = (UINT)winH;
+    }
+    LOG_INFO("Undock rect final: (%d,%d %dx%d) panel-confirmed=%d panel-rect=(%d,%d %dx%d)",
+             winX, winY, winW, winH, (int)g_displayPanelConfirmed,
+             g_displayDesktopRect.offset.x, g_displayDesktopRect.offset.y,
+             g_displayDesktopRect.extent.width, g_displayDesktopRect.extent.height);
+
+    HWND hwnd = CreateAppWindow(hInstance, winW, winH, winX, winY, g_launch.transparent);
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
         CleanupOpenXR(xr);
@@ -3166,7 +3628,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 LOG_INFO("Deterministic capture: auto-orbit disabled (DXR_MODELVIEWER_DETERMINISTIC)");
             }
             TryAutoLoadBundledEnvironment();
-            TryAutoLoadBundledScene(cliModelPath);
+            if (suppressAutoLoad) {
+                LOG_INFO("--src is a URL — skipping the bundled auto-load; the download "
+                         "below supplies the scene");
+            } else {
+                TryAutoLoadBundledScene(cliModelPath);
+            }
         }
     }
 
@@ -3356,8 +3823,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    ShowWindow(hwnd, nCmdShow);
+    // Undocking must not steal focus from whatever spawned us — the browser
+    // tab stays active while the model appears beside it. SW_SHOWNOACTIVATE
+    // shows without activating; the window is already WS_VISIBLE|WS_EX_TOPMOST
+    // from creation, so it is on top without being foreground.
+    if (g_launch.transparent) {
+        // Twice on purpose: the FIRST ShowWindow of a process started with
+        // SW_SHOWDEFAULT is overridden by the launcher's STARTUPINFO, which
+        // would activate the window and defeat the whole point. The second
+        // call is the one that is honoured verbatim.
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    } else {
+        ShowWindow(hwnd, nCmdShow);
+    }
     UpdateWindow(hwnd);
+
+    // --src=<url>: start the download now that the toast layer exists, so the
+    // progress chip has somewhere to land. Detached worker; the loaded path
+    // crosses back through the render thread's load queue.
+    if (g_launch.srcKind == dxr::LaunchSrcKind::Url) {
+        StartSrcFetch(hwnd, g_launch.src, g_launch.fromProtocol, g_launch.maxBytes,
+                      g_launch.noCache);
+    }
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
@@ -3464,6 +3952,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_appHwnd = nullptr;
     DestroyWindow(hwnd);
     UnregisterClass(WINDOW_CLASS, hInstance);
+
+    // Held for the process lifetime so a second protocol launch forwards here
+    // instead of opening a second window; released last, after the window is
+    // gone, so the next instance cannot find a dying HWND to SendMessage.
+    if (g_singleInstanceMutex) {
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = nullptr;
+    }
 
     LOG_INFO("Application shutdown complete");
     ShutdownLogging();
