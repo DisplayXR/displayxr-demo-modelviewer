@@ -1504,6 +1504,104 @@ const char* ModelRenderer::toneCurveName() const {
     }
 }
 
+// ===========================================================================
+// Studio rig - the storefront page's lighting, reproduced.
+//
+// The DisplayXR storefront's inline-3D tile lights every model with three.js's
+// addStudioLights (displayxr-shop-pvt, src/vendor/inline3d/inline3d-model.js):
+// three DirectionalLights plus a HemisphereLight, physically-correct
+// intensities, NO environment map, and a WebGLRenderer left at the default
+// NoToneMapping. When a page hands a model to this viewer over displayxr-view:
+// the two end up side by side on one desktop, so anything that does not match
+// reads as a bug in the viewer. Metal is where it shows: three sharp lights on
+// an otherwise unlit body read as metal, while this viewer's smooth analytic
+// sky gives the same body a uniform grey reflection that reads as matte.
+//
+// three.js and this renderer already share a world frame - +Y up, camera down
+// -Z so +Z is toward the viewer - and a three.js DirectionalLight points from
+// its `position` at the origin. So a light's `position`, normalised, IS the
+// shader's world direction TO the light, with no change of basis. Verified by
+// eye on an atlas capture, not assumed.
+namespace {
+
+constexpr float kStudioKeyDir[3]  = { 1.0f,  1.4f,  1.6f};   // upper front right
+constexpr float kStudioKeyI       = 2.2f;
+constexpr float kStudioFillDir[3] = {-1.4f,  0.4f,  0.8f};   // front left, low
+constexpr float kStudioFillI      = 0.7f;
+constexpr float kStudioRimDir[3]  = {-0.4f,  0.8f, -1.6f};   // behind, upper left
+constexpr float kStudioRimI       = 1.0f;
+constexpr float kStudioHemiI      = 0.6f;
+
+// HemisphereLight(sky 0xffffff, ground 0x444444). three.js r152+ has
+// ColorManagement on by default, so a hex colour is DECODED from sRGB into the
+// linear working space before it is ever used: the ground is 0.0578 linear, not
+// 0x44/255 = 0.267. Getting this wrong lifts every downward-facing surface by
+// ~4.6x, which on a bottle is the whole lower half.
+constexpr float kStudioHemiSky[3]    = {1.0f, 1.0f, 1.0f};
+constexpr float kStudioHemiGround[3] = {0.057805f, 0.057805f, 0.057805f};
+
+// How much of the analytic-sky IBL survives under Studio.
+//
+// The faithful number is 0: the page has no environment map at all, so its
+// metal is lit by three lights and nothing else. It is 0.15 instead for one
+// reason specific to this display - a metal with no environment goes pure black
+// everywhere the three lights miss, and a black region is the one thing a
+// lightfield panel has NO parallax detail to show. A body that is black in
+// every view carries no depth cue at all, so the object reads as a flat cut-out
+// floating in front of the desktop. 0.15 leaves the direct highlights dominant
+// by close to an order of magnitude (measured on WaterBottle.glb; see the #113
+// PR comment) while keeping the body's form readable in 3D.
+constexpr float kStudioIblScale = 0.15f;
+
+void normalizeInto(float out[4], const float dir[3], float intensity) {
+    const float n = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+    const float inv = (n > 1e-6f) ? (1.0f / n) : 0.0f;
+    out[0] = dir[0] * inv; out[1] = dir[1] * inv; out[2] = dir[2] * inv;
+    out[3] = intensity;
+}
+
+}  // namespace
+
+void ModelRenderer::setLightingMode(LightingMode m) {
+    lightingMode_ = m;
+    // The grading is PART of the mode. The page runs three.js at unit exposure
+    // with NoToneMapping, so Studio has to as well - a filmic knee alone would
+    // pull every highlight the rig exists to produce back under 1.0 and undo
+    // the comparison. Sky keeps the #70 phase-0 pairing (PBR Neutral needs the
+    // +1 EV to reach its knee at all). [ / ] and G still override afterwards;
+    // this only sets the mode's starting point.
+    if (m == LightingMode::Studio) {
+        exposureEV_ = 0.0f;
+        toneCurve_  = ToneCurve::Clamp;
+    } else {
+        exposureEV_ = 1.0f;
+        toneCurve_  = ToneCurve::PbrNeutral;
+    }
+    std::printf("ModelRenderer: lighting = %s (exposure %+.2f EV, tone %s)\n",
+                lightingModeName(), exposureEV_, toneCurveName());
+}
+
+const char* ModelRenderer::lightingModeName() const {
+    switch (lightingMode_) {
+        case LightingMode::Studio: return "studio";
+        case LightingMode::NoLights:   return "none";
+        default:                   return "sky";
+    }
+}
+
+void ModelRenderer::cycleLightingMode() {
+    setLightingMode(lightingMode_ == LightingMode::Sky    ? LightingMode::Studio
+                  : lightingMode_ == LightingMode::Studio ? LightingMode::NoLights
+                                                          : LightingMode::Sky);
+}
+
+bool ModelRenderer::parseLightingMode(const std::string& env, LightingMode& out) {
+    if (env == "studio") { out = LightingMode::Studio; return true; }
+    if (env == "sky")    { out = LightingMode::Sky;    return true; }
+    if (env == "none")   { out = LightingMode::NoLights;   return true; }
+    return false;
+}
+
 VkDescriptorSet ModelRenderer::makeMaterialSet(const VkImageView views[MTEX_COUNT]) {
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = matPool_;
@@ -1807,20 +1905,44 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     // an sRGB swapchain, whose blit already encodes. Repurposes an unused slot.
     ub.cameraPos[3] = swapchainIsSrgb_ ? 0.0f : 1.0f;
 
-    // Fixed key light (world space), normalized.
-    float lx = 0.4f, ly = 0.8f, lz = 0.5f;
+    const bool studio = (lightingMode_ == LightingMode::Studio);
+
+    // Key light (world space), normalized. Studio takes the page's key
+    // direction; Sky and None keep the direction the analytic sky bakes its sun
+    // at (sky.glsl uses the same vector, so lit and reflected highlights agree).
+    float lx = studio ? kStudioKeyDir[0] : 0.4f;
+    float ly = studio ? kStudioKeyDir[1] : 0.8f;
+    float lz = studio ? kStudioKeyDir[2] : 0.5f;
     float ln = std::sqrt(lx * lx + ly * ly + lz * lz);
     ub.lightDir[0] = lx / ln; ub.lightDir[1] = ly / ln; ub.lightDir[2] = lz / ln;
     ub.lightDir[3] = (clipFar > 0.0f) ? clipFar : 0.0f;  // foreground clip (view-space)
 
     // Grading (issue #70 phase 0). .z gates the analytic key light off under an
-    // HDRI, which already contains its own sun — see pbr.frag.
+    // HDRI, which already contains its own sun - see pbr.frag. None gates it off
+    // outright (that mode IS "ambient only"). Studio ignores .z entirely: its
+    // key scale comes from studio.y, so an HDRI cannot silently unlight it.
     ub.tone[0] = std::pow(2.0f, exposureEV_);
     ub.tone[1] = (float)(int)toneCurve_;
-    ub.tone[2] = envIsHdri_ ? 0.0f : 1.0f;
+    ub.tone[2] = (lightingMode_ == LightingMode::NoLights || envIsHdri_) ? 0.0f : 1.0f;
     ub.tone[3] = transmissionProbe_ ? 1.0f : 0.0f;
     ub.viewport[0] = (width_  > 0) ? (float)vpWidth_  / (float)width_  : 1.0f;
     ub.viewport[1] = (height_ > 0) ? (float)vpHeight_ / (float)height_ : 1.0f;
+
+    // Studio rig. Written unconditionally (zero-cost: the shader reads them
+    // only when studio.x is 1) so a mode switch is one uniform away and never
+    // leaves a stale direction behind.
+    ub.studio[0] = studio ? 1.0f : 0.0f;
+    ub.studio[1] = kStudioKeyI;
+    ub.studio[2] = kStudioHemiI;
+    ub.studio[3] = kStudioIblScale;
+    normalizeInto(ub.studioFill, kStudioFillDir, kStudioFillI);
+    normalizeInto(ub.studioRim,  kStudioRimDir,  kStudioRimI);
+    ub.hemiSky[0]    = kStudioHemiSky[0];
+    ub.hemiSky[1]    = kStudioHemiSky[1];
+    ub.hemiSky[2]    = kStudioHemiSky[2];
+    ub.hemiGround[0] = kStudioHemiGround[0];
+    ub.hemiGround[1] = kStudioHemiGround[1];
+    ub.hemiGround[2] = kStudioHemiGround[2];
     // DXR_MODELVIEWER_KULLA_CONTY=1 switches the scatter lobe to the spec's
     // multi->single scatter albedo remap, so the two can be MEASURED against the
     // conformance references rather than argued about. See pbr.frag.

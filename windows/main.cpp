@@ -1805,6 +1805,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             LOG_INFO("Tone curve: %s", g_modelRenderer.toneCurveName());
             return 0;
         }
+        // L cycles the lighting mode: sky -> studio -> none. Bare L is free -
+        // the open-file binding moved to Ctrl+O. Each mode re-pins exposure and
+        // the tone curve (see setLightingMode), so [ / ] and G after an L are
+        // deviations FROM the mode rather than leftovers from the last one.
+        if (wParam == 'L' && !(GetKeyState(VK_CONTROL) & 0x8000)) {
+            g_modelRenderer.cycleLightingMode();
+            LOG_INFO("Lighting: %s", g_modelRenderer.lightingModeName());
+            wchar_t w[64];
+            swprintf(w, 64, L"Lighting  %hs", g_modelRenderer.lightingModeName());
+            g_toast.Show(w);
+            return 0;
+        }
         // Dynamic-recenter pins: P arms, then X/Y/Z toggle that axis' pin.
         // onKey consumes P (arm) and X/Y/Z (while armed); otherwise it falls
         // through untouched (X/Y/Z are not bound elsewhere).
@@ -3692,6 +3704,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 g_inputState.animateEnabled = false;
                 LOG_INFO("Deterministic capture: auto-orbit disabled (DXR_MODELVIEWER_DETERMINISTIC)");
             }
+            // --env= / protocol env= -> lighting mode (common v2.9.5).
+            //
+            // A PROTOCOL launch is by definition an undock from a storefront
+            // page, and that page lit the same asset with its three-point
+            // studio rig - so Studio is the default there, or the model would
+            // change materials the moment it left the tile. A plain desktop
+            // launch keeps Sky, this viewer's own look. An explicit --env
+            // always wins over both.
+            {
+                ModelRenderer::LightingMode lm =
+                    g_launch.fromProtocol ? ModelRenderer::LightingMode::Studio
+                                          : ModelRenderer::LightingMode::Sky;
+                if (!g_launch.env.empty() &&
+                    !ModelRenderer::parseLightingMode(g_launch.env, lm)) {
+                    LOG_WARN("launch: env='%s' is not a lighting mode this viewer "
+                             "knows (studio|sky|none) - ignored", g_launch.env.c_str());
+                }
+                g_modelRenderer.setLightingMode(lm);
+                LOG_INFO("Lighting: %s (env='%s', protocol=%d), MSAA %ux",
+                         g_modelRenderer.lightingModeName(),
+                         g_launch.env.c_str(), (int)g_launch.fromProtocol,
+                         g_modelRenderer.sampleCount());
+            }
+            // Environment first: setEnvironment rebakes the IBL cubes.
             TryAutoLoadBundledEnvironment();
             if (suppressAutoLoad) {
                 LOG_INFO("--src is a URL — skipping the bundled auto-load; the download "
