@@ -320,6 +320,14 @@ static std::string g_pendingLoadPath;
 // with the path it belongs to.
 static bool g_pendingLoadFromUrl = false;
 static std::mutex g_pendingLoadPathMutex;
+// 'L' cycles the lighting mode, and since the `room` mode was added that is no
+// longer a pure uniform change: entering or leaving room REBAKES the IBL cubes
+// (sky.glsl <-> room.glsl), which is vkQueueWaitIdle + a few dozen submits on
+// the same single graphics queue the paragraph above is about. So L goes
+// through the same door the file dialog does - the key handler only counts the
+// presses, the render thread performs them between frames. A counter rather
+// than a flag so a fast lll is three modes on, not one.
+static std::atomic<int> g_lightingCyclePending{0};
 // 'I' key: capture the multi-view atlas region (cols × rows × renderW × renderH)
 // of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
 // 1×1 (mono) layouts. Helper lives in test_apps/common/atlas_capture*.
@@ -1805,16 +1813,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             LOG_INFO("Tone curve: %s", g_modelRenderer.toneCurveName());
             return 0;
         }
-        // L cycles the lighting mode: sky -> studio -> none. Bare L is free -
+        // L cycles the lighting mode: sky -> studio -> room -> none. Bare L is free -
         // the open-file binding moved to Ctrl+O. Each mode re-pins exposure and
         // the tone curve (see setLightingMode), so [ / ] and G after an L are
         // deviations FROM the mode rather than leftovers from the last one.
         if (wParam == 'L' && !(GetKeyState(VK_CONTROL) & 0x8000)) {
-            g_modelRenderer.cycleLightingMode();
-            LOG_INFO("Lighting: %s", g_modelRenderer.lightingModeName());
-            wchar_t w[64];
-            swprintf(w, 64, L"Lighting  %hs", g_modelRenderer.lightingModeName());
-            g_toast.Show(w);
+            // Queue it; the render thread cycles and reports (see
+            // g_lightingCyclePending). Nothing is logged or toasted here,
+            // because the mode this press lands on is not known until the
+            // render thread has applied every press queued ahead of it.
+            g_lightingCyclePending.fetch_add(1, std::memory_order_release);
             return 0;
         }
         // Dynamic-recenter pins: P arms, then X/Y/Z toggle that axis' pin.
@@ -2163,6 +2171,19 @@ static void RenderThreadFunc(
         // Request main thread to open file dialog when L key or Load button was pressed.
         if (loadReq) {
             PostMessage(hwnd, WM_USER + 1, 0, 0);
+        }
+
+        // Drain queued 'L' presses. Same rule as the scene load below: entering
+        // or leaving `room` rebakes the IBL cubes on the graphics queue, so the
+        // mode change belongs to this thread. Toast + log from here too, so
+        // they name the mode that was actually applied.
+        if (int cycles = g_lightingCyclePending.exchange(0, std::memory_order_acquire)) {
+            for (int i = 0; i < cycles; ++i) g_modelRenderer.cycleLightingMode();
+            LOG_INFO("Lighting: %s (env %s, exposure %+.2f EV, tone %s)",
+                     g_modelRenderer.lightingModeName(),
+                     g_modelRenderer.environmentName().c_str(),
+                     g_modelRenderer.exposureEV(), g_modelRenderer.toneCurveName());
+            ToastF("Lighting  %s", g_modelRenderer.lightingModeName());
         }
 
         // Drain a queued scene load (set by OpenLoadDialog on the main
@@ -3707,19 +3728,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             // --env= / protocol env= -> lighting mode (common v2.9.5).
             //
             // A PROTOCOL launch is by definition an undock from a storefront
-            // page, and that page lit the same asset with its three-point
-            // studio rig - so Studio is the default there, or the model would
-            // change materials the moment it left the tile. A plain desktop
-            // launch keeps Sky, this viewer's own look. An explicit --env
-            // always wins over both.
+            // page, so the default is whatever that page's SDK lights a tile
+            // with when the page says nothing - and that is now Room (three.js
+            // RoomEnvironment through a PMREM), not the three-point studio rig
+            // it used to be. A page that still lights with the rig says so
+            // explicitly with env=studio, which is why following the SDK's
+            // default here is safe: the only launches this changes are the ones
+            // that named no environment at all, and those are exactly the ones
+            // the page renders as room. A plain desktop launch keeps Sky, this
+            // viewer's own look. An explicit --env always wins over both.
             {
                 ModelRenderer::LightingMode lm =
-                    g_launch.fromProtocol ? ModelRenderer::LightingMode::Studio
+                    g_launch.fromProtocol ? ModelRenderer::LightingMode::Room
                                           : ModelRenderer::LightingMode::Sky;
                 if (!g_launch.env.empty() &&
                     !ModelRenderer::parseLightingMode(g_launch.env, lm)) {
                     LOG_WARN("launch: env='%s' is not a lighting mode this viewer "
-                             "knows (studio|sky|none) - ignored", g_launch.env.c_str());
+                             "knows (studio|sky|room|none) - ignored", g_launch.env.c_str());
                 }
                 g_modelRenderer.setLightingMode(lm);
                 LOG_INFO("Lighting: %s (env='%s', protocol=%d), MSAA %ux",
