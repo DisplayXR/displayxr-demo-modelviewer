@@ -60,6 +60,7 @@
 #include "model_renderer.h"
 #include "atlas_capture.h"
 #include "auto_fit.h"    // dxr::AutoFitVHeight — shared width-aware load-time framing
+#include "model_fit.h"   // modelviewer::FitVHeight — the page-parity framing rule
 
 // ============================================================================
 // Logging
@@ -145,11 +146,14 @@ struct InputState {
 // percentile-based extent — see ApplyAutoFitForLoadedScene().
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
-// Load-time framing is the shared width-aware rule from displayxr-common
-// (dxr::AutoFitVHeight, default dxr::kAutoFitDefaultFill = 80%): the model
-// spans at most 80% of the viewport in BOTH axes, so a wide asset is bound by
-// width instead of overflowing the sides. There is no separate vertical
-// comfort multiplier — the fill fraction IS the headroom.
+// Load-time framing is the page's rule (common/model_fit.h), which composes
+// the shared width-aware rule from displayxr-common (dxr::AutoFitVHeight,
+// default dxr::kAutoFitDefaultFill = 80%): the model spans at most 80% of the
+// viewport in BOTH axes, with the SWEPT horizontal extent hypot(W, D) as the
+// width so a deep asset still fits once the turntable turns it, plus a depth
+// backstop. There is no separate vertical comfort multiplier — the fill
+// fraction IS the headroom. One rule across every leg: see common/model_fit.h
+// for why it has to equal the web SDK's SceneViewer.fitTo.
 
 // Cached auto-fit result for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -2029,7 +2033,8 @@ static void ApplyAutoFitForLoadedScene() {
                 viewportH = (float)cs.height;
             }
         }
-        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH);
+        float sweptW = 0.0f;
+        float vh = modelviewer::FitVHeight(extent, viewportW, viewportH, &sweptW);
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
         g_fitVHeight = vh;
 
@@ -2042,12 +2047,13 @@ static void ApplyAutoFitForLoadedScene() {
         // the viewport aspect can hold at the height-only vHeight.
         const bool haveViewport = (viewportW > 0.0f && viewportH > 0.0f);
         const float aspect = haveViewport ? (viewportW / viewportH) : 0.0f;
-        const char *boundBy = !haveViewport ? "height (no viewport)"
-                            : (extent[0] / aspect > extent[1]) ? "width" : "height";
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent W=%.3f H=%.3f D=%.3f "
+        const char *boundBy = !haveViewport
+                            ? "height (no viewport)"
+                            : modelviewer::FitBoundBy(sweptW, extent[1], extent[2], aspect);
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent W=%.3f H=%.3f D=%.3f swept-W=%.3f "
                  "viewport=%.0fx%.0f (aspect %.3f) bound-by=%s fill=%.0f%% vHeight=%.3f yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2],
+                 extent[0], extent[1], extent[2], sweptW,
                  viewportW, viewportH, aspect, boundBy,
                  dxr::kAutoFitDefaultFill * 100.0f, vh, g_fitYaw * 57.2957795f);
     } else {

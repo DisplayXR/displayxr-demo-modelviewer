@@ -236,8 +236,10 @@ float g_rig_vh = 1.33f;  // virtual display height (app units); refit per model
 // landed" convention). Inlined because the Android build cannot link
 // displayxr_common_lib -- adopting the header-only displayxr::rules target is
 // the follow-up that retires every copy of this.
-float g_fit_ext_w = 0.0f;   // cached CONTENT extents (already fit-scaled)
+float g_fit_ext_w = 0.0f;   // cached CONTENT extents (already fit-scaled);
+                            // _w is the SWEPT horizontal extent hypot(W, D)
 float g_fit_ext_h = 0.0f;
+float g_fit_ext_d = 0.0f;   // depth, for the depth backstop
 float g_fit_vp_aspect = 0.0f; // aspect the current base was derived from
 float g_refit_from = 0.0f;
 float g_refit_to = 0.0f;
@@ -323,6 +325,10 @@ constexpr float kTargetSize = 0.95f;  // normalized world size of the largest mo
 // viewport in BOTH axes. Mirrors displayxr-common auto_fit.h
 // dxr::kAutoFitDefaultFill — keep the two in step.
 constexpr float kAutoFitFill = 0.8f;
+// Backstop on total subject depth, in display heights. Mirrors
+// modelviewer::kFitDepthLimit (common/model_fit.h) and the inline3d SDK's
+// SceneViewer depthLimit — keep the three in step.
+constexpr float kFitDepthLimit = 4.0f;
 // Flip the splat vertically (some splats are trained Y-up vs Y-down).
 bool g_flip_y = false;  // glTF is Y-up already (the butterfly point cloud was upside-down)
 // Slow turntable spin about Y (radians/frame). 0 = static. Auto-spin runs until
@@ -1048,10 +1054,16 @@ load_model_path(const char *path)
 
 		// Width-aware fit: the scaled model caps at kAutoFitFill of the
 		// viewport in BOTH axes, so a wide model is bound by width instead of
-		// overflowing the sides. Live canvas px when a frame has landed, else
-		// the active mode's panel px (this runs before the first frame).
-		// Mirrors displayxr-common auto_fit.h AutoFitVHeight — inlined because
-		// the Android leg does not pull displayxr-common.
+		// overflowing the sides. THE HORIZONTAL EXTENT IS THE SWEPT DIAGONAL
+		// hypot(W, D), not the width: the turntable swings depth into the
+		// horizontal, so a deep model fitted face-on overflows the moment it
+		// turns — and the page's rule (common/model_fit.h, which the desktop
+		// legs use) does the same, which is what keeps an undocked model the
+		// same apparent size as the tile it came from. Live canvas px when a
+		// frame has landed, else the active mode's panel px (this runs before
+		// the first frame). Mirrors common/model_fit.h over displayxr-common
+		// auto_fit.h AutoFitVHeight — inlined because the Android leg does not
+		// pull displayxr-common.
 		// Live canvas > app window > native panel. The panel is LAST because
 		// it is orientation-blind: display-derived px stay 2560x1600 in
 		// portrait, where the real viewport is 1600x2560, and the fit then
@@ -1066,7 +1078,9 @@ load_model_path(const char *path)
 			vp_w = g_disp_px_w;
 			vp_h = g_disp_px_h;
 		}
-		const float fit_w = ext[0] * g_fit_scale;
+		const float fit_d = ext[2] * g_fit_scale;
+		const float fit_w =
+		    std::sqrt(ext[0] * ext[0] + ext[2] * ext[2]) * g_fit_scale;  // swept
 		const float fit_h = ext[1] * g_fit_scale;
 		float vh = fit_h / kAutoFitFill;
 		const bool have_vp = (vp_w > 0 && vp_h > 0);
@@ -1077,15 +1091,25 @@ load_model_path(const char *path)
 				vh = vh_for_width;
 			}
 		}
+		if (fit_d > 0.0f) {
+			const float vh_for_depth = fit_d / kFitDepthLimit;
+			if (vh_for_depth > vh) {
+				vh = vh_for_depth;
+			}
+		}
 		g_rig_vh = (vh > 1e-3f) ? vh : kTargetSize / kAutoFitFill;
 		// Cache for the viewport-change refit. The extents are CONTENT
 		// properties, so a rotation re-derives the base without re-measuring.
 		g_fit_ext_w = fit_w;
 		g_fit_ext_h = fit_h;
+		g_fit_ext_d = fit_d;
 		g_fit_vp_aspect = have_vp ? vp_aspect : 0.0f;
 		g_refit_t = 1.0f; // landed
-		const char *bound_by = !have_vp                      ? "height (no viewport)"
-		                       : (fit_w / vp_aspect > fit_h) ? "width"
+		const char *bound_by = !have_vp ? "height (no viewport)"
+		                       : (fit_d / kFitDepthLimit > fit_h / kAutoFitFill &&
+		                          fit_d / kFitDepthLimit > fit_w / (kAutoFitFill * vp_aspect))
+		                           ? "depth"
+		                       : (fit_w / vp_aspect > fit_h) ? "swept-width"
 		                                                     : "height";
 		LOGI("scene center=(%.2f,%.2f,%.2f) extent W=%.2f H=%.2f D=%.2f "
 		     "viewport=%ux%u (aspect %.3f) bound-by=%s push=%.2f rig_vh=%.2f",
@@ -1304,6 +1328,8 @@ render_frame()
 					float vh = g_fit_ext_h / kAutoFitFill;
 					const float vh_w = g_fit_ext_w / (kAutoFitFill * a);
 					if (vh_w > vh) vh = vh_w;
+					const float vh_d = g_fit_ext_d / kFitDepthLimit;
+					if (vh_d > vh) vh = vh_d;
 					if (vh > 1e-3f) {
 						g_refit_from = g_rig_vh;
 						g_refit_to = vh;

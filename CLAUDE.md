@@ -80,6 +80,19 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   `ez` (large scenes don't clip). macOS has no transparent mode → `far_offset =
   1000·vH` there. This whole path is dormant whenever the runtime supplies the
   rig (the common case); it survives as the no-extension fallback.
+- **Load-time framing is the WEB rule, not just `dxr::AutoFitVHeight`.**
+  `common/model_fit.h` (`modelviewer::FitVHeight`) is the single framing rule
+  every leg uses — Windows/macOS/Linux call it, Android inlines the same maths.
+  It composes displayxr-common's `dxr::AutoFitVHeight` (80% fill in BOTH axes)
+  but passes the **swept horizontal extent `hypot(W, D)`** as the width and adds
+  a **depth backstop** (`D / 4.0` display heights). That is exactly the inline3d
+  SDK's `SceneViewer.fitTo` with `addModel`'s defaults (`fit:'contain'`,
+  `margin:0.8`, `fitSweep:true`, `depthLimit:4.0`), and it has to stay exactly
+  that: the storefront **undocks** a product into this viewer at the page tile's
+  own pixel rect and sends no `--vh`, so the two rules disagreeing means the
+  product visibly changes size as it leaves the page. Only a DEEP subject
+  notices (`D > W / aspect`); `--vh` still overrides the whole thing.
+
 - **IBL** is generated once at init from a procedural analytic sky (`sky.glsl`):
   BRDF LUT + irradiance cube + roughness-mipped prefiltered cube; split-sum in
   `pbr.frag`. The **skybox** samples the prefiltered cube at a high mip

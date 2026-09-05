@@ -41,6 +41,7 @@
 #include "zone_default.h"      // dxr::FullWindowZone — zones-by-default (#63 / INV-5.6)
 #include "auto_fit.h"          // dxr::AutoFitVHeight / FitTransition — shared width-aware framing
 #include "auto_fit_canvas.h"   // dxr::AutoFitCanvas — the runtime-resolved viewport (shell tile)
+#include "model_fit.h"         // modelviewer::FitVHeight — the page-parity framing rule
 // ── The undock launch contract (displayxr-common v2.9.0) ──────────────────
 // One grammar + one security policy shared with the splat viewer: a web page
 // or a CAD app spawns this viewer transparent, borderless and topmost at a
@@ -414,11 +415,15 @@ static std::vector<XrSwapchainImageVulkanKHR> g_animBtnSwapImages;
 // Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
 static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
-// Load-time framing is the shared width-aware rule from displayxr-common
-// (dxr::AutoFitVHeight, default dxr::kAutoFitDefaultFill = 80%): the model
-// spans at most 80% of the viewport in BOTH axes, so a wide asset is bound by
-// width instead of overflowing the sides. There is no separate vertical
-// comfort multiplier — the fill fraction IS the headroom.
+// Load-time framing is the page's rule (common/model_fit.h), which composes
+// the shared width-aware rule from displayxr-common (dxr::AutoFitVHeight,
+// default dxr::kAutoFitDefaultFill = 80%): the model spans at most 80% of the
+// viewport in BOTH axes, with the SWEPT horizontal extent hypot(W, D) as the
+// width so a deep asset still fits once the turntable turns it, plus a depth
+// backstop. There is no separate vertical comfort multiplier — the fill
+// fraction IS the headroom. Keeping this identical to the inline3d SDK's
+// SceneViewer.fitTo is what makes an UNDOCKED model the same apparent size as
+// the page tile it was lifted out of; see common/model_fit.h.
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -430,8 +435,9 @@ static std::atomic<bool> g_fitValid{false};
 // Refit state (displayxr-common common/auto_fit_canvas.h). vHeight is a
 // function of (content, viewport): the CONTENT half is cached here so a
 // viewport change re-derives the base without re-measuring the model.
-static std::atomic<float> g_fitExtentW{0.0f};
+static std::atomic<float> g_fitExtentW{0.0f};  //!< SWEPT horizontal extent hypot(W, D)
 static std::atomic<float> g_fitExtentH{0.0f};
+static std::atomic<float> g_fitExtentD{0.0f};  //!< depth, for the depth backstop
 static std::atomic<float> g_fitAspect{0.0f};   //!< viewport the current base was derived for
 static dxr::AutoFitCanvas g_autoFitCanvas;     //!< runtime-resolved canvas, published post-locate
 static dxr::FitTransition g_fitTransition;     //!< render-thread only
@@ -499,7 +505,8 @@ static void ApplyAutoFitForLoadedScene_locked() {
         g_fitCenter[2] = center[2];
         float viewportW = 0.0f, viewportH = 0.0f;
         const bool fromCanvas = GetAutoFitViewportPx(viewportW, viewportH);
-        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH);
+        float sweptW = 0.0f;
+        float vh = modelviewer::FitVHeight(extent, viewportW, viewportH, &sweptW);
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
@@ -517,8 +524,9 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // the viewport this base was derived for, so RefitForViewport can
         // re-derive on an aspect change without re-measuring the model. A load
         // lands the base immediately — the framing IS the load's result.
-        g_fitExtentW.store(extent[0], std::memory_order_relaxed);
+        g_fitExtentW.store(sweptW, std::memory_order_relaxed);
         g_fitExtentH.store(extent[1], std::memory_order_relaxed);
+        g_fitExtentD.store(extent[2], std::memory_order_relaxed);
         g_fitAspect.store((viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f,
                           std::memory_order_relaxed);
         g_fitTransition.start(vh, vh, 0.0f);
@@ -533,12 +541,13 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // usable viewport the rule degrades to height-only.
         const bool haveViewport = (viewportW > 0.0f && viewportH > 0.0f);
         const float aspect = haveViewport ? (viewportW / viewportH) : 0.0f;
-        const char* boundBy = !haveViewport ? "height (no viewport)"
-                            : (extent[0] / aspect > extent[1]) ? "width" : "height";
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent W=%.3f H=%.3f D=%.3f "
+        const char* boundBy = !haveViewport
+                            ? "height (no viewport)"
+                            : modelviewer::FitBoundBy(sweptW, extent[1], extent[2], aspect);
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent W=%.3f H=%.3f D=%.3f swept-W=%.3f "
                  "viewport=%.3fx%.3f (%s) (aspect %.3f) bound-by=%s fill=%.0f%% vHeight=%.3f yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2],
+                 extent[0], extent[1], extent[2], sweptW,
                  viewportW, viewportH,
                  fromCanvas ? "runtime canvas, m" : "client rect, px", aspect, boundBy,
                  dxr::kAutoFitDefaultFill * 100.0f, vh, g_fitYaw * 57.2957795f);
@@ -617,8 +626,9 @@ static void RefitForViewport(float dtSeconds) {
         }
         return;
     }
-    const float extW = g_fitExtentW.load(std::memory_order_relaxed);
+    const float extW = g_fitExtentW.load(std::memory_order_relaxed);  // swept
     const float extH = g_fitExtentH.load(std::memory_order_relaxed);
+    const float extD = g_fitExtentD.load(std::memory_order_relaxed);
     if (!(extH > 0.0f)) {
         return;
     }
@@ -627,7 +637,7 @@ static void RefitForViewport(float dtSeconds) {
     const bool fromCanvas = GetAutoFitViewportPx(vpW, vpH);
     const float aspect = (vpH > 0.0f) ? (vpW / vpH) : 0.0f;
     if (dxr::AutoFitAspectChanged(g_fitAspect.load(std::memory_order_relaxed), aspect)) {
-        const float vh = dxr::AutoFitVHeight(extW, extH, vpW, vpH);
+        const float vh = modelviewer::FitVHeightFromCached(extW, extH, extD, vpW, vpH);
         if (vh > 1e-3f) {
             // Retarget rather than restart: a resize that settles in two steps
             // must not snap back to where it started.
@@ -638,7 +648,7 @@ static void RefitForViewport(float dtSeconds) {
             LOG_INFO("Auto-fit refit: viewport=%.3fx%.3f (%s) aspect=%.3f bound-by=%s "
                      "base %.3f -> %.3f (zoom preserved)",
                      vpW, vpH, fromCanvas ? "runtime canvas, m" : "client rect, px", aspect,
-                     (aspect > 0.0f && extW / aspect > extH) ? "width" : "height",
+                     modelviewer::FitBoundBy(extW, extH, extD, aspect),
                      prev, vh);
         }
     }
