@@ -153,6 +153,17 @@ jobs:
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build build
 
+      - name: Unit tests (pure helpers)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          # model_common's framework-free unit tests. Today that is the .gltf
+          # sibling-URI validator (#114) — the one gate between a downloaded
+          # JSON document and a filesystem write, so it is checked on every PR
+          # rather than only by a live download that cannot exercise the
+          # hostile cases at all.
+          ctest --test-dir build --output-on-failure
+
       - name: Stage OpenXR loader next to demo binary
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
