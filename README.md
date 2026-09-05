@@ -392,8 +392,39 @@ cubes are rebaked from it. Loading an HDRI also **switches the analytic key
 light off** — a real capture already contains its own sun, and keeping both
 would double-count the dominant light source.
 
+**Lighting mode.** `L` cycles it; `--env=` sets it at launch. It is the answer
+to "why does the model change materials when the page hands it to the viewer":
+
+| Mode | What it is |
+|---|---|
+| `sky` | The analytic-sky IBL plus one key light — the viewer's own look. Grades at **PBR Neutral, +1 EV**. |
+| `studio` | The three-point rig the DisplayXR storefront's inline-3D tile lights the same model with (three.js: key 2.2, fill 0.7, rim 1.0, plus a 0.6 hemisphere ambient), **no tone curve, 0 EV** — matching the page, which runs three.js at its `NoToneMapping` default. The sky IBL drops to a 0.15 residual, because the page has no environment map at all; not to 0, because a metal with no environment goes pure black wherever the three lights miss, and a black body carries no parallax detail for the panel to show. |
+| `none` | No lights; the IBL ambient only. |
+
+Metal is what this is for. Three sharp lights on an otherwise unlit body read
+as metal; a smooth sky reflection over the whole body reads as matte. On
+`WaterBottle.glb`, switching `sky` → `studio` drops the median luminance
+162 → 60 while the 99th percentile holds (245 → 248), so the
+highlight-to-body contrast goes from 1.5× to 4.1×.
+
+The **fill and rim lights take the base metallic-roughness lobe only** — the
+`KHR_materials_*` layers (sheen, coat, fuzz, scatter) still see the key light
+alone. Those layers are dominated by one light, and the page-authored assets
+this rig exists to match declare none of them.
+
+**Anti-aliasing.** The internal colour and depth targets are **4× MSAA**,
+resolved into the single-sample image the per-eye blit reads (falls back to
+2× or 1× if the device cannot do 4× for all three attachment formats).
+`DXR_MODELVIEWER_MSAA=<1|2|4|8>` overrides it, which is how a before/after is
+measured without a rebuild. Note the panel's own limit: the display processor
+hard-masks the **silhouette** alpha to 0/1, so a transparent window's outline
+against the desktop cannot be fully smooth — internal edges and texture
+detail are what improve.
+
 **Exposure.** `[` / `]` in quarter stops; the shader multiplies linear radiance
-by 2^EV.
+by 2^EV. Switching the lighting mode re-pins exposure and the tone curve to
+that mode's pairing (the grading is part of the mode, not an independent knob);
+`[`, `]` and `G` after an `L` are deviations *from* the mode.
 
 **Tone curve.** `G` cycles:
 
@@ -450,10 +481,105 @@ calibration, brightness, gamut and 3D cross-talk are separate concerns.
 | Drag-and-drop (Windows, macOS) | Load a supported model, or an `.hdr` environment, dropped onto the window |
 | `[` / `]` | Exposure down / up, in quarter stops |
 | `G` | Cycle the tone curve (PBR Neutral → ACES → none) |
+| `L` | Cycle the lighting mode (sky → studio → none) — see *Environment and grading* |
 | Space | Reset pose, zoom, depth |
 | Tab | Toggle HUD |
 | Ctrl+T | Toggle transparent background (desktop see-through; Windows only) |
 | Esc | Quit |
+
+## Undocking the viewer (launch flags + `displayxr-view:` links)
+
+The viewer can be started by a web page, by a CAD app, or from a shell tile as
+a floating 3D window over the desktop showing a given asset at a given screen
+rect. Windows only, and shared with the sibling splat viewer through
+[`displayxr-common`](https://github.com/DisplayXR/displayxr-common) so both
+speak one grammar and apply one security policy.
+
+### Command line
+
+```bat
+model_viewer_handle_vk_win.exe [flags] [model-path]
+```
+
+| Flag | Meaning |
+|---|---|
+| `--transparent` | Borderless, topmost and click-through-shaped **from the first frame** — no style flip after the window exists. `Ctrl+T` still toggles it live. |
+| `--rect=X,Y,W,H` | Window rect in physical virtual-screen pixels. The exe is PerMonitorV2, so no DPI scaling is applied to what you pass. With `--transparent` the rect is the window rect exactly; framed, it is the client area. |
+| `--src=<url\|path>` | Asset to load instead of the bundled sample. A URL is downloaded to the cache first (progress shows as a toast). |
+| `--vh=<metres>` | Virtual display height the asset was authored at. Pins the scale: auto-fit will not re-derive it. |
+| `--title=<suffix>` | **Appended** to the window title, never replaces it. |
+| `--type=model\|splat` | Routing hint. A non-`model` type is forwarded to the sibling viewer. |
+| `--env=studio\|sky\|none` | Lighting the sender rendered with, so the undocked view matches the tile it came out of. **Protocol launches default to `studio`** (a protocol launch *is* an undock from a storefront page); a plain command-line launch defaults to `sky`. An unrecognised value warns and is ignored. `L` cycles it live. |
+| `--dpr=<float>` | The launching page's `devicePixelRatio`. Logged only — a calibration aid. |
+| `--max-bytes=<n>` | Download cap (default 256 MiB). |
+| `--no-cache` | Re-download even on a cache hit (dev aid). |
+| `--allow-local` | Native callers only: permit a local/`file:` `src` inside a protocol URL. A web page can never set it — it is an argv flag. |
+
+Flags are `--key=value` (never `--key value`). The first non-flag token is
+still the legacy positional model path, so every existing launcher keeps
+working. Exit codes: **2** = the launch was refused (bad or disallowed
+arguments), **3** = the link belongs to a sibling viewer that is not installed.
+
+A refused or forwarded launch also raises a message box, because a protocol
+launch has no console and without one a rejected link is indistinguishable
+from a crash. Set **`DXR_LAUNCH_QUIET=1`** to suppress every one of those
+dialogs — the log line and the exit code, which the box only ever restated,
+are unchanged. Automated checks and CI should always set it: the box is modal
+and would otherwise sit on the display until a human clicks OK, long after the
+check that raised it has exited. `DXR_LAUNCH_QUIET=0` disarms the override.
+
+```bat
+set DXR_LAUNCH_QUIET=1
+model_viewer_handle_vk_win.exe "displayxr-view://open?src=...&v=1"
+```
+
+### The `displayxr-view:` protocol
+
+The viewer registers `HKCU\Software\Classes\displayxr-view` on **every**
+launch (the installer runs elevated, so an HKCU write from there would land in
+the wrong hive; self-registration is also self-healing after a sibling is
+uninstalled). A page opens the viewer with:
+
+```
+displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&env=studio&transparent=1&v=1
+```
+
+`open` is the verb; `v=1` is the grammar version, so a future grammar is
+rejected loudly instead of half-honoured. Every value is percent-encoded by
+the sender (`encodeURIComponent`); `+` is **not** a space. A protocol launch
+is **transparent by default** (displayxr-common >= v2.9.1) — undocking into a
+floating overlay is what the scheme exists for; `transparent=0` opts out for a
+framed, positionable window. On the command line `--transparent` stays opt-in.
+It also defaults to **`env=studio`**, so an undocked model keeps the lighting
+the page rendered it with; send `env=sky` or `env=none` to override.
+
+One scheme serves every DisplayXR viewer, so the browser asks the user once. A
+URL whose `type=` is not `model` is handed to the sibling viewer found at
+`HKCU` then `HKLM\Software\DisplayXR\Demos\<Key>\InstallPath` (the per-user key
+is a dev override, same precedence as the workspace manifests); if it is not installed,
+the viewer says so and exits. A second launch while one is already running
+does not open a second window — the URL is handed to the running instance over
+`WM_COPYDATA`, which moves it to the new rect and loads the new asset.
+
+### Security policy
+
+The browser's one-time "Open this app?" dialog is the **only** consent gate and
+it is sticky per origin, so from a protocol launch `src` must be `https:` (any
+host) or `http:` on loopback, and `file:`, UNC and bare local paths are refused
+— a protocol-launched viewer that opened arbitrary local files would be a
+file-existence oracle through its own error toasts, reachable from any page on
+an allowed origin. The same policy is re-applied to the final URL after
+redirects, lengths and rects are bounded, and the cache file's extension comes
+from the URL path, the `Content-Type` or the magic bytes — never from a query
+parameter.
+
+### Download cache
+
+Downloads land in `%LOCALAPPDATA%\DisplayXR\ModelViewer\cache`, named by the
+SHA-1 of the requested URL (never by anything in the URL's path, so there is no
+traversal surface). A cache hit skips the network entirely, which is what makes
+the second undock of the same asset instant; `--no-cache` bypasses it. Deleting
+the directory is always safe.
 
 ## Build from source
 

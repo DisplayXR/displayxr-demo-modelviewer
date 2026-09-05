@@ -89,6 +89,11 @@ target_link_libraries(model_viewer_handle_vk_win PRIVATE
     d2d1
     dwrite
     comdlg32
+    # The undock launch contract: winhttp/bcrypt/shell32 arrive transitively
+    # from displayxr::common (PUBLIC), but shell32 is named here too because
+    # this TU calls CommandLineToArgvW / DragQueryFile directly — a transitive
+    # dependency is the LIB's contract, not ours, and it has changed before.
+    shell32
 )
 
 if(MSVC)

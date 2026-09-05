@@ -76,6 +76,38 @@ struct ModelRenderer {
     void      cycleToneCurve();
     const char* toneCurveName() const;
 
+    // ── Lighting mode (undocked-page parity) ─────────────────────────────────
+    // Sky    the analytic procedural sky as an IBL environment plus one key
+    //        light. The viewer's own look; unchanged.
+    // Studio the three-point directional rig + hemisphere ambient the DisplayXR
+    //        storefront's inline-3D tile lights the SAME asset with (three.js
+    //        addStudioLights), with the sky IBL knocked down to a residual and
+    //        no tone curve — so a model undocked from a page (displayxr-view:)
+    //        keeps the materials it had in the tile. Metal is the case that
+    //        makes this visible: crisp specular highlights off three lights
+    //        read as metal, a smooth sky reflection reads as matte.
+    // None   no lights at all; the IBL ambient only.
+    //
+    // The GRADING is part of the mode, not an independent knob — see
+    // setLightingMode() — so switching modes re-pins exposure + tone curve.
+    // NoLights, not `None`: <X11/X.h> defines `None` as a macro (0L), and this
+    // header is compiled on desktop Linux through the xlib window binding. The
+    // CLI/protocol token stays "none" - only the enumerator is spelled around it.
+    enum class LightingMode { Sky = 0, Studio = 1, NoLights = 2 };
+    void         setLightingMode(LightingMode m);
+    LightingMode lightingMode() const { return lightingMode_; }
+    const char*  lightingModeName() const;
+    void         cycleLightingMode();
+    // "studio" / "sky" / "none" (the LaunchArgs::env vocabulary) -> a mode.
+    // Returns false for anything else, leaving `out` untouched.
+    static bool  parseLightingMode(const std::string& env, LightingMode& out);
+
+    // Rasterisation samples actually in use (1 when the device or the
+    // DXR_MODELVIEWER_MSAA override asked for no multisampling). Surfaced so
+    // the platform layer can put it in the log - an AA claim that cannot be
+    // read back is not a measurement.
+    uint32_t sampleCount() const { return (uint32_t)samples_; }
+
     // Extensions the loaded asset declares that this renderer doesn't implement
     // (issue #70). Non-empty means the model on screen differs from what its
     // author saw — the affected materials fall back to their base
@@ -216,10 +248,25 @@ private:
         // by the viewport's fraction of the image, or it reads past the region
         // that was actually rendered. x,y = viewport/image ratio.
         float viewport[4];
+        // ── Studio rig; mirrors the tail of pbr.frag's UBO. Zero (and dead in
+        // the shader) in every mode but Studio.
+        float studio[4];      // x=on, y=key intensity, z=hemi intensity, w=IBL scale
+        float studioFill[4];  // xyz = world dir TO the light, w = intensity
+        float studioRim[4];
+        float hemiSky[4];     // rgb linear
+        float hemiGround[4];  // rgb linear
     };
 
     bool createRenderTargets();
     bool ensureTargets(uint32_t w, uint32_t h);   // (re)create color+depth+framebuffer at this size
+    // Pick samples_ once, at init: 4x if the device supports it for all three
+    // attachment formats, else 1. DXR_MODELVIEWER_MSAA=<1|2|4|8> overrides.
+    void chooseSampleCount();
+    // One attachment image + view. Exists because the MSAA attachments need a
+    // sample count and modelCreateImage2D has no parameter for one.
+    bool createAttachment(ModelImage& img, uint32_t w, uint32_t h, VkFormat fmt,
+                          VkImageUsageFlags usage, VkSampleCountFlagBits samples,
+                          VkImageAspectFlags aspect);
     bool createPipeline();
     bool createSamplerAndDefaults();
     bool createIbl();   // BRDF LUT + the env descriptor + the first cube bake
@@ -313,6 +360,23 @@ private:
     ModelImage colorImage_;
     ModelImage sceneLinearImage_;
     ModelImage depthImage_;
+
+    // ── MSAA (issue #113) ────────────────────────────────────────────────────
+    // The page this viewer undocks from renders with `antialias: true`; the
+    // viewer rasterised at 1 sample, so its edges were visibly stepped beside
+    // the page's. When samples_ > 1 the two colour attachments and the depth
+    // buffer above are joined by multisampled twins that the subpass RESOLVES
+    // into them, so colorImage_ / sceneLinearImage_ keep their single-sample
+    // identity and every consumer downstream - the per-eye blit, the
+    // transmission capture, the mip chain - is untouched.
+    //
+    // Note what this cannot fix: the display processor hard-masks the
+    // SILHOUETTE alpha to 0/1, so a transparent window's outline against the
+    // desktop stays hard however many samples are taken. Internal edges and
+    // texture detail are what improve.
+    VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;
+    ModelImage colorMsaa_;         // only when samples_ > 1
+    ModelImage sceneLinearMsaa_;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     // Second pass over the same attachments with LOAD instead of CLEAR, for the
     // transmissive draws that have to come after the scene-colour capture.
@@ -418,6 +482,7 @@ private:
     // material grid rather than tuning by eye on one asset.
     float     exposureEV_ = 1.0f;
     ToneCurve toneCurve_  = ToneCurve::PbrNeutral;
+    LightingMode lightingMode_ = LightingMode::Sky;
 
     // Carried over from the loaded ModelData; cleared on every model load so it
     // always describes the asset currently on screen.

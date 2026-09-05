@@ -31,6 +31,17 @@ PFN_xrUnregisterMCPToolDXR   g_pfnUnregisterMcpTool  = nullptr;
 int32_t g_displayDesktopLeft = 0;
 int32_t g_displayDesktopTop = 0;
 
+// XR_DXR_display_info v18 (XrDisplayDesktopInfoDXR): the panel monitor's FULL
+// desktop rect, not just its origin. The undock launch contract clamps a
+// caller-supplied --rect into this so a web page cannot strand the floating
+// window off-screen — but only when isPanelConfirmed says the runtime really
+// located a 3D panel (sim_display and the platforms whose panel-origin
+// plumbing is open report the primary monitor's rect with the flag clear, and
+// clamping to the wrong monitor is worse than not clamping). All-zero =
+// unresolved; zero-init also yields that on pre-v18 runtimes.
+XrRect2Di g_displayDesktopRect = {};
+bool g_displayPanelConfirmed = false;
+
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -183,7 +194,14 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         desktopPos.next = &eyeCaps;
-        displayInfo.next = &desktopPos;
+        // v18: the full panel-monitor rect + "is this really the panel?".
+        // Chained NEXT TO the v16 position struct (both are additive
+        // XrSystemProperties extensions); a pre-v18 runtime ignores it and the
+        // zero-init below reads as "unresolved".
+        XrDisplayDesktopInfoDXR desktopInfo = {};
+        desktopInfo.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+        desktopInfo.next = &desktopPos;
+        displayInfo.next = &desktopInfo;
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
         if (XR_SUCCEEDED(diResult)) {
@@ -200,8 +218,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
             g_displayDesktopLeft = desktopPos.left;
             g_displayDesktopTop = desktopPos.top;
+            g_displayDesktopRect = desktopInfo.desktopRect;
+            g_displayPanelConfirmed = desktopInfo.isPanelConfirmed == XR_TRUE;
             LOG_INFO("Display desktop position: (%d, %d)",
                 g_displayDesktopLeft, g_displayDesktopTop);
+            LOG_INFO("Display desktop rect: (%d,%d %dx%d) device='%s' primary=%d panel-confirmed=%d",
+                g_displayDesktopRect.offset.x, g_displayDesktopRect.offset.y,
+                g_displayDesktopRect.extent.width, g_displayDesktopRect.extent.height,
+                desktopInfo.deviceName, (int)desktopInfo.isPrimary,
+                (int)desktopInfo.isPanelConfirmed);
             LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, pixels=%ux%u, nominal=(%.0f,%.0f,%.0f)mm",
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                 xr.displayWidthM, xr.displayHeightM,

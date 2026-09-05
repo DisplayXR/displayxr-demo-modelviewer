@@ -339,6 +339,29 @@ Section "Uninstall"
     ; Don't RMDir $SMPROGRAMS\DisplayXR — the runtime's own shortcuts may
     ; still live there.
 
+    ; displayxr-view: protocol association. The VIEWER writes this, not the
+    ; installer — an HKCU write from an elevated installer lands in the
+    ; elevating admin's hive, not the logged-in user's. So there is nothing to
+    ; add on install; there is only this to clean up on uninstall.
+    ;
+    ; ONE scheme serves every DisplayXR viewer (last writer wins), so deleting
+    ; it unconditionally would break a still-installed sibling's links. Delete
+    ; only while it still points INTO this install dir. A sibling that owned
+    ; it is left alone; a sibling that comes second re-registers itself on its
+    ; next launch, which is what makes the association self-healing.
+    ReadRegStr $0 HKCU "Software\Classes\displayxr-view\shell\open\command" ""
+    StrCpy $1 '"$INSTDIR\'
+    StrLen $2 $1
+    StrCpy $3 $0 $2
+    ${If} $3 == $1
+        DeleteRegKey HKCU "Software\Classes\displayxr-view"
+        DetailPrint "Removed the displayxr-view: protocol association (it pointed here)"
+    ${ElseIf} $0 == ""
+        DetailPrint "No displayxr-view: protocol association to remove"
+    ${Else}
+        DetailPrint "Left the displayxr-view: association alone - it points at $0"
+    ${EndIf}
+
     DeleteRegKey HKLM "Software\DisplayXR\Demos\ModelViewer"
     DeleteRegKey /ifempty HKLM "Software\DisplayXR\Demos"
     DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRModelViewer"

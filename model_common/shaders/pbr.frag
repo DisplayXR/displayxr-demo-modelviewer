@@ -33,6 +33,19 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale,
                        // w=transmission probe (issue #75; 0 = normal shading)
     vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target
+    // ── Studio rig (undocked-page parity) ────────────────────────────────────
+    // The DisplayXR storefront's inline-3D tile lights every model with a
+    // three.js three-point rig plus a hemisphere ambient, no environment map
+    // and no tone curve. A model UNDOCKED from such a page (displayxr-view:)
+    // has to keep looking like the tile it came out of, so the renderer can
+    // reproduce that rig instead of its own analytic sky. Sky mode leaves
+    // studio.x at 0 and every term below is dead code.
+    vec4 studio;       // x = studio on (0/1), y = key intensity,
+                       // z = hemisphere intensity, w = residual IBL scale
+    vec4 studioFill;   // xyz = world dir TO the light, w = intensity
+    vec4 studioRim;    // xyz = world dir TO the light, w = intensity
+    vec4 hemiSky;      // rgb = linear sky colour
+    vec4 hemiGround;   // rgb = linear ground colour
 } ubo;
 
 layout(push_constant) uniform Push {
@@ -348,6 +361,34 @@ vec2 xfUV(int slot, vec2 uv) {
     return p + os.xy;
 }
 
+// One direct light's BASE metallic-roughness contribution: Lambert (under the
+// diffuse-roughness multiplier) plus an isotropic GGX lobe, weighted by N.L and
+// NOT yet scaled by the light's intensity. Same D / G / Schlick-F the key light
+// and the split-sum IBL already use, so the studio rig's extra lights are the
+// same BRDF evaluated at another direction rather than a second shading model.
+//
+// Deliberately BASE-only: the KHR_materials_* lobes (sheen, coat, fuzz,
+// scatter) still see the key light alone. Those extensions all describe layers
+// whose look is dominated by one dominant light, the assets this rig exists to
+// match (a page's MeshStandardMaterial) declare none of them, and threading
+// three lights through five layered blocks would restructure the whole shader
+// for an effect nothing on that path can show. Documented in the README.
+vec3 studioDirectLobe(vec3 N, vec3 V, vec3 L, vec3 albedo, vec3 f0, vec3 f90,
+                      float a, float metallic, float diffuseRoughness, float ndotv) {
+    float ndotl = max(dot(N, L), 0.0);
+    if (ndotl <= 0.0) return vec3(0.0);
+    vec3  H     = normalize(V + L);
+    float ndoth = max(dot(N, H), 0.0);
+    float vdoth = max(dot(V, H), 0.0);
+    vec3  F     = f0 + (f90 - f0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0);
+    float D     = D_GGX(ndoth, a);
+    float G     = G_SchlickSmith(ndotv, ndotl, a);
+    vec3  spec  = (D * G) * F / max(4.0 * ndotv * ndotl, 1e-4);
+    vec3  kd    = (1.0 - F) * (1.0 - metallic);
+    float dr    = diffuseOrenNayar(ndotl, ndotv, dot(L, V), diffuseRoughness);
+    return (kd * albedo / PI * dr + spec) * ndotl;
+}
+
 void main() {
     // Foreground-only clip (transparent mode): drop geometry behind the
     // display plane. 0 = disabled (opaque path unaffected).
@@ -399,6 +440,12 @@ void main() {
     vec3 N = perturbNormal(Ng, xfUV(XF_NORMAL, inUV), frameT, frameB, frameValid);
 
     vec3 L = normalize(ubo.lightDir.xyz);
+    // Every direct lobe in this shader is scaled by keyScale. Sky mode keeps
+    // the literal it always used (3.0, gated to 0 under an HDRI, which carries
+    // its own sun); Studio swaps in the page's key irradiance. Reading it from
+    // ONE place is what keeps the two modes from drifting apart lobe by lobe.
+    bool  studioOn = ubo.studio.x > 0.5;
+    float keyScale = studioOn ? ubo.studio.y : (3.0 * ubo.tone.z);
     vec3 H = normalize(V + L);
     float ndotl = max(dot(N, L), 0.0);
     float ndotv = max(dot(N, V), 1e-4);
@@ -506,7 +553,16 @@ void main() {
     // microfacet one. The multiplier is exactly 1 at roughness 0, so a material
     // without the extension takes the identical path it always did.
     float dr = diffuseOrenNayar(ndotl, ndotv, dot(L, V), diffuseRoughness);
-    vec3 direct = (kd * albedo / PI * dr + spec) * vec3(3.0 * ubo.tone.z) * ndotl;
+    vec3 direct = (kd * albedo / PI * dr + spec) * vec3(keyScale) * ndotl;
+
+    // Studio fill + rim. Added AFTER the key so the key keeps the anisotropic /
+    // iridescent treatment above and the two extra lights take the base lobe.
+    if (studioOn) {
+        direct += studioDirectLobe(N, V, normalize(ubo.studioFill.xyz), albedo, f0, f90,
+                                   a, metallic, diffuseRoughness, ndotv) * ubo.studioFill.w;
+        direct += studioDirectLobe(N, V, normalize(ubo.studioRim.xyz), albedo, f0, f90,
+                                   a, metallic, diffuseRoughness, ndotv) * ubo.studioRim.w;
+    }
 
     // Ambient = image-based lighting (split-sum): irradiance cube for diffuse,
     // prefiltered cube + BRDF LUT for specular.
@@ -554,6 +610,19 @@ void main() {
     vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
     vec3 ambient = (diffuseIBL + specularIBL) * ao;
 
+    // Studio's indirect term. The page has NO environment map — its whole
+    // indirect contribution is a HemisphereLight — so the sky IBL is knocked
+    // down to a residual (ubo.studio.w; see kStudioIblScale for why it is not
+    // 0) and three.js's hemisphere irradiance is added in its place:
+    //   mix(ground, sky, 0.5*N.y + 0.5) * intensity, through BRDF_Lambert.
+    // Diffuse only, exactly as three.js does it — a HemisphereLight feeds
+    // RE_IndirectDiffuse and contributes no specular at all.
+    if (studioOn) {
+        ambient *= ubo.studio.w;
+        vec3 hemi = mix(ubo.hemiGround.rgb, ubo.hemiSky.rgb, 0.5 * N.y + 0.5) * ubo.studio.z;
+        ambient += hemi * albedo * (1.0 - metallic) / PI * ao;
+    }
+
     // `direct` and `ambient` stay SEPARATE until after the coat block, and are
     // summed there. The coat's darkening needs them apart: the spec gives its
     // internal reflectance R in two forms, one using dot(N,L) for direct light
@@ -585,7 +654,7 @@ void main() {
 
         float sheenD = D_Charlie(ndoth, sheenRoughness);
         float sheenV = V_Ashikhmin(ndotl, ndotv);
-        direct += sheenColor * sheenD * sheenV * 3.0 * ubo.tone.z * ndotl;
+        direct += sheenColor * sheenD * sheenV * keyScale * ndotl;
         // Ambient sheen: the irradiance cube stands in for the full integral.
         ambient += sheenColor * texture(irradianceMap, N).rgb
                  * pow(1.0 - ndotv, 3.0) * ao;
@@ -771,7 +840,7 @@ void main() {
         // The coat's own reflection splits the same way: its GGX highlight is
         // direct light, its prefiltered-environment term is ambient.
         direct  = direct  * (1.0 - ccF) * baseThroughCoatDirect
-                + vec3(ccSpec) * 3.0 * ubo.tone.z * ndotl * clearcoatFactor;
+                + vec3(ccSpec) * keyScale * ndotl * clearcoatFactor;
         ambient = ambient * (1.0 - ccF) * baseThroughCoatAmb
                 + ccIbl * ao * clearcoatFactor;
     }
@@ -912,7 +981,7 @@ void main() {
             if (scatterMix > 0.0) {
                 // Backward half: a Lambertian reflection lobe of multi-scatter
                 // albedo. Same shape as the diffuse lobe, different albedo.
-                vec3 scatterBack = (lobeAlbedo / PI) * vec3(3.0 * ubo.tone.z) * ndotl
+                vec3 scatterBack = (lobeAlbedo / PI) * vec3(keyScale) * ndotl
                                  + texture(irradianceMap, N).rgb * lobeAlbedo * ao;
                 // Forward half: what lies behind, fully diffused. The top mip of
                 // the scene chain is the most-blurred copy available, which is
@@ -933,7 +1002,7 @@ void main() {
             // Same `dr` the direct diffuse was built with, so transmission
             // subtracts exactly the lobe that was added rather than a
             // Lambertian approximation of it.
-            vec3 diffuseTerm = (kd * albedo / PI * dr) * vec3(3.0 * ubo.tone.z) * ndotl
+            vec3 diffuseTerm = (kd * albedo / PI * dr) * vec3(keyScale) * ndotl
                              + diffuseIBL * ao;
             vec3 transmissionTerm = transmitted * (1.0 - metallic);
             color += (transmissionTerm - diffuseTerm) * transmissionFactor;
@@ -976,7 +1045,7 @@ void main() {
     if (hasFuzz && fuzzFactor > 0.0 && !probe) {
         float Efz = texture(sheenLUT, vec2(ndotv, sheenRoughness)).r;
         vec3 fuzzDirect = sheenColor * D_Charlie(ndoth, sheenRoughness)
-                        * V_Ashikhmin(ndotl, ndotv) * 3.0 * ubo.tone.z * ndotl;
+                        * V_Ashikhmin(ndotl, ndotv) * keyScale * ndotl;
         // Ambient fuzz: the irradiance cube stands in for the full integral,
         // weighted by the same directional albedo. Same approximation the sheen
         // lobe makes, and the same caveat.

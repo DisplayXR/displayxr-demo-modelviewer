@@ -220,6 +220,7 @@ bool ModelRenderer::init(VkInstance instance,
         }
     }
 
+    chooseSampleCount();
     if (!createRenderTargets()) return false;
     if (!createPipeline()) return false;
     if (!createSamplerAndDefaults()) return false;
@@ -248,6 +249,91 @@ bool ModelRenderer::init(VkInstance instance,
     return true;
 }
 
+// Pick the rasterisation sample count once, at init.
+//
+// 4x is the target: it is the level `antialias: true` gets in a browser, it is
+// universally supported on desktop, and the step from 4 to 8 buys far less than
+// it costs on a renderer that already runs the whole pass once PER VIEW TILE.
+// The count has to be supported for the colour format, the scene-linear format
+// AND depth - framebufferColorSampleCounts alone is not enough, because the two
+// colour attachments have different formats and a device may differ on them.
+void ModelRenderer::chooseSampleCount() {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(physDevice_, &props);
+
+    auto supported = [&](VkSampleCountFlagBits want) {
+        VkSampleCountFlags common = props.limits.framebufferColorSampleCounts &
+                                    props.limits.framebufferDepthSampleCounts;
+        if ((common & want) == 0) return false;
+        // Per-format check: the limits above are the framebuffer's ceiling, not
+        // a promise for a specific format+usage pair.
+        const VkFormat fmts[3] = {colorFormat_, sceneLinearFormat_, depthFormat_};
+        const VkImageUsageFlags usages[3] = {
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
+        for (int i = 0; i < 3; ++i) {
+            VkImageFormatProperties ifp{};
+            if (vkGetPhysicalDeviceImageFormatProperties(
+                    physDevice_, fmts[i], VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                    usages[i], 0, &ifp) != VK_SUCCESS)
+                return false;
+            if ((ifp.sampleCounts & want) == 0) return false;
+        }
+        return true;
+    };
+
+    VkSampleCountFlagBits want = VK_SAMPLE_COUNT_4_BIT;
+    // DXR_MODELVIEWER_MSAA=<n> makes the 1-vs-4 comparison runnable without a
+    // rebuild, which is what an aliasing claim has to be settled with.
+    if (const char* e = std::getenv("DXR_MODELVIEWER_MSAA")) {
+        const int n = std::atoi(e);
+        want = (n >= 8) ? VK_SAMPLE_COUNT_8_BIT
+             : (n >= 4) ? VK_SAMPLE_COUNT_4_BIT
+             : (n >= 2) ? VK_SAMPLE_COUNT_2_BIT
+                        : VK_SAMPLE_COUNT_1_BIT;
+    }
+
+    samples_ = VK_SAMPLE_COUNT_1_BIT;
+    if (want != VK_SAMPLE_COUNT_1_BIT) {
+        if (supported(want)) {
+            samples_ = want;
+        } else if (want != VK_SAMPLE_COUNT_4_BIT && supported(VK_SAMPLE_COUNT_4_BIT)) {
+            samples_ = VK_SAMPLE_COUNT_4_BIT;
+        } else if (supported(VK_SAMPLE_COUNT_2_BIT)) {
+            samples_ = VK_SAMPLE_COUNT_2_BIT;
+        }
+    }
+    std::printf("ModelRenderer: MSAA %ux%s\n", (unsigned)samples_,
+                (samples_ == want) ? "" : " (requested level unsupported)");
+}
+
+bool ModelRenderer::createAttachment(ModelImage& img, uint32_t w, uint32_t h,
+                                     VkFormat fmt, VkImageUsageFlags usage,
+                                     VkSampleCountFlagBits samples,
+                                     VkImageAspectFlags aspect) {
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = fmt;
+    ici.extent = {w, h, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
+    ici.samples = samples; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = usage; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(device_, &ici, nullptr, &img.image) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(device_, img.image, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = modelFindMemoryType(physDevice_, mr.memoryTypeBits,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device_, &ai, nullptr, &img.memory) != VK_SUCCESS) return false;
+    vkBindImageMemory(device_, img.image, img.memory, 0);
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = img.image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
+    vci.subresourceRange = {aspect, 0, 1, 0, 1};
+    if (vkCreateImageView(device_, &vci, nullptr, &img.view) != VK_SUCCESS) return false;
+    img.width = w; img.height = h;
+    return true;
+}
+
 bool ModelRenderer::createRenderTargets() {
     // Render pass (format-only; size-independent). Clears colour+depth, leaves
     // colour in TRANSFER_SRC for the per-eye viewport blit.
@@ -259,21 +345,32 @@ bool ModelRenderer::createRenderTargets() {
     // models that contain glass, because the render pass and the pipelines are
     // built at init while hasTransmissive_ is only known after a model loads
     // (and models are loaded and swapped at runtime via L / drag-drop).
-    VkAttachmentDescription atts[3] = {};
+    // MSAA (samples_ > 1) adds two RESOLVE attachments, 3 and 4. Attachments 0
+    // and 1 then carry the multisampled twins and the subpass resolves them
+    // into colorImage_ / sceneLinearImage_ - which keep the single-sample
+    // identity, layout and finalLayout they always had, so nothing downstream
+    // (the per-eye blit, captureSceneColor, the mip chain) changes at all.
+    const bool msaa = (samples_ != VK_SAMPLE_COUNT_1_BIT);
+
+    VkAttachmentDescription atts[5] = {};
     atts[0].format = colorFormat_;
-    atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[0].samples = samples_;
     atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    // The MSAA image is never transferred from - only resolved - so it stays a
+    // colour attachment across both passes; only the resolve target goes to
+    // TRANSFER_SRC for the blit.
+    atts[0].finalLayout = msaa ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                               : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
     atts[1] = atts[0];
     atts[1].format = sceneLinearFormat_;
 
     atts[2].format = depthFormat_;
-    atts[2].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[2].samples = samples_;
     atts[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     // STORE, not DONT_CARE: the transmissive pass (renderPassLoad_ below) does
     // LOAD_OP_LOAD on this same depth attachment so glass depth-tests against the
@@ -286,15 +383,33 @@ bool ModelRenderer::createRenderTargets() {
     atts[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     atts[2].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+    // Resolve targets: single-sample, contents irrelevant on entry (the resolve
+    // overwrites every pixel of the render area), TRANSFER_SRC on the way out.
+    atts[3].format = colorFormat_;
+    atts[3].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[3].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[3].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[3].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[3].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[3].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    atts[4] = atts[3];
+    atts[4].format = sceneLinearFormat_;
+
     VkAttachmentReference colorRefs[2] = {
         {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
         {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+    };
+    VkAttachmentReference resolveRefs[2] = {
+        {3, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+        {4, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
     };
     VkAttachmentReference depthRef = {2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub = {};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 2;
     sub.pColorAttachments = colorRefs;
+    sub.pResolveAttachments = msaa ? resolveRefs : nullptr;
     sub.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency deps[2] = {};
@@ -312,7 +427,7 @@ bool ModelRenderer::createRenderTargets() {
     deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
     VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpci.attachmentCount = 3;
+    rpci.attachmentCount = msaa ? 5u : 3u;
     rpci.pAttachments = atts;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &sub;
@@ -331,8 +446,17 @@ bool ModelRenderer::createRenderTargets() {
     atts[1].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     atts[2].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     atts[2].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    // The resolve targets are rewritten wholesale by pass 2's resolve, so they
+    // still LOAD nothing - but they arrive in COLOR_ATTACHMENT_OPTIMAL, put
+    // there by renderEye's explicit barrier off the transmission copy's read.
+    atts[3].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    atts[4].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    // OR, not assign: pass 2 LOADs colour and depth that pass 1 WROTE, so the
+    // attachment-write stages have to stay in the dependency alongside the
+    // transmission sample's shader read.
+    deps[0].srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].srcAccessMask |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPassLoad_) != VK_SUCCESS) return false;
 
     return ensureTargets(width_, height_);
@@ -350,6 +474,8 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
     if (sceneLinearImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearImage_);
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
+    if (colorMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorMsaa_);
+    if (sceneLinearMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearMsaa_);
     if (transmissionImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, transmissionImage_);
     width_ = w; height_ = h;
 
@@ -363,28 +489,36 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (sceneLinearImage_.image == VK_NULL_HANDLE) return false;
 
-    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = depthFormat_;
-    ici.extent = {w, h, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(device_, &ici, nullptr, &depthImage_.image) != VK_SUCCESS) return false;
-    VkMemoryRequirements mr; vkGetImageMemoryRequirements(device_, depthImage_.image, &mr);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = mr.size;
-    ai.memoryTypeIndex = modelFindMemoryType(physDevice_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vkAllocateMemory(device_, &ai, nullptr, &depthImage_.memory) != VK_SUCCESS) return false;
-    vkBindImageMemory(device_, depthImage_.image, depthImage_.memory, 0);
-    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vci.image = depthImage_.image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = depthFormat_;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device_, &vci, nullptr, &depthImage_.view) != VK_SUCCESS) return false;
-    depthImage_.width = w; depthImage_.height = h;
+    // Depth follows the colour attachments' sample count - a subpass's depth
+    // and colour attachments must agree, so this is not an independent choice.
+    if (!createAttachment(depthImage_, w, h, depthFormat_,
+                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, samples_,
+                          VK_IMAGE_ASPECT_DEPTH_BIT)) return false;
 
-    VkImageView fbViews[3] = {colorImage_.view, sceneLinearImage_.view, depthImage_.view};
+    const bool msaa = (samples_ != VK_SAMPLE_COUNT_1_BIT);
+    if (msaa) {
+        // The multisampled twins. COLOR_ATTACHMENT only - they are resolved,
+        // never sampled or transferred.
+        if (!createAttachment(colorMsaa_, w, h, colorFormat_,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, samples_,
+                              VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+        if (!createAttachment(sceneLinearMsaa_, w, h, sceneLinearFormat_,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, samples_,
+                              VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    }
+
+    // Attachment order mirrors createRenderTargets(): 0,1 = colour (MSAA twins
+    // when multisampling), 2 = depth, 3,4 = the resolve targets.
+    VkImageView fbViews[5] = {
+        msaa ? colorMsaa_.view       : colorImage_.view,
+        msaa ? sceneLinearMsaa_.view : sceneLinearImage_.view,
+        depthImage_.view,
+        colorImage_.view,
+        sceneLinearImage_.view,
+    };
     VkFramebufferCreateInfo fbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     if (!createTransmissionTarget(w, h)) return false;
-    fbci.renderPass = renderPass_; fbci.attachmentCount = 3; fbci.pAttachments = fbViews;
+    fbci.renderPass = renderPass_; fbci.attachmentCount = msaa ? 5u : 3u; fbci.pAttachments = fbViews;
     fbci.width = w; fbci.height = h; fbci.layers = 1;
     if (vkCreateFramebuffer(device_, &fbci, nullptr, &framebuffer_) != VK_SUCCESS) return false;
     return true;
@@ -639,8 +773,12 @@ bool ModelRenderer::createPipeline() {
 #endif
     rs.lineWidth = 1.0f;
 
+    // Must equal the render pass's attachment sample count. `ms` is shared with
+    // the skybox pipeline built at the end of this function, so both move
+    // together - a mismatch on either is a pipeline-creation failure, not a
+    // visual artefact.
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = samples_;
 
     VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = VK_TRUE;
@@ -1366,6 +1504,104 @@ const char* ModelRenderer::toneCurveName() const {
     }
 }
 
+// ===========================================================================
+// Studio rig - the storefront page's lighting, reproduced.
+//
+// The DisplayXR storefront's inline-3D tile lights every model with three.js's
+// addStudioLights (displayxr-shop-pvt, src/vendor/inline3d/inline3d-model.js):
+// three DirectionalLights plus a HemisphereLight, physically-correct
+// intensities, NO environment map, and a WebGLRenderer left at the default
+// NoToneMapping. When a page hands a model to this viewer over displayxr-view:
+// the two end up side by side on one desktop, so anything that does not match
+// reads as a bug in the viewer. Metal is where it shows: three sharp lights on
+// an otherwise unlit body read as metal, while this viewer's smooth analytic
+// sky gives the same body a uniform grey reflection that reads as matte.
+//
+// three.js and this renderer already share a world frame - +Y up, camera down
+// -Z so +Z is toward the viewer - and a three.js DirectionalLight points from
+// its `position` at the origin. So a light's `position`, normalised, IS the
+// shader's world direction TO the light, with no change of basis. Verified by
+// eye on an atlas capture, not assumed.
+namespace {
+
+constexpr float kStudioKeyDir[3]  = { 1.0f,  1.4f,  1.6f};   // upper front right
+constexpr float kStudioKeyI       = 2.2f;
+constexpr float kStudioFillDir[3] = {-1.4f,  0.4f,  0.8f};   // front left, low
+constexpr float kStudioFillI      = 0.7f;
+constexpr float kStudioRimDir[3]  = {-0.4f,  0.8f, -1.6f};   // behind, upper left
+constexpr float kStudioRimI       = 1.0f;
+constexpr float kStudioHemiI      = 0.6f;
+
+// HemisphereLight(sky 0xffffff, ground 0x444444). three.js r152+ has
+// ColorManagement on by default, so a hex colour is DECODED from sRGB into the
+// linear working space before it is ever used: the ground is 0.0578 linear, not
+// 0x44/255 = 0.267. Getting this wrong lifts every downward-facing surface by
+// ~4.6x, which on a bottle is the whole lower half.
+constexpr float kStudioHemiSky[3]    = {1.0f, 1.0f, 1.0f};
+constexpr float kStudioHemiGround[3] = {0.057805f, 0.057805f, 0.057805f};
+
+// How much of the analytic-sky IBL survives under Studio.
+//
+// The faithful number is 0: the page has no environment map at all, so its
+// metal is lit by three lights and nothing else. It is 0.15 instead for one
+// reason specific to this display - a metal with no environment goes pure black
+// everywhere the three lights miss, and a black region is the one thing a
+// lightfield panel has NO parallax detail to show. A body that is black in
+// every view carries no depth cue at all, so the object reads as a flat cut-out
+// floating in front of the desktop. 0.15 leaves the direct highlights dominant
+// by close to an order of magnitude (measured on WaterBottle.glb; see the #113
+// PR comment) while keeping the body's form readable in 3D.
+constexpr float kStudioIblScale = 0.15f;
+
+void normalizeInto(float out[4], const float dir[3], float intensity) {
+    const float n = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+    const float inv = (n > 1e-6f) ? (1.0f / n) : 0.0f;
+    out[0] = dir[0] * inv; out[1] = dir[1] * inv; out[2] = dir[2] * inv;
+    out[3] = intensity;
+}
+
+}  // namespace
+
+void ModelRenderer::setLightingMode(LightingMode m) {
+    lightingMode_ = m;
+    // The grading is PART of the mode. The page runs three.js at unit exposure
+    // with NoToneMapping, so Studio has to as well - a filmic knee alone would
+    // pull every highlight the rig exists to produce back under 1.0 and undo
+    // the comparison. Sky keeps the #70 phase-0 pairing (PBR Neutral needs the
+    // +1 EV to reach its knee at all). [ / ] and G still override afterwards;
+    // this only sets the mode's starting point.
+    if (m == LightingMode::Studio) {
+        exposureEV_ = 0.0f;
+        toneCurve_  = ToneCurve::Clamp;
+    } else {
+        exposureEV_ = 1.0f;
+        toneCurve_  = ToneCurve::PbrNeutral;
+    }
+    std::printf("ModelRenderer: lighting = %s (exposure %+.2f EV, tone %s)\n",
+                lightingModeName(), exposureEV_, toneCurveName());
+}
+
+const char* ModelRenderer::lightingModeName() const {
+    switch (lightingMode_) {
+        case LightingMode::Studio: return "studio";
+        case LightingMode::NoLights:   return "none";
+        default:                   return "sky";
+    }
+}
+
+void ModelRenderer::cycleLightingMode() {
+    setLightingMode(lightingMode_ == LightingMode::Sky    ? LightingMode::Studio
+                  : lightingMode_ == LightingMode::Studio ? LightingMode::NoLights
+                                                          : LightingMode::Sky);
+}
+
+bool ModelRenderer::parseLightingMode(const std::string& env, LightingMode& out) {
+    if (env == "studio") { out = LightingMode::Studio; return true; }
+    if (env == "sky")    { out = LightingMode::Sky;    return true; }
+    if (env == "none")   { out = LightingMode::NoLights;   return true; }
+    return false;
+}
+
 VkDescriptorSet ModelRenderer::makeMaterialSet(const VkImageView views[MTEX_COUNT]) {
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = matPool_;
@@ -1669,20 +1905,44 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     // an sRGB swapchain, whose blit already encodes. Repurposes an unused slot.
     ub.cameraPos[3] = swapchainIsSrgb_ ? 0.0f : 1.0f;
 
-    // Fixed key light (world space), normalized.
-    float lx = 0.4f, ly = 0.8f, lz = 0.5f;
+    const bool studio = (lightingMode_ == LightingMode::Studio);
+
+    // Key light (world space), normalized. Studio takes the page's key
+    // direction; Sky and None keep the direction the analytic sky bakes its sun
+    // at (sky.glsl uses the same vector, so lit and reflected highlights agree).
+    float lx = studio ? kStudioKeyDir[0] : 0.4f;
+    float ly = studio ? kStudioKeyDir[1] : 0.8f;
+    float lz = studio ? kStudioKeyDir[2] : 0.5f;
     float ln = std::sqrt(lx * lx + ly * ly + lz * lz);
     ub.lightDir[0] = lx / ln; ub.lightDir[1] = ly / ln; ub.lightDir[2] = lz / ln;
     ub.lightDir[3] = (clipFar > 0.0f) ? clipFar : 0.0f;  // foreground clip (view-space)
 
     // Grading (issue #70 phase 0). .z gates the analytic key light off under an
-    // HDRI, which already contains its own sun — see pbr.frag.
+    // HDRI, which already contains its own sun - see pbr.frag. None gates it off
+    // outright (that mode IS "ambient only"). Studio ignores .z entirely: its
+    // key scale comes from studio.y, so an HDRI cannot silently unlight it.
     ub.tone[0] = std::pow(2.0f, exposureEV_);
     ub.tone[1] = (float)(int)toneCurve_;
-    ub.tone[2] = envIsHdri_ ? 0.0f : 1.0f;
+    ub.tone[2] = (lightingMode_ == LightingMode::NoLights || envIsHdri_) ? 0.0f : 1.0f;
     ub.tone[3] = transmissionProbe_ ? 1.0f : 0.0f;
     ub.viewport[0] = (width_  > 0) ? (float)vpWidth_  / (float)width_  : 1.0f;
     ub.viewport[1] = (height_ > 0) ? (float)vpHeight_ / (float)height_ : 1.0f;
+
+    // Studio rig. Written unconditionally (zero-cost: the shader reads them
+    // only when studio.x is 1) so a mode switch is one uniform away and never
+    // leaves a stale direction behind.
+    ub.studio[0] = studio ? 1.0f : 0.0f;
+    ub.studio[1] = kStudioKeyI;
+    ub.studio[2] = kStudioHemiI;
+    ub.studio[3] = kStudioIblScale;
+    normalizeInto(ub.studioFill, kStudioFillDir, kStudioFillI);
+    normalizeInto(ub.studioRim,  kStudioRimDir,  kStudioRimI);
+    ub.hemiSky[0]    = kStudioHemiSky[0];
+    ub.hemiSky[1]    = kStudioHemiSky[1];
+    ub.hemiSky[2]    = kStudioHemiSky[2];
+    ub.hemiGround[0] = kStudioHemiGround[0];
+    ub.hemiGround[1] = kStudioHemiGround[1];
+    ub.hemiGround[2] = kStudioHemiGround[2];
     // DXR_MODELVIEWER_KULLA_CONTY=1 switches the scatter lobe to the spec's
     // multi->single scatter albedo remap, so the two can be MEASURED against the
     // conformance references rather than argued about. See pbr.frag.
@@ -2476,6 +2736,8 @@ void ModelRenderer::cleanup() {
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
     if (sceneLinearImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearImage_);
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
+    if (colorMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorMsaa_);
+    if (sceneLinearMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearMsaa_);
     if (cmdPool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
 
     initialized_ = false;

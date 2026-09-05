@@ -32,6 +32,16 @@ extern bool g_hasDisplayZonesExt;
 extern int32_t g_displayDesktopLeft;
 extern int32_t g_displayDesktopTop;
 
+// XR_DXR_display_info v18 (XrDisplayDesktopInfoDXR): the panel monitor's full
+// desktop rect in physical virtual-screen pixels, and whether the runtime
+// genuinely located a 3D panel. The undock launch contract clamps a
+// caller-supplied --rect into the rect, but ONLY when the flag is set — an
+// unconfirmed rect is the primary monitor's, and clamping to the wrong
+// monitor is worse than not clamping. All-zero rect = unresolved (pre-v18
+// runtime, or the runtime could not resolve one).
+extern XrRect2Di g_displayDesktopRect;
+extern bool      g_displayPanelConfirmed;
+
 // ── XR_DXR_mcp_tools (#47): app-defined agent tools ─────────────────────────
 // Ported from the macOS build (macos/main.mm). The model viewer registers its
 // own appId ("modelviewer") + tools; agent tool calls arrive as
