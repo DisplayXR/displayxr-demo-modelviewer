@@ -1932,6 +1932,17 @@ struct PerformanceStats {
     float fpsAccumulator = 0.0f;
 };
 
+// Wall time inside ModelRenderer::renderEye, summed over the frame's views.
+//
+// The fps line above cannot answer "what did this cost": the session is
+// vsync-locked, so a change that eats real GPU time still reports a flat 16.67
+// ms right up until it blows the budget entirely. renderEye ends in
+// vkQueueWaitIdle, so its wall time IS that view's GPU pass - which makes this
+// the honest number for a before/after (MSAA, a new lobe) at a workload that
+// still fits in the frame. Published only under DXR_MODELVIEWER_PERF_LOG.
+static std::atomic<double> g_sceneMsAccum{0.0};
+static std::atomic<int>    g_sceneMsFrames{0};
+
 static void UpdatePerformanceStats(PerformanceStats& stats) {
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(now - stats.lastTime);
@@ -1944,6 +1955,21 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
         stats.fps = stats.frameCount / stats.fpsAccumulator;
         stats.frameCount = 0;
         stats.fpsAccumulator = 0.0f;
+        // DXR_MODELVIEWER_PERF_LOG=1 puts what the HUD shows into the log too.
+        // The HUD is a separate composited layer, so it is not in an atlas
+        // capture and cannot be read back headlessly - which makes a claim
+        // about a change's frame-time cost (MSAA, say) unverifiable without
+        // someone at the panel. One line per second, opt-in, off by default.
+        static const bool perfLog = [] {
+            const char* e = std::getenv("DXR_MODELVIEWER_PERF_LOG");
+            return e && *e && *e != '0';
+        }();
+        if (perfLog) {
+            const int    n  = g_sceneMsFrames.exchange(0);
+            const double ms = g_sceneMsAccum.exchange(0.0);
+            LOG_INFO("perf: %.1f fps, %.2f ms/frame, scene %.3f ms/frame (%d frames)",
+                     stats.fps, 1000.0f / stats.fps, (n > 0) ? (ms / n) : 0.0, n);
+        }
     }
 }
 
@@ -2716,6 +2742,7 @@ static void RenderThreadFunc(
                             }
 
                             if (hasGsScene) {
+                                const auto sceneT0 = std::chrono::high_resolution_clock::now();
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     // Row-major eye placement in the atlas; for 2×1 SBS
                                     // this is (0, renderW) at row 0; for mono (cols=1)
@@ -2731,6 +2758,12 @@ static void RenderThreadFunc(
                                         viewMat[eye], projMat[eye],
                                         g_transparentBg.load(), clipFar[eye]);
                                 }
+                                g_sceneMsAccum.store(
+                                    g_sceneMsAccum.load(std::memory_order_relaxed) +
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::high_resolution_clock::now() - sceneT0).count(),
+                                    std::memory_order_relaxed);
+                                g_sceneMsFrames.fetch_add(1, std::memory_order_relaxed);
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
                                     (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);

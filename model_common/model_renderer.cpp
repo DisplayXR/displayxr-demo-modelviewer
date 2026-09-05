@@ -220,6 +220,7 @@ bool ModelRenderer::init(VkInstance instance,
         }
     }
 
+    chooseSampleCount();
     if (!createRenderTargets()) return false;
     if (!createPipeline()) return false;
     if (!createSamplerAndDefaults()) return false;
@@ -248,6 +249,91 @@ bool ModelRenderer::init(VkInstance instance,
     return true;
 }
 
+// Pick the rasterisation sample count once, at init.
+//
+// 4x is the target: it is the level `antialias: true` gets in a browser, it is
+// universally supported on desktop, and the step from 4 to 8 buys far less than
+// it costs on a renderer that already runs the whole pass once PER VIEW TILE.
+// The count has to be supported for the colour format, the scene-linear format
+// AND depth - framebufferColorSampleCounts alone is not enough, because the two
+// colour attachments have different formats and a device may differ on them.
+void ModelRenderer::chooseSampleCount() {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(physDevice_, &props);
+
+    auto supported = [&](VkSampleCountFlagBits want) {
+        VkSampleCountFlags common = props.limits.framebufferColorSampleCounts &
+                                    props.limits.framebufferDepthSampleCounts;
+        if ((common & want) == 0) return false;
+        // Per-format check: the limits above are the framebuffer's ceiling, not
+        // a promise for a specific format+usage pair.
+        const VkFormat fmts[3] = {colorFormat_, sceneLinearFormat_, depthFormat_};
+        const VkImageUsageFlags usages[3] = {
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
+        for (int i = 0; i < 3; ++i) {
+            VkImageFormatProperties ifp{};
+            if (vkGetPhysicalDeviceImageFormatProperties(
+                    physDevice_, fmts[i], VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                    usages[i], 0, &ifp) != VK_SUCCESS)
+                return false;
+            if ((ifp.sampleCounts & want) == 0) return false;
+        }
+        return true;
+    };
+
+    VkSampleCountFlagBits want = VK_SAMPLE_COUNT_4_BIT;
+    // DXR_MODELVIEWER_MSAA=<n> makes the 1-vs-4 comparison runnable without a
+    // rebuild, which is what an aliasing claim has to be settled with.
+    if (const char* e = std::getenv("DXR_MODELVIEWER_MSAA")) {
+        const int n = std::atoi(e);
+        want = (n >= 8) ? VK_SAMPLE_COUNT_8_BIT
+             : (n >= 4) ? VK_SAMPLE_COUNT_4_BIT
+             : (n >= 2) ? VK_SAMPLE_COUNT_2_BIT
+                        : VK_SAMPLE_COUNT_1_BIT;
+    }
+
+    samples_ = VK_SAMPLE_COUNT_1_BIT;
+    if (want != VK_SAMPLE_COUNT_1_BIT) {
+        if (supported(want)) {
+            samples_ = want;
+        } else if (want != VK_SAMPLE_COUNT_4_BIT && supported(VK_SAMPLE_COUNT_4_BIT)) {
+            samples_ = VK_SAMPLE_COUNT_4_BIT;
+        } else if (supported(VK_SAMPLE_COUNT_2_BIT)) {
+            samples_ = VK_SAMPLE_COUNT_2_BIT;
+        }
+    }
+    std::printf("ModelRenderer: MSAA %ux%s\n", (unsigned)samples_,
+                (samples_ == want) ? "" : " (requested level unsupported)");
+}
+
+bool ModelRenderer::createAttachment(ModelImage& img, uint32_t w, uint32_t h,
+                                     VkFormat fmt, VkImageUsageFlags usage,
+                                     VkSampleCountFlagBits samples,
+                                     VkImageAspectFlags aspect) {
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = fmt;
+    ici.extent = {w, h, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
+    ici.samples = samples; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = usage; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(device_, &ici, nullptr, &img.image) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(device_, img.image, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = modelFindMemoryType(physDevice_, mr.memoryTypeBits,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device_, &ai, nullptr, &img.memory) != VK_SUCCESS) return false;
+    vkBindImageMemory(device_, img.image, img.memory, 0);
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = img.image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
+    vci.subresourceRange = {aspect, 0, 1, 0, 1};
+    if (vkCreateImageView(device_, &vci, nullptr, &img.view) != VK_SUCCESS) return false;
+    img.width = w; img.height = h;
+    return true;
+}
+
 bool ModelRenderer::createRenderTargets() {
     // Render pass (format-only; size-independent). Clears colour+depth, leaves
     // colour in TRANSFER_SRC for the per-eye viewport blit.
@@ -259,21 +345,32 @@ bool ModelRenderer::createRenderTargets() {
     // models that contain glass, because the render pass and the pipelines are
     // built at init while hasTransmissive_ is only known after a model loads
     // (and models are loaded and swapped at runtime via L / drag-drop).
-    VkAttachmentDescription atts[3] = {};
+    // MSAA (samples_ > 1) adds two RESOLVE attachments, 3 and 4. Attachments 0
+    // and 1 then carry the multisampled twins and the subpass resolves them
+    // into colorImage_ / sceneLinearImage_ - which keep the single-sample
+    // identity, layout and finalLayout they always had, so nothing downstream
+    // (the per-eye blit, captureSceneColor, the mip chain) changes at all.
+    const bool msaa = (samples_ != VK_SAMPLE_COUNT_1_BIT);
+
+    VkAttachmentDescription atts[5] = {};
     atts[0].format = colorFormat_;
-    atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[0].samples = samples_;
     atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    // The MSAA image is never transferred from - only resolved - so it stays a
+    // colour attachment across both passes; only the resolve target goes to
+    // TRANSFER_SRC for the blit.
+    atts[0].finalLayout = msaa ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                               : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
     atts[1] = atts[0];
     atts[1].format = sceneLinearFormat_;
 
     atts[2].format = depthFormat_;
-    atts[2].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[2].samples = samples_;
     atts[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     // STORE, not DONT_CARE: the transmissive pass (renderPassLoad_ below) does
     // LOAD_OP_LOAD on this same depth attachment so glass depth-tests against the
@@ -286,15 +383,33 @@ bool ModelRenderer::createRenderTargets() {
     atts[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     atts[2].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+    // Resolve targets: single-sample, contents irrelevant on entry (the resolve
+    // overwrites every pixel of the render area), TRANSFER_SRC on the way out.
+    atts[3].format = colorFormat_;
+    atts[3].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[3].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[3].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[3].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[3].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[3].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    atts[4] = atts[3];
+    atts[4].format = sceneLinearFormat_;
+
     VkAttachmentReference colorRefs[2] = {
         {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
         {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+    };
+    VkAttachmentReference resolveRefs[2] = {
+        {3, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+        {4, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
     };
     VkAttachmentReference depthRef = {2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub = {};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 2;
     sub.pColorAttachments = colorRefs;
+    sub.pResolveAttachments = msaa ? resolveRefs : nullptr;
     sub.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency deps[2] = {};
@@ -312,7 +427,7 @@ bool ModelRenderer::createRenderTargets() {
     deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
     VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpci.attachmentCount = 3;
+    rpci.attachmentCount = msaa ? 5u : 3u;
     rpci.pAttachments = atts;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &sub;
@@ -331,8 +446,17 @@ bool ModelRenderer::createRenderTargets() {
     atts[1].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     atts[2].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     atts[2].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    // The resolve targets are rewritten wholesale by pass 2's resolve, so they
+    // still LOAD nothing - but they arrive in COLOR_ATTACHMENT_OPTIMAL, put
+    // there by renderEye's explicit barrier off the transmission copy's read.
+    atts[3].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    atts[4].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    // OR, not assign: pass 2 LOADs colour and depth that pass 1 WROTE, so the
+    // attachment-write stages have to stay in the dependency alongside the
+    // transmission sample's shader read.
+    deps[0].srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].srcAccessMask |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPassLoad_) != VK_SUCCESS) return false;
 
     return ensureTargets(width_, height_);
@@ -350,6 +474,8 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
     if (sceneLinearImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearImage_);
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
+    if (colorMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorMsaa_);
+    if (sceneLinearMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearMsaa_);
     if (transmissionImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, transmissionImage_);
     width_ = w; height_ = h;
 
@@ -363,28 +489,36 @@ bool ModelRenderer::ensureTargets(uint32_t w, uint32_t h) {
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (sceneLinearImage_.image == VK_NULL_HANDLE) return false;
 
-    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = depthFormat_;
-    ici.extent = {w, h, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(device_, &ici, nullptr, &depthImage_.image) != VK_SUCCESS) return false;
-    VkMemoryRequirements mr; vkGetImageMemoryRequirements(device_, depthImage_.image, &mr);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = mr.size;
-    ai.memoryTypeIndex = modelFindMemoryType(physDevice_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vkAllocateMemory(device_, &ai, nullptr, &depthImage_.memory) != VK_SUCCESS) return false;
-    vkBindImageMemory(device_, depthImage_.image, depthImage_.memory, 0);
-    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vci.image = depthImage_.image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = depthFormat_;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device_, &vci, nullptr, &depthImage_.view) != VK_SUCCESS) return false;
-    depthImage_.width = w; depthImage_.height = h;
+    // Depth follows the colour attachments' sample count - a subpass's depth
+    // and colour attachments must agree, so this is not an independent choice.
+    if (!createAttachment(depthImage_, w, h, depthFormat_,
+                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, samples_,
+                          VK_IMAGE_ASPECT_DEPTH_BIT)) return false;
 
-    VkImageView fbViews[3] = {colorImage_.view, sceneLinearImage_.view, depthImage_.view};
+    const bool msaa = (samples_ != VK_SAMPLE_COUNT_1_BIT);
+    if (msaa) {
+        // The multisampled twins. COLOR_ATTACHMENT only - they are resolved,
+        // never sampled or transferred.
+        if (!createAttachment(colorMsaa_, w, h, colorFormat_,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, samples_,
+                              VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+        if (!createAttachment(sceneLinearMsaa_, w, h, sceneLinearFormat_,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, samples_,
+                              VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    }
+
+    // Attachment order mirrors createRenderTargets(): 0,1 = colour (MSAA twins
+    // when multisampling), 2 = depth, 3,4 = the resolve targets.
+    VkImageView fbViews[5] = {
+        msaa ? colorMsaa_.view       : colorImage_.view,
+        msaa ? sceneLinearMsaa_.view : sceneLinearImage_.view,
+        depthImage_.view,
+        colorImage_.view,
+        sceneLinearImage_.view,
+    };
     VkFramebufferCreateInfo fbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     if (!createTransmissionTarget(w, h)) return false;
-    fbci.renderPass = renderPass_; fbci.attachmentCount = 3; fbci.pAttachments = fbViews;
+    fbci.renderPass = renderPass_; fbci.attachmentCount = msaa ? 5u : 3u; fbci.pAttachments = fbViews;
     fbci.width = w; fbci.height = h; fbci.layers = 1;
     if (vkCreateFramebuffer(device_, &fbci, nullptr, &framebuffer_) != VK_SUCCESS) return false;
     return true;
@@ -639,8 +773,12 @@ bool ModelRenderer::createPipeline() {
 #endif
     rs.lineWidth = 1.0f;
 
+    // Must equal the render pass's attachment sample count. `ms` is shared with
+    // the skybox pipeline built at the end of this function, so both move
+    // together - a mismatch on either is a pipeline-creation failure, not a
+    // visual artefact.
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = samples_;
 
     VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = VK_TRUE;
@@ -2476,6 +2614,8 @@ void ModelRenderer::cleanup() {
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);
     if (sceneLinearImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearImage_);
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
+    if (colorMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorMsaa_);
+    if (sceneLinearMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearMsaa_);
     if (cmdPool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
 
     initialized_ = false;

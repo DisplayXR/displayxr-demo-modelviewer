@@ -220,6 +220,14 @@ private:
 
     bool createRenderTargets();
     bool ensureTargets(uint32_t w, uint32_t h);   // (re)create color+depth+framebuffer at this size
+    // Pick samples_ once, at init: 4x if the device supports it for all three
+    // attachment formats, else 1. DXR_MODELVIEWER_MSAA=<1|2|4|8> overrides.
+    void chooseSampleCount();
+    // One attachment image + view. Exists because the MSAA attachments need a
+    // sample count and modelCreateImage2D has no parameter for one.
+    bool createAttachment(ModelImage& img, uint32_t w, uint32_t h, VkFormat fmt,
+                          VkImageUsageFlags usage, VkSampleCountFlagBits samples,
+                          VkImageAspectFlags aspect);
     bool createPipeline();
     bool createSamplerAndDefaults();
     bool createIbl();   // BRDF LUT + the env descriptor + the first cube bake
@@ -313,6 +321,23 @@ private:
     ModelImage colorImage_;
     ModelImage sceneLinearImage_;
     ModelImage depthImage_;
+
+    // ── MSAA (issue #113) ────────────────────────────────────────────────────
+    // The page this viewer undocks from renders with `antialias: true`; the
+    // viewer rasterised at 1 sample, so its edges were visibly stepped beside
+    // the page's. When samples_ > 1 the two colour attachments and the depth
+    // buffer above are joined by multisampled twins that the subpass RESOLVES
+    // into them, so colorImage_ / sceneLinearImage_ keep their single-sample
+    // identity and every consumer downstream - the per-eye blit, the
+    // transmission capture, the mip chain - is untouched.
+    //
+    // Note what this cannot fix: the display processor hard-masks the
+    // SILHOUETTE alpha to 0/1, so a transparent window's outline against the
+    // desktop stays hard however many samples are taken. Internal edges and
+    // texture detail are what improve.
+    VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;
+    ModelImage colorMsaa_;         // only when samples_ > 1
+    ModelImage sceneLinearMsaa_;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     // Second pass over the same attachments with LOAD instead of CLEAR, for the
     // transmissive draws that have to come after the scene-colour capture.
