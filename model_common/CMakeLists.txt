@@ -145,6 +145,8 @@ add_library(model_renderer STATIC
     model_loader_backends.h
     model_loader.cpp           # format dispatcher + path helpers
     model_loader_gltf.cpp      # .glb/.gltf backend (tinygltf, defines its impl)
+    gltf_siblings.h
+    gltf_siblings.cpp          # .gltf external buffer/image URI policy (#114)
     model_loader_material.h
     model_loader_material.cpp  # shared texture/material shim (OBJ + FBX)
     model_loader_stl.cpp       # .stl backend (hand-rolled, no dep)
@@ -176,3 +178,25 @@ target_link_libraries(model_renderer PRIVATE
     tinygltf
     tinyusdz::tinyusdz_static
 )
+
+# ── Unit tests ────────────────────────────────────────────────────────────
+# gltf_siblings.cpp is the security boundary of the multi-file .gltf fetch
+# (#114): it decides which URIs inside a downloaded JSON document the viewer
+# will fetch and write to disk. A live download can never demonstrate that a
+# hostile URI is refused, so the validator is tested directly, in a tiny
+# console exe with no framework (exit 0 = all cases pass). It compiles
+# gltf_siblings.cpp on its own — no Vulkan, no shaders, no renderer — so it
+# builds and runs on every platform's CI in about a second.
+option(MODELVIEWER_BUILD_TESTS "Build the model_common unit tests" ON)
+if(MODELVIEWER_BUILD_TESTS)
+    add_executable(gltf_uri_tests
+        tests/gltf_uri_tests.cpp
+        gltf_siblings.cpp
+    )
+    target_include_directories(gltf_uri_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(gltf_uri_tests PRIVATE tinygltf)   # nlohmann json.hpp
+    if(MSVC)
+        target_compile_options(gltf_uri_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME gltf_uri_tests COMMAND gltf_uri_tests)
+endif()

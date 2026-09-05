@@ -15,6 +15,11 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ctest: `ctest --test-dir build` runs model_common's pure unit tests (the
+# .gltf sibling-URI validator). Enabled here so add_test() in the subdirectory
+# registers; -DMODELVIEWER_BUILD_TESTS=OFF drops the target entirely.
+enable_testing()
+
 # Shared libraries (built once, linked by the platform executable).
 add_subdirectory(common)
 add_subdirectory(model_common)
