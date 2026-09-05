@@ -29,6 +29,7 @@
 #include "gltf_siblings.h"   // .gltf external buffer/image URI policy (#114)
 #include "display3d_view.h"
 #include "projection_depth.h"
+#include "clip_policy.h"       // dxr::ResolveClipPlanes / ChainRearDepthBudget (#116, XR_DXR_depth_budget)
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
@@ -2840,6 +2841,18 @@ static void RenderThreadFunc(
                             viewState.next = &viewRigRaw;
                         }
 
+                        // XR_DXR_depth_budget (#116): chain the advisory rear depth
+                        // budget beside the view rig's raw channel. Only meaningful
+                        // under the rig (ez/vH — the ClipPolicy inputs — come from
+                        // RigLocalEyeZ below); a runtime lacking the extension, or an
+                        // app that never enabled it, leaves rearBudgetPtr null and
+                        // dxr::ResolveClipPlanes falls back to today's rule untouched.
+                        XrRearDepthBudgetDXR rearBudget = {};
+                        const bool useDepthBudget = g_hasDepthBudgetExt && useRig;
+                        if (useDepthBudget) {
+                            dxr::ChainRearDepthBudget(viewState, rearBudget);
+                        }
+
                         // Zones-by-default (#63): lazy one-time caps probe, then a
                         // zone-scoped locate — the full-window zone with the rig
                         // chained THROUGH it. Requires the rig (a zone locate
@@ -2865,6 +2878,15 @@ static void RenderThreadFunc(
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                        // A runtime that recognizes the chained struct always overwrites
+                        // `type` with XR_TYPE_REAR_DEPTH_BUDGET_DXR — that's how an
+                        // untouched ChainRearDepthBudget() zero-init (pre-extension
+                        // runtime, or one that ignored the chain) is told apart from a
+                        // genuine advisory value (clip_policy.h contract).
+                        const XrRearDepthBudgetDXR* rearBudgetPtr =
+                            (useDepthBudget && rearBudget.type == XR_TYPE_REAR_DEPTH_BUDGET_DXR)
+                                ? &rearBudget : nullptr;
 
                         // HUD eye readout. Under the rig, rawViews[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
@@ -2934,15 +2956,15 @@ static void RenderThreadFunc(
                         // --- Consume the runtime's render-ready XrView{pose, fov} (#396 W7) ---
                         // The runtime owns the off-axis Kooima (window resolve included —
                         // it tracks resize via GetClientRect runtime-side); the app keeps
-                        // only the clip policy (fov is clip-independent). near = ez - vH,
-                        // far = ez + 1000*vH (opaque recede band; transparent mode's
-                        // foreground-only look is the clipFar shader cull below, not a
-                        // projection clamp), ez = RigLocalEyeZ (== the display-space eye Z
-                        // display3d resolved). The view matrix is the plain clean-frame
-                        // mat4_view_from_xr_pose — ModelRenderer owns the Vulkan Y-down
-                        // flip via a negative viewport. GL projection → [0,1] depth remap
-                        // kept (mesh uses the depth buffer).
+                        // only the clip policy (fov is clip-independent). near/far/clipFar
+                        // are resolved by dxr::ResolveClipPlanes (#116, XR_DXR_depth_budget)
+                        // from ez = RigLocalEyeZ (== the display-space eye Z display3d
+                        // resolved) — see the per-eye loop below. The view matrix is the
+                        // plain clean-frame mat4_view_from_xr_pose — ModelRenderer owns the
+                        // Vulkan Y-down flip via a negative viewport. GL projection → [0,1]
+                        // depth remap kept (mesh uses the depth buffer).
                         Display3DView stereoViews[8];
+                        float rigClipFar[8] = {0};  // per-eye shader/rasterizer far cull (0 = off)
                         bool useAppProjection = useRig;
                         if (useRig) {
                             // Mono: collapse the active views to their centroid (pose + fov).
@@ -2976,8 +2998,15 @@ static void RenderThreadFunc(
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 const XrView& sv = srcViews[eye];
                                 float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
-                                float near_z = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
-                                float far_z  = ez + 1000.0f * rigVH;
+                                // #116: runtime-advised rear depth budget (or the
+                                // pre-#116 fallback rule, bit-for-bit, when rearBudgetPtr
+                                // is null) resolves near/far for the projection AND the
+                                // shader/rasterizer far-cull in one place.
+                                dxr::ClipPlanes clip = dxr::ResolveClipPlanes(ez, rigVH,
+                                    rearBudgetPtr, g_transparentBg.load(), IsStandaloneSession(xr));
+                                float near_z = clip.near_z;
+                                float far_z  = clip.far_z;
+                                rigClipFar[eye] = clip.clipFar;
                                 mat4_view_from_xr_pose(stereoViews[eye].view_matrix, sv.pose);
                                 mat4_from_xr_fov(stereoViews[eye].projection_matrix, sv.fov, near_z, far_z);
                                 // GL ([-1,1] clip-z) → Vulkan [0,1] depth for the mesh's depth buffer.
@@ -3095,13 +3124,15 @@ static void RenderThreadFunc(
                             }
                         }
 
-                        // Foreground-only clip: in transparent mode, cull splats
-                        // behind the virtual display plane so only popping-out
-                        // content shows. Suppressed under the shell's external
-                        // multi-compositor (non-controller workspace session,
-                        // where the per-app transparent bridge is bypassed) —
-                        // signalled by renderingModeIsRequestable being false.
-                        bool foregroundClip = g_transparentBg.load() && IsStandaloneSession(xr);
+                        // Foreground-only clip: in transparent mode, cull content behind
+                        // the virtual display plane so only popping-out content shows.
+                        // Suppressed under the shell's external multi-compositor
+                        // (non-controller workspace session, where the per-app
+                        // transparent bridge is bypassed). #116: the cull distance itself
+                        // now comes from dxr::ResolveClipPlanes (rigClipFar, computed
+                        // alongside near/far above) instead of being re-derived here —
+                        // one call, one rule, whether or not the runtime advertises
+                        // XR_DXR_depth_budget.
 
                         // Build per-eye view/projection matrices (column-major float[16]).
                         // Sized to the runtime's max view count so Quad mode (4 views) fits.
@@ -3112,12 +3143,7 @@ static void RenderThreadFunc(
                                 int srcEye = monoMode ? 0 : eye;
                                 memcpy(viewMat[eye], stereoViews[srcEye].view_matrix, sizeof(float) * 16);
                                 memcpy(projMat[eye], stereoViews[srcEye].projection_matrix, sizeof(float) * 16);
-                                // eye_display.z = eye->display-plane forward distance,
-                                // same world units as the shader's p_view.z.
-                                if (foregroundClip) {
-                                    float cf = stereoViews[srcEye].eye_display.z;
-                                    clipFar[eye] = (cf > 0.2f) ? cf : 0.0f;  // never cull at/behind near
-                                }
+                                clipFar[eye] = rigClipFar[srcEye];
                             } else {
                                 // Fallback: use DirectXMath mono matrices, store as column-major
                                 XMMATRIX v = monoMode ? monoViewMatrix :
@@ -3384,6 +3410,17 @@ static void RenderThreadFunc(
                                     swprintf(vhBuf, 128, L"\nvHeight: %.3f  m2v: %.3f\nDepth/IPD: %d%%  Auto-Orbit: %s",
                                         inputSnapshot.viewParams.virtualDisplayHeight, hudM2v, depthPct, orbitLbl);
                                     stereoText += vhBuf;
+                                }
+                                // #116 (XR_DXR_depth_budget): only meaningful once the
+                                // extension resolved a value for this locate (see
+                                // rearBudgetPtr above) — silent (no line) otherwise, same
+                                // as every other extension-gated HUD readout in this file.
+                                if (rearBudgetPtr) {
+                                    wchar_t rearBuf[64];
+                                    swprintf(rearBuf, 64, L"\nrear: %hs %.0f",
+                                        dxr::RearDepthBudgetStateName(rearBudgetPtr->state),
+                                        rearBudgetPtr->farOffsetVH);
+                                    stereoText += rearBuf;
                                 }
                                 std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset | [N] Clip | [K] Play/Pause\n"
