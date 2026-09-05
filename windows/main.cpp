@@ -3342,6 +3342,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // ── Launch contract: report, refuse, route, then configure ───────────
     for (const std::string& w : g_launch.warnings) LOG_WARN("launch: %s", w.c_str());
+    // An undocked viewer must run its OWN in-process compositor. A protocol handler
+    // inherits the browser's environment (XRT_FORCE_MODE=ipc), which would make this
+    // process an IPC client that is not the panel owner: 2D whenever the browser holds
+    // the panel, no drag phase-snap. Must run before xrCreateInstance loads the runtime.
+    if (dxr::ForceInProcessRuntimeForUndock(g_launch))
+        LOG_WARN("launch: inherited IPC routing overridden -> XRT_FORCE_MODE=native (undock is standalone)");
     if (!g_launch.ok()) {
         for (const std::string& e : g_launch.errors) LOG_ERROR("launch: %s", e.c_str());
         // A protocol launch has no console and no parent reading stderr — the
