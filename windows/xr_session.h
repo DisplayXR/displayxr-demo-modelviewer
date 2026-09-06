@@ -27,6 +27,13 @@ extern bool g_hasViewRigExt;
 // Enabling is a pure opt-in; when absent dxr::ResolveClipPlanes(nullptr, ...)
 // reproduces today's hand-rolled clip rule bit-for-bit. Set by InitializeOpenXR.
 extern bool g_hasDepthBudgetExt;
+// The runtime's reported `XrExtensionProperties::extensionVersion` for
+// XR_DXR_depth_budget, captured alongside g_hasDepthBudgetExt (0 when the
+// extension is absent). v3 (silhouette content-mask ROI, brief §6) is
+// additive — a v2 runtime still advertises the extension and the rear-budget
+// value chains fine, it just never sees a mask, so this must gate ONLY the
+// mask-chaining call, never g_hasDepthBudgetExt itself.
+extern uint32_t g_depthBudgetExtVersion;
 // XR_DXR_display_zones + XR_DXR_local_3d_zone both present (#63): the
 // zones-by-default full-window zone needs the pair (zone chain + Local2D).
 extern bool g_hasDisplayZonesExt;

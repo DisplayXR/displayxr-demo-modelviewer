@@ -13,6 +13,7 @@
 bool g_hasViewRigExt = false;
 bool g_hasDisplayZonesExt = false;   // display_zones AND local_3d_zone (#63)
 bool g_hasDepthBudgetExt = false;    // XR_DXR_depth_budget (#116), optional
+uint32_t g_depthBudgetExtVersion = 0; // extensionVersion reported alongside it (0 = absent)
 
 // XR_DXR_mcp_tools (#47): app-owned REGISTRATION entry points. Resolved in
 // InitializeOpenXR; NULL when the runtime lacks the extension (feature inert).
@@ -101,6 +102,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
         if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
             g_hasDepthBudgetExt = true;
+            g_depthBudgetExtVersion = ext.extensionVersion;
         }
     }
     // Zones-by-default (#63 / INV-5.6) needs the PAIR: display_zones for the
@@ -125,7 +127,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_mcp_tools: %s", g_hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_display_zones(+local_3d_zone): %s", g_hasDisplayZonesExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_DXR_depth_budget: %s", g_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_depth_budget: %s (v%u)", g_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
+        g_depthBudgetExtVersion);
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");
