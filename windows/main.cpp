@@ -30,6 +30,7 @@
 #include "display3d_view.h"
 #include "projection_depth.h"
 #include "clip_policy.h"       // dxr::ResolveClipPlanes / ChainRearDepthBudget (#116, XR_DXR_depth_budget)
+#include "content_bounds.h"    // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (v2 content-bounds ROI, brief §5)
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
@@ -296,6 +297,145 @@ static float RigLocalEyeZ(const XrPosef& rig, const XrVector3f& eyeWorld) {
     return oz;
 }
 
+// #116 v2 (XR_DXR_depth_budget SPEC_VERSION 2, content-bounds ROI, brief §5):
+// XrContentBoundsDXR must chain on XrFrameEndInfo::next, but this app submits
+// through displayxr-common's EndFrameWithWindowSpaceLayers (v2.11.0), which
+// builds its XrFrameEndInfo internally and calls xrEndFrame itself — it has no
+// XrFrameEndInfo::next hook of its own (only projectionNext, chained on the
+// projection LAYER, a different pointer chain the runtime's
+// oxr_session_frame_end.c never walks for XR_TYPE_CONTENT_BOUNDS_DXR). Until
+// that hook exists upstream, this local wrapper duplicates
+// EndFrameWithWindowSpaceLayers's body (xr_session_common.cpp) with one added
+// line — endInfo.next — so xrEndFrame gets the REAL chain the runtime reads.
+// Byte-identical to the common function when contentBoundsUV is null, which
+// is every frame with no model loaded or the extension unavailable.
+//
+// SelectEnvBlendMode() itself is `static` (internal linkage) in
+// xr_session_common.cpp, so it isn't callable from here; this is the same
+// lazy-cache-on-the-session logic, duplicated against the same PUBLIC
+// XrSessionManager fields (envBlendModeCount/envBlendModes/
+// runtimeSupportsAlphaBlend) so the two can never disagree within one run.
+static XrEnvironmentBlendMode SelectEnvBlendModeLocal(XrSessionManager& xr) {
+    static const bool transparency_wanted = []() {
+        const char* e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    if (!transparency_wanted) {
+        return XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    }
+    if (xr.envBlendModeCount == 0 && xr.instance != XR_NULL_HANDLE && xr.systemId != XR_NULL_SYSTEM_ID) {
+        uint32_t count = 0;
+        XrResult r = xrEnumerateEnvironmentBlendModes(
+            xr.instance, xr.systemId, xr.viewConfigType,
+            (uint32_t)(sizeof(xr.envBlendModes) / sizeof(xr.envBlendModes[0])),
+            &count, xr.envBlendModes);
+        if (XR_SUCCEEDED(r)) {
+            xr.envBlendModeCount = count;
+            for (uint32_t i = 0; i < count; i++) {
+                if (xr.envBlendModes[i] == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) {
+                    xr.runtimeSupportsAlphaBlend = true;
+                    LOG_INFO("Runtime advertises XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND — submitting it at xrEndFrame");
+                    break;
+                }
+            }
+            if (!xr.runtimeSupportsAlphaBlend) {
+                LOG_WARN("DISPLAYXR_TRANSPARENT_BG=1 but runtime does not advertise ALPHA_BLEND — submitting OPAQUE");
+            }
+        }
+    }
+    return xr.runtimeSupportsAlphaBlend ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                                        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+}
+
+// Same parameter list as displayxr-common's EndFrameWithWindowSpaceLayers,
+// plus a trailing content-bounds pair. `contentBoundsUV` is the canvas-
+// normalised union rect from dxr::ProjectAabbToCanvasBounds (or null to skip
+// chaining entirely, matching the common function exactly).
+static bool EndFrameWithContentBoundsChain(
+    XrSessionManager& xr,
+    XrTime displayTime,
+    const XrCompositionLayerProjectionView* projViews,
+    float hudX, float hudY, float hudWidth, float hudHeight,
+    float hudDisparity,
+    uint32_t viewCount,
+    const void* uiLayers, uint32_t uiLayerCount,
+    int32_t srcX, int32_t srcY,
+    int32_t srcW, int32_t srcH,
+    bool submitHud,
+    XrCompositionLayerFlags projectionLayerFlags,
+    const void* projectionNext,
+    const XrCompositionLayerBaseHeader* const* extraLayers,
+    uint32_t extraLayerCount,
+    const XrRect2Df* contentBoundsUV,
+    float contentBoundsMargin) {
+    XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    projectionLayer.next = projectionNext;
+    projectionLayer.space = xr.localSpace;
+    projectionLayer.layerFlags = projectionLayerFlags;
+    projectionLayer.viewCount = viewCount;
+    projectionLayer.views = projViews;
+
+    if (srcW < 0) srcW = (int32_t)xr.hudSwapchain.width;
+    if (srcH < 0) srcH = (int32_t)xr.hudSwapchain.height;
+
+    XrCompositionLayerWindowSpaceDXR hudLayer = {};
+    hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
+    hudLayer.next = nullptr;
+    hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    hudLayer.subImage.swapchain = xr.hudSwapchain.swapchain;
+    hudLayer.subImage.imageRect.offset = {srcX, srcY};
+    hudLayer.subImage.imageRect.extent = {srcW, srcH};
+    hudLayer.subImage.imageArrayIndex = 0;
+    hudLayer.x = hudX;
+    hudLayer.y = hudY;
+    hudLayer.width = hudWidth;
+    hudLayer.height = hudHeight;
+    hudLayer.disparity = hudDisparity;
+
+    const XrCompositionLayerWindowSpaceDXR* ui =
+        reinterpret_cast<const XrCompositionLayerWindowSpaceDXR*>(uiLayers);
+    std::vector<const XrCompositionLayerBaseHeader*> layers;
+    layers.reserve(2 + uiLayerCount);
+    layers.push_back((const XrCompositionLayerBaseHeader*)&projectionLayer);
+    if (xr.hasHudSwapchain && submitHud)
+        layers.push_back((const XrCompositionLayerBaseHeader*)&hudLayer);
+    for (uint32_t i = 0; i < uiLayerCount; ++i)
+        layers.push_back((const XrCompositionLayerBaseHeader*)&ui[i]);
+    for (uint32_t i = 0; i < extraLayerCount; ++i)
+        if (extraLayers[i] != nullptr) layers.push_back(extraLayers[i]);
+
+    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime = displayTime;
+    endInfo.environmentBlendMode = SelectEnvBlendModeLocal(xr);
+    endInfo.layerCount = (uint32_t)layers.size();
+    endInfo.layers = layers.data();
+
+    // The one addition over the common function: chain XrContentBoundsDXR
+    // onto the REAL XrFrameEndInfo that reaches xrEndFrame. `contentBounds`
+    // lives on this stack frame only until xrEndFrame returns below — never
+    // retained past this call, matching ChainRearDepthBudget's per-locate
+    // lifetime convention.
+    XrContentBoundsDXR contentBounds = {};
+    if (contentBoundsUV != nullptr) {
+        dxr::ChainContentBounds(endInfo, contentBounds, *contentBoundsUV, contentBoundsMargin);
+    }
+
+    XrResult result = xrEndFrame(xr.session, &endInfo);
+    if (XR_FAILED(result)) {
+        static int endFrameFailLog = 0;
+        if (endFrameFailLog < 10 || endFrameFailLog % 300 == 0) {
+            LOG_WARN("[Frame] xrEndFrame (HUD) FAILED: %d (view[0] rect=(%d,%d %dx%d))",
+                     result,
+                     viewCount > 0 ? projViews[0].subImage.imageRect.offset.x : 0,
+                     viewCount > 0 ? projViews[0].subImage.imageRect.offset.y : 0,
+                     viewCount > 0 ? projViews[0].subImage.imageRect.extent.width : 0,
+                     viewCount > 0 ? projViews[0].subImage.imageRect.extent.height : 0);
+        }
+        endFrameFailLog++;
+    }
+    return XR_SUCCEEDED(result);
+}
+
 // sim_display output mode switching (legacy — replaced by unified rendering mode)
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
 static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
@@ -460,6 +600,8 @@ static std::atomic<bool> g_fitValid{false};
 // viewport change re-derives the base without re-measuring the model.
 static std::atomic<float> g_fitExtentW{0.0f};  //!< SWEPT horizontal extent hypot(W, D)
 static std::atomic<float> g_fitExtentH{0.0f};
+// Also reconstructs the full-model world-space AABB (center ± extent/2) for the
+// v2 content-bounds ROI (#116 XR_DXR_depth_budget v2) without re-measuring.
 static std::atomic<float> g_fitExtentD{0.0f};  //!< depth, for the depth backstop
 static std::atomic<float> g_fitAspect{0.0f};   //!< viewport the current base was derived for
 static dxr::AutoFitCanvas g_autoFitCanvas;     //!< runtime-resolved canvas, published post-locate
@@ -2769,6 +2911,13 @@ static void RenderThreadFunc(
                 bool rendered = false;
                 bool hudSubmitted = false;
                 bool loadBtnSubmitted = false;
+                // #116 v2 (XR_DXR_depth_budget content-bounds ROI, brief §5):
+                // populated inside the LocateViews block below (which does not
+                // survive to the Submit-frame section further down — this
+                // outer scope does), then consumed at the
+                // EndFrameWithContentBoundsChain call.
+                XrRect2Df contentBoundsUV{};
+                bool haveContentBounds = false;
 
                 // Aspect-preserving HUD layer footprint (fixes demo-gs#8).
                 // The HUD swapchain has a fixed pixel aspect (hudWidth × hudHeight,
@@ -3159,6 +3308,47 @@ static void RenderThreadFunc(
                             }
                         }
 
+                        // #116 v2 (XR_DXR_depth_budget SPEC_VERSION 2, content-bounds
+                        // ROI, brief §5): project the cached full-model world-space AABB
+                        // — the SAME AABB AutoFit framed against, g_fitCenter ± the
+                        // extents cached in ApplyAutoFitForLoadedScene_locked — through
+                        // this frame's per-eye view-projection matrices, union over every
+                        // eye actually rendered, and hand the canvas-normalised rect to
+                        // EndFrameWithContentBoundsChain below. Gated on useAppProjection
+                        // (viewMat/projMat are only the GL-convention column-major
+                        // matrices content_bounds.h expects in that branch — the
+                        // DirectXMath fallback path never populates a rig, so it never
+                        // enables the extension either) and on a loaded model
+                        // (g_fitValid — no AABB, nothing to project, brief step 3's
+                        // "if the model is not loaded, do not chain"). If the projection
+                        // fails (a corner behind an eye) ProjectAabbToCanvasBounds already
+                        // yields the whole canvas — chained anyway, matching the runtime's
+                        // own no-bounds fallback exactly (a no-op, never a regression).
+                        if (g_hasDepthBudgetExt && useAppProjection &&
+                            g_fitValid.load(std::memory_order_relaxed)) {
+                            const float halfW = 0.5f * g_fitExtentW.load(std::memory_order_relaxed);
+                            const float halfH = 0.5f * g_fitExtentH.load(std::memory_order_relaxed);
+                            const float halfD = 0.5f * g_fitExtentD.load(std::memory_order_relaxed);
+                            const float aabbMin[3] = {g_fitCenter[0] - halfW, g_fitCenter[1] - halfH,
+                                                       g_fitCenter[2] - halfD};
+                            const float aabbMax[3] = {g_fitCenter[0] + halfW, g_fitCenter[1] + halfH,
+                                                       g_fitCenter[2] + halfD};
+
+                            // viewProj = proj * view per eye (column-major, matches
+                            // mat4_multiply's out=a*b convention — same one
+                            // model_renderer.cpp's mat4Mul and content_bounds.h's own
+                            // row-0/1/3 dot products assume).
+                            float viewProj[8][16];
+                            const float* viewProjPtr[8];
+                            for (int eye = 0; eye < eyeCount; eye++) {
+                                mat4_multiply(viewProj[eye], projMat[eye], viewMat[eye]);
+                                viewProjPtr[eye] = viewProj[eye];
+                            }
+                            dxr::ProjectAabbToCanvasBounds(aabbMin, aabbMax, viewProjPtr,
+                                                            (uint32_t)eyeCount, &contentBoundsUV);
+                            haveContentBounds = true;
+                        }
+
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(*xr, imageIndex)) {
                             VkFormat colorFormat = (VkFormat)xr->swapchain.format;
@@ -3416,10 +3606,23 @@ static void RenderThreadFunc(
                                 // rearBudgetPtr above) — silent (no line) otherwise, same
                                 // as every other extension-gated HUD readout in this file.
                                 if (rearBudgetPtr) {
-                                    wchar_t rearBuf[64];
-                                    swprintf(rearBuf, 64, L"\nrear: %hs %.0f",
-                                        dxr::RearDepthBudgetStateName(rearBudgetPtr->state),
-                                        rearBudgetPtr->farOffsetVH);
+                                    // #116 v2: append the content-bounds ROI (canvas-
+                                    // normalised, 2 decimals) to the SAME line when this
+                                    // frame computed one — cheap (a few floats), and only
+                                    // ever present alongside the budget it fed.
+                                    wchar_t rearBuf[128];
+                                    if (haveContentBounds) {
+                                        swprintf(rearBuf, 128, L"\nrear: %hs %.0f  roi %.2f,%.2f-%.2f,%.2f",
+                                            dxr::RearDepthBudgetStateName(rearBudgetPtr->state),
+                                            rearBudgetPtr->farOffsetVH,
+                                            contentBoundsUV.offset.x, contentBoundsUV.offset.y,
+                                            contentBoundsUV.offset.x + contentBoundsUV.extent.width,
+                                            contentBoundsUV.offset.y + contentBoundsUV.extent.height);
+                                    } else {
+                                        swprintf(rearBuf, 128, L"\nrear: %hs %.0f",
+                                            dxr::RearDepthBudgetStateName(rearBudgetPtr->state),
+                                            rearBudgetPtr->farOffsetVH);
+                                    }
                                     stereoText += rearBuf;
                                 }
                                 std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
@@ -3740,13 +3943,19 @@ static void RenderThreadFunc(
                     uint32_t extraLayerCount = 0;
                     if (toastLayer2DReady)
                         extraLayers[extraLayerCount++] = (const XrCompositionLayerBaseHeader*)&toastLayer2D;
-                    EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
+                    // #116 v2: EndFrameWithContentBoundsChain (local wrapper, see its
+                    // definition above) instead of displayxr-common's
+                    // EndFrameWithWindowSpaceLayers directly, so XrContentBoundsDXR can
+                    // chain onto the real XrFrameEndInfo — byte-identical to the common
+                    // function when haveContentBounds is false.
+                    EndFrameWithContentBoundsChain(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
                         uiLayerCount ? uiLayers : nullptr, uiLayerCount,
                         0, 0, -1, -1, /*submitHud=*/hudSubmitted,
                         XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
                         dxr::FullWindowZoneSubmitChain(g_fwZone),
-                        extraLayerCount ? extraLayers : nullptr, extraLayerCount);
+                        extraLayerCount ? extraLayers : nullptr, extraLayerCount,
+                        haveContentBounds ? &contentBoundsUV : nullptr, 0.0f);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
