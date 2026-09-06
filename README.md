@@ -512,6 +512,8 @@ model_viewer_handle_vk_win.exe [flags] [model-path]
 | `--rect=X,Y,W,H` | Window rect in physical virtual-screen pixels. The exe is PerMonitorV2, so no DPI scaling is applied to what you pass. With `--transparent` the rect is the window rect exactly; framed, it is the client area. |
 | `--src=<url\|path>` | Asset to load instead of the bundled sample. A URL is downloaded to the cache first (progress shows as a toast). A `.gltf` also has its `buffers[]`/`images[]` fetched relative to its URL — see [Multi-file glTF](#multi-file-gltf-gltf--bin--textures). |
 | `--vh=<metres>` | Virtual display height the asset was authored at. Pins the scale: auto-fit will not re-derive it. |
+| `--pose=YAW,PITCH[,ZOOM]` | Orbit the sender was showing the asset at, in the page's degrees (the inline3d SDK's `setPose({yaw, pitch, zoom})`; `zoom` multiplies the fit, default 1). Applied once per load, right after the fit frames the model, so an undocked product opens on the same face its tile was showing instead of snapping face-on. Yaw is normalised to (-180, 180]; pitch is clamped to the orbit's own limit. Auto-orbit is **not** re-armed — see below. |
+| `--margin=<0..1>` | Fraction of the window the framed asset may fill — the sender's own fit margin. Replaces the built-in 80%. `--vh` still outranks it: a margin tunes the guess, a `vh` pin replaces it. |
 | `--title=<suffix>` | **Appended** to the window title, never replaces it. |
 | `--type=model\|splat` | Routing hint. A non-`model` type is forwarded to the sibling viewer. |
 | `--env=room\|studio\|sky\|none` | Lighting the sender rendered with, so the undocked view matches the tile it came out of. **Protocol launches default to `room`** (a protocol launch *is* an undock from a storefront page, and `room` is that page's SDK default — a page that lights with the studio rig says `env=studio` explicitly); a plain command-line launch defaults to `sky`. An unrecognised value warns and is ignored. `L` cycles it live. |
@@ -524,6 +526,16 @@ Flags are `--key=value` (never `--key value`). The first non-flag token is
 still the legacy positional model path, so every existing launcher keeps
 working. Exit codes: **2** = the launch was refused (bad or disallowed
 arguments), **3** = the link belongs to a sibling viewer that is not installed.
+
+**The opening pose is held, not spun — and that is a deliberate difference from
+the page.** The storefront's tile passes a non-zero `idleSpin` to the SDK, so a
+product starts turning a few seconds after it appears. The undocked view does
+not: in transparent mode with a standalone session the idle turntable is
+suppressed outright, so the window holds `--pose` until the user drags it.
+Applying a launch pose does **not** re-arm auto-orbit — the pose is staged as
+the *framed* pose (the same slot the auto-fit yaw has always used), not as a
+user input, so it neither restarts the idle countdown nor flips the `M` state.
+`Space` returns to it, exactly as it returns to the framed yaw.
 
 A refused or forwarded launch also raises a message box, because a protocol
 launch has no console and without one a rejected link is indistinguishable
@@ -546,7 +558,7 @@ the wrong hive; self-registration is also self-healing after a sibling is
 uninstalled). A page opens the viewer with:
 
 ```
-displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&env=room&transparent=1&v=1
+displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&env=room&pose=-40,10&margin=0.8&transparent=1&v=1
 ```
 
 `open` is the verb; `v=1` is the grammar version, so a future grammar is
