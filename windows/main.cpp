@@ -31,6 +31,7 @@
 #include "projection_depth.h"
 #include "clip_policy.h"       // dxr::ResolveClipPlanes / ChainRearDepthBudget (#116, XR_DXR_depth_budget)
 #include "content_bounds.h"    // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (v2 content-bounds ROI, brief §5)
+#include "content_mask.h"      // dxr::ContentMaskFromCoverage / ChainContentMask (v3 silhouette-mask ROI, brief §6)
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
@@ -2779,6 +2780,17 @@ static void RenderThreadFunc(
                 // EndFrameWithWindowSpaceLayers call (frameEndNext).
                 XrRect2Df contentBoundsUV{};
                 bool haveContentBounds = false;
+                // #116 v3 (XR_DXR_depth_budget SPEC_VERSION 3, silhouette content-
+                // mask ROI, brief §6): populated after the click-through region
+                // (dxr::ClickThroughRegion, g_punch) applies its per-frame coverage
+                // further down in the Submit-frame section, then consumed at the
+                // same EndFrameWithWindowSpaceLayers call as contentBoundsUV above.
+                // maskCells must outlive the xrEndFrame call (XrContentMaskDXR::cells
+                // is a pointer, not a copy), so it lives at this frame-outer scope,
+                // not inside the block that fills it.
+                std::vector<uint8_t> maskCells;
+                uint32_t maskW = 0, maskH = 0;
+                bool haveContentMask = false;
 
                 // Aspect-preserving HUD layer footprint (fixes demo-gs#8).
                 // The HUD swapchain has a fixed pixel aspect (hudWidth × hudHeight,
@@ -3357,6 +3369,48 @@ static void RenderThreadFunc(
                                                    renderW, renderH, hwnd, windowW, windowH, chrome, nChrome,
                                                    (lastV % cols) * renderW, (lastV / cols) * renderH,
                                                    eyeCount > 1);
+
+                                    // #116 v3 (XR_DXR_depth_budget SPEC_VERSION 3,
+                                    // silhouette content-mask ROI, brief §6): the
+                                    // region above just derived the union-over-eyes
+                                    // rendered-alpha silhouette as its coverage
+                                    // buffer — window-client-normalised, un-dilated —
+                                    // exactly the artefact the runtime wants as its
+                                    // analysis ROI. Reduce it to a small occupancy
+                                    // grid here; chained at xrEndFrame below (the
+                                    // contentBounds/contentMask block) alongside the
+                                    // v2 bounds rect, which stays chained regardless
+                                    // as the runtime's own fallback. Gated on
+                                    // extensionVersion >= 3: a v2 runtime still
+                                    // advertises XR_DXR_depth_budget (rearBudgetPtr
+                                    // above stays live) but has neither
+                                    // XR_TYPE_CONTENT_MASK_DXR nor the mask precedence
+                                    // logic, so chaining one there would just be
+                                    // ignored bytes copied for nothing — never chain
+                                    // the mask on a v2 runtime.
+                                    if (g_hasDepthBudgetExt && g_depthBudgetExtVersion >= 3) {
+                                        const uint8_t* cov = g_punch.coverage();
+                                        // Null until the first region has been applied
+                                        // (the readback lags one update() call) —
+                                        // skip the frame rather than chain garbage.
+                                        if (cov != nullptr) {
+                                            const uint32_t covW = g_punch.coverageWidth();
+                                            const uint32_t covH = g_punch.coverageHeight();
+                                            // ~1/4 of the coverage dims, capped to the
+                                            // extension's recommended ceiling (finer
+                                            // buys nothing — the runtime dilates by its
+                                            // own disparity band before measuring).
+                                            maskW = (std::max)(1u, (std::min)(covW / 4u,
+                                                dxr::kContentMaskRecommendedCells));
+                                            maskH = (std::max)(1u, (std::min)(covH / 4u,
+                                                dxr::kContentMaskRecommendedCells));
+                                            if (dxr::ContentMaskFromCoverage(cov, covW, covH, covW,
+                                                    windowW, windowH, nullptr, maskW, maskH, maskCells) &&
+                                                dxr::ContentMaskCoverageCells(maskCells) > 0) {
+                                                haveContentMask = true;
+                                            }
+                                        }
+                                    }
                                 }
                             } else if (g_punch.shaped()) {
                                 g_punch.disable(hwnd);
@@ -3486,6 +3540,10 @@ static void RenderThreadFunc(
                                             rearBudgetPtr->farOffsetVH);
                                     }
                                     stereoText += rearBuf;
+                                    // #116 v3: mark whether a silhouette mask actually
+                                    // chained this frame (vs. just the v2 bounds rect
+                                    // above) — the same silent-unless-computed rule.
+                                    if (haveContentMask) stereoText += L" mask";
                                 }
                                 std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset | [N] Clip | [K] Play/Pause\n"
@@ -3812,6 +3870,15 @@ static void RenderThreadFunc(
                     // written directly (not chained through an existing fei.next), so
                     // this is built by hand rather than via dxr::ChainContentBounds
                     // (which expects an XrFrameEndInfo& to link onto).
+                    // #116 v3: XrContentMaskDXR (haveContentMask, built above from the
+                    // click-through region's coverage) chains AHEAD of the bounds rect
+                    // — mask.next stays null (nothing else on this sub-chain), bounds
+                    // .next points at the mask, and the head handed to frameEndNext is
+                    // whichever of the two is actually populated this frame. Bounds
+                    // keeps chaining unconditionally whenever haveContentBounds (the
+                    // runtime's own fallback: mask -> bounds -> 3D zones -> whole
+                    // canvas), so a v2 runtime — or a v3 runtime on a frame with no
+                    // mask yet — degrades to exactly today's v2 behaviour.
                     XrContentBoundsDXR contentBounds = {};
                     if (haveContentBounds) {
                         contentBounds.type = (XrStructureType)XR_TYPE_CONTENT_BOUNDS_DXR;
@@ -3819,6 +3886,20 @@ static void RenderThreadFunc(
                         contentBounds.bounds = contentBoundsUV;
                         contentBounds.marginNormalized = 0.0f;
                     }
+                    XrContentMaskDXR contentMask = {};
+                    if (haveContentMask) {
+                        contentMask.type = (XrStructureType)XR_TYPE_CONTENT_MASK_DXR;
+                        contentMask.next = nullptr;
+                        contentMask.width = maskW;
+                        contentMask.height = maskH;
+                        contentMask.strideBytes = maskW;
+                        contentMask.cells = maskCells.data();
+                        contentMask.marginNormalized = 0.0f;
+                        if (haveContentBounds) contentBounds.next = &contentMask;
+                    }
+                    const void* frameEndNext = haveContentBounds
+                        ? (const void*)&contentBounds
+                        : (haveContentMask ? (const void*)&contentMask : nullptr);
                     EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
                         uiLayerCount ? uiLayers : nullptr, uiLayerCount,
@@ -3826,7 +3907,7 @@ static void RenderThreadFunc(
                         XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
                         dxr::FullWindowZoneSubmitChain(g_fwZone),
                         extraLayerCount ? extraLayers : nullptr, extraLayerCount,
-                        haveContentBounds ? &contentBounds : nullptr);
+                        frameEndNext);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
