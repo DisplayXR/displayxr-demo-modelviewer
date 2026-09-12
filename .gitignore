@@ -23,3 +23,8 @@ __pycache__/
 # Khronos sample-asset submission staging (generated; regenerate with
 # scripts/make_khronos_conformance_assets.py)
 khronos_submission/
+
+# Fetched by android/fetch-client-aar.sh from the pinned runtime release.
+# A binary that is already published elsewhere must not be vendored here: it would
+# drift from dxrClientRuntimeTag silently, which is the whole failure this replaces.
+android/libs/
