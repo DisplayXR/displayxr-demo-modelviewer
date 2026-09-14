@@ -187,6 +187,51 @@ struct ModelRenderer {
                    bool transparentBg = false,
                    float clipFarViewSpace = 0.0f);
 
+    // ── Unclipped-silhouette coverage (#127 / displayxr-runtime#1470) ────────
+    //
+    // The `XR_DXR_depth_budget` content mask must describe the silhouette the
+    // content WOULD have at an unrestricted rear budget. The rendered alpha
+    // cannot: pbr.frag discards everything past `clipFarViewSpace`, so a mask
+    // derived from it is a function of the budget the runtime published, and
+    // the two feed each other into a ~0.6-1.1 s open/close oscillation
+    // whenever the model straddles a text/blank border (runtime#1470).
+    //
+    // So the mask gets its own source. `beginContentMaskFrame(true)` arms a
+    // coverage-only pass — same vertex shader, same skinning, same push
+    // constants, same view/projection, into a small R8 target with
+    // shaders/coverage.frag, which has no far-clip discard because it has no
+    // code at all. Each following renderEye() unions its view's silhouette
+    // into the accumulator, so after the frame's views are rendered
+    // contentMaskCoverage() is the union-over-views UNCLIPPED silhouette,
+    // ready for dxr::ContentMaskFromCoverage(). The click-through window
+    // region keeps using the rendered (clipped) alpha — that one IS a visual
+    // clip and must stay one.
+    //
+    // Costs one extra draw of the model's index buffer per view at
+    // kContentMaskCovW x kContentMaskCovH with an empty fragment shader, and
+    // one ~36 KB readback per view on the submit renderEye already waits on.
+    // Disabled by default; only the transparent/borderless leg arms it.
+
+    //! Coverage raster dimensions. Fixed, not aspect-matched to the viewport:
+    //! the grid is mapped onto the window's client rect by normalised position
+    //! (dxr::ContentMaskFromCoverage), so a different aspect is a pure linear
+    //! stretch of the sampling lattice, not a displacement of the silhouette —
+    //! and the runtime dilates the mask by its own disparity band before it
+    //! measures anything, which is far coarser than the difference.
+    static constexpr uint32_t kContentMaskCovW = 256;
+    static constexpr uint32_t kContentMaskCovH = 144;
+
+    //! Arm (or disarm) the coverage pass and clear the accumulator. Call once
+    //! per frame BEFORE the frame's renderEye() calls.
+    void beginContentMaskFrame(bool enable);
+
+    //! The union-over-views unclipped coverage for the last armed frame: one
+    //! byte per texel, nonzero = covered, row-major, top-left origin, tightly
+    //! packed at kContentMaskCovW x kContentMaskCovH. nullptr when the pass is
+    //! disarmed, unavailable (creation failed), or no view has been rendered
+    //! into it yet. Valid until the next beginContentMaskFrame().
+    const uint8_t* contentMaskCoverage() const;
+
     void cleanup();
     ~ModelRenderer();
 
@@ -396,6 +441,34 @@ private:
     // transmissive draws that have to come after the scene-colour capture.
     VkRenderPass renderPassLoad_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+
+    // ── Unclipped-silhouette coverage pass (#127) ───────────────────────────
+    // Created lazily on the first armed frame — an opaque-mode session never
+    // pays for it. No depth attachment and no depth test: the artefact wanted
+    // is the UNION of where geometry lands, for which occlusion is irrelevant,
+    // and leaving depth out removes the only reason this pass would have to
+    // track the main pass's sample count or target size.
+    VkRenderPass  maskRenderPass_ = VK_NULL_HANDLE;
+    VkPipeline    maskPipeline_ = VK_NULL_HANDLE;
+    ModelImage    maskImage_;
+    VkFramebuffer maskFramebuffer_ = VK_NULL_HANDLE;
+    ModelBuffer   maskReadback_;          // host-visible, kCovW*kCovH bytes
+    std::vector<uint8_t> maskCoverage_;   // CPU accumulator, OR-ed per view
+    bool maskArmed_ = false;              // this frame wants the pass
+    bool maskFailed_ = false;             // creation failed once; never retry
+    bool maskHasView_ = false;            // at least one view accumulated
+    // DXR_MODELVIEWER_MASKPASS_TEST=1 — arm the coverage pass unconditionally
+    // and log the covered-texel count every ~60 frames. The pass is otherwise
+    // reachable only from the Windows transparent/borderless leg, which is the
+    // one leg that cannot be exercised on a macOS or Linux box; this makes the
+    // Vulkan objects, the draw and the readback testable everywhere the
+    // renderer runs at all. Diagnostics only — it changes no output.
+    bool maskTestForce_ = false;
+    uint32_t maskTestFrames_ = 0;
+    bool ensureMaskPass();
+    void recordMaskPass(VkCommandBuffer cmd);
+    void consumeMaskReadback();
+    void destroyMaskPass();
 
     // ── KHR_materials_transmission / _volume (issue #70 phase 2 tier 2) ──────
     // A mipped copy of the opaque pass's colour, which transmissive surfaces

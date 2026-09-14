@@ -16,6 +16,7 @@
 set(MV_SHADER_NAMES
     pbr.vert
     pbr.frag
+    coverage.frag
     skybox.frag
     fullscreen.vert
     brdf_lut.frag

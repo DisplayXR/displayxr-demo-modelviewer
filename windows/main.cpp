@@ -3233,6 +3233,24 @@ static void RenderThreadFunc(
                                 hasGsScene = g_modelRenderer.hasModel();
                             }
 
+                            // #127 / runtime#1470: arm the renderer's
+                            // coverage-only pass for this frame's views when a
+                            // v3 content mask is going to be chained below. It
+                            // redraws the model with the far clip absent, so
+                            // the mask describes the silhouette AS IT WOULD
+                            // RENDER AT UNRESTRICTED BUDGET (spec v4) instead
+                            // of the post-clip alpha — which is a function of
+                            // the budget the runtime published, and therefore
+                            // oscillates against it. Armed on exactly the
+                            // condition the mask block below chains on, and
+                            // armed regardless of whether clipFar is currently
+                            // nonzero: a source that switched rasterisation
+                            // when the clip engaged would jitter on its own.
+                            const bool wantContentMask =
+                                g_hasDepthBudgetExt && g_depthBudgetExtVersion >= 3 &&
+                                g_transparentBg.load() && g_borderless.load();
+                            g_modelRenderer.beginContentMaskFrame(wantContentMask);
+
                             if (hasGsScene) {
                                 const auto sceneT0 = std::chrono::high_resolution_clock::now();
                                 for (int eye = 0; eye < eyeCount; eye++) {
@@ -3371,13 +3389,10 @@ static void RenderThreadFunc(
                                                    eyeCount > 1);
 
                                     // #116 v3 (XR_DXR_depth_budget SPEC_VERSION 3,
-                                    // silhouette content-mask ROI, brief §6): the
-                                    // region above just derived the union-over-eyes
-                                    // rendered-alpha silhouette as its coverage
-                                    // buffer — window-client-normalised, un-dilated —
-                                    // exactly the artefact the runtime wants as its
-                                    // analysis ROI. Reduce it to a small occupancy
-                                    // grid here; chained at xrEndFrame below (the
+                                    // silhouette content-mask ROI, brief §6), as
+                                    // amended by #127 / runtime#1470: reduce the
+                                    // frame's silhouette to a small occupancy grid
+                                    // here; chained at xrEndFrame below (the
                                     // contentBounds/contentMask block) alongside the
                                     // v2 bounds rect, which stays chained regardless
                                     // as the runtime's own fallback. Gated on
@@ -3388,14 +3403,32 @@ static void RenderThreadFunc(
                                     // logic, so chaining one there would just be
                                     // ignored bytes copied for nothing — never chain
                                     // the mask on a v2 runtime.
-                                    if (g_hasDepthBudgetExt && g_depthBudgetExtVersion >= 3) {
-                                        const uint8_t* cov = g_punch.coverage();
-                                        // Null until the first region has been applied
-                                        // (the readback lags one update() call) —
-                                        // skip the frame rather than chain garbage.
+                                    //
+                                    // The source is the RENDERER's unclipped coverage
+                                    // pass, NOT g_punch.coverage(). The click-through
+                                    // region legitimately wants the post-clip alpha
+                                    // (it is a visual clip, and the window must not be
+                                    // clickable where nothing is drawn); the budget
+                                    // mask must not, because pbr.frag's far discard
+                                    // makes that alpha a function of the budget the
+                                    // runtime published — mask shrinks when clipped,
+                                    // grows when open, and the two drive a ~0.6-1.1 s
+                                    // open/close cycle the runtime's dwell/grace
+                                    // hysteresis cannot damp (runtime#1470). The two
+                                    // artefacts diverge here, deliberately.
+                                    if (wantContentMask) {
+                                        const uint8_t* cov = g_modelRenderer.contentMaskCoverage();
+                                        // Null when no model is loaded, when no view
+                                        // has been rendered into the accumulator this
+                                        // frame, or when the pass could not be
+                                        // created. Chain nothing rather than fall back
+                                        // to the clipped alpha: with no mask the
+                                        // runtime uses the v2 bounds, which are
+                                        // clip-independent by construction — a coarser
+                                        // ROI, never an oscillating one.
                                         if (cov != nullptr) {
-                                            const uint32_t covW = g_punch.coverageWidth();
-                                            const uint32_t covH = g_punch.coverageHeight();
+                                            const uint32_t covW = ModelRenderer::kContentMaskCovW;
+                                            const uint32_t covH = ModelRenderer::kContentMaskCovH;
                                             // ~1/4 of the coverage dims, capped to the
                                             // extension's recommended ceiling (finer
                                             // buys nothing — the runtime dilates by its
