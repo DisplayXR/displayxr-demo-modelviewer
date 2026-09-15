@@ -185,7 +185,17 @@ struct ModelRenderer {
                    const float viewMatrix[16],
                    const float projMatrix[16],
                    bool transparentBg = false,
-                   float clipFarViewSpace = 0.0f);
+                   float clipFarViewSpace = 0.0f,
+                   //! This eye's projection built with an UNRESTRICTED far plane
+                   //! (same fov, same near, far = ez + 1000·vH — what
+                   //! dxr::ResolveClipPlanes returns for farOffsetVH = 1000).
+                   //! The coverage pass projects with THIS, never with
+                   //! projMatrix — see the coverage block below for why the
+                   //! rasterizer's own far clip is the second clip #128 missed.
+                   //! nullptr = "same as projMatrix", for the legs whose real
+                   //! far plane is already unrestricted (macOS/Linux have no
+                   //! transparent mode) and which never arm the mask.
+                   const float projUnclipped[16] = nullptr);
 
     // ── Unclipped-silhouette coverage (#127 / displayxr-runtime#1470) ────────
     //
@@ -198,7 +208,7 @@ struct ModelRenderer {
     //
     // So the mask gets its own source. `beginContentMaskFrame(true)` arms a
     // coverage-only pass — same vertex shader, same skinning, same push
-    // constants, same view/projection, into a small R8 target with
+    // constants, same VIEW, into a small R8 target with
     // shaders/coverage.frag, which has no far-clip discard because it has no
     // code at all. Each following renderEye() unions its view's silhouette
     // into the accumulator, so after the frame's views are rendered
@@ -211,6 +221,20 @@ struct ModelRenderer {
     // kContentMaskCovW x kContentMaskCovH with an empty fragment shader, and
     // one ~36 KB readback per view on the submit renderEye already waits on.
     // Disabled by default; only the transparent/borderless leg arms it.
+    //
+    // THERE WERE TWO CLIPS (#127 follow-up). Removing pbr.frag's discard fixed
+    // only the fragment one. The GPU's fixed-function clip (NDC z > 1) removes
+    // the rear half of the model before a fragment shader runs at all, and the
+    // coverage pass inherited it by reusing the eye's REAL projection — whose
+    // far plane IS the published rear budget (ez + farOffsetVH·vH, straight out
+    // of dxr::ResolveClipPlanes). So the mask stayed a function of the budget
+    // and kept oscillating against it. The pass therefore gets its OWN set-0
+    // uniform buffer holding `projUnclipped * view`, written per view beside
+    // the real one; nothing else about it differs (same view matrix, same
+    // near plane, same viewport/scissor, no CPU-side frustum cull anywhere in
+    // this renderer). depthClampEnable was rejected as the fix: it is an
+    // optional device feature, and clamping to the far plane is not the same
+    // artefact as "the silhouette it would have at an unrestricted budget".
 
     //! Coverage raster dimensions. Fixed, not aspect-matched to the viewport:
     //! the grid is mapped onto the window's client rect by normalised position
@@ -371,7 +395,14 @@ private:
     // vertex buffer using each owning node's current weights. No-op without morph.
     // trackAnchor → also accumulate the morphed verts' world centroid (rig bind).
     void blendMorphs(bool trackAnchor = false);
-    void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar);
+    //! Build the set-0 UniformBlock for this view/projection and upload it.
+    //! `dst` = nullptr writes the main camera UBO (uniformBuffer_); pass a
+    //! different host-visible buffer to write a second, independently-projected
+    //! copy — that is how the coverage pass gets its unrestricted far plane
+    //! without disturbing the real pass (both are read by the SAME command
+    //! buffer, so they cannot share one buffer).
+    void updateUniforms(const float viewMatrix[16], const float projMatrix[16], float clipFar,
+                        ModelBuffer *dst = nullptr);
     void cleanupModel();
 
     // ── Core Vulkan handles (not owned, from OpenXR runtime) ─────────────
@@ -454,6 +485,14 @@ private:
     VkFramebuffer maskFramebuffer_ = VK_NULL_HANDLE;
     ModelBuffer   maskReadback_;          // host-visible, kCovW*kCovH bytes
     std::vector<uint8_t> maskCoverage_;   // CPU accumulator, OR-ed per view
+    // The pass's OWN set-0: same layout as descriptorSet_, but binding 0 points
+    // at maskUniform_ instead of uniformBuffer_ — the copy carrying
+    // `projUnclipped * view`. Binding 1 (the material-extension SSBO) is
+    // mirrored from the main set so the bound set is complete even though
+    // coverage.frag never reads it.
+    VkDescriptorPool maskDescPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet  maskSet_ = VK_NULL_HANDLE;
+    ModelBuffer      maskUniform_;
     bool maskArmed_ = false;              // this frame wants the pass
     bool maskFailed_ = false;             // creation failed once; never retry
     bool maskHasView_ = false;            // at least one view accumulated
@@ -462,12 +501,41 @@ private:
     // reachable only from the Windows transparent/borderless leg, which is the
     // one leg that cannot be exercised on a macOS or Linux box; this makes the
     // Vulkan objects, the draw and the readback testable everywhere the
-    // renderer runs at all. Diagnostics only — it changes no output.
+    // renderer runs at all.
+    //
+    // It is also a MUTATION test, not just a smoke test. Every armed view is
+    // rasterised TWICE: once through the unrestricted projection the pass is
+    // supposed to use (count U), and once through an artificially restricted
+    // one whose far plane bisects the model's view-space depth range (count R).
+    // U must be identical across frames and R must be strictly smaller — if R
+    // ever equals U the far plane is not reaching the rasterizer and the test
+    // is proving nothing, which is exactly the hole v0.28.5's self-test fell
+    // into (clipFar was 0 in every frame it exercised, so both clips were off).
+    // Diagnostics only — it changes no output.
     bool maskTestForce_ = false;
     uint32_t maskTestFrames_ = 0;
+    VkDescriptorSet maskTestSet_ = VK_NULL_HANDLE;   // set 0 -> maskTestUniform_
+    ModelBuffer     maskTestUniform_;
+    // U is tracked PER TILE (the eyes see different silhouettes, so a single
+    // min/max over all views would read as "varies" for a perfectly invariant
+    // pass). maskTestTile_ counts views within the frame; beginContentMaskFrame
+    // resets it.
+    static constexpr uint32_t kMaskTestTiles = 8;
+    uint32_t maskTestTile_ = 0;
+    size_t maskTestUMin_[kMaskTestTiles];
+    size_t maskTestUMax_[kMaskTestTiles];
+    size_t maskTestRMin_ = (size_t)-1, maskTestRMax_ = 0;
+    uint32_t maskTestViews_ = 0, maskTestRLtU_ = 0;
     bool ensureMaskPass();
-    void recordMaskPass(VkCommandBuffer cmd);
+    //! Point the coverage set(s)' binding 1 at the current material-extension
+    //! SSBO. Called at creation and again from uploadMaterialExtensions, which
+    //! reallocates that buffer on every model load.
+    void refreshMaskMaterialBinding();
+    void recordMaskPass(VkCommandBuffer cmd, VkDescriptorSet set0);
     void consumeMaskReadback();
+    //! Nonzero texels currently in maskReadback_ (the LAST recorded coverage
+    //! render), without touching the union accumulator. Test-side only.
+    size_t countMaskReadback() const;
     void destroyMaskPass();
 
     // ── KHR_materials_transmission / _volume (issue #70 phase 2 tier 2) ──────

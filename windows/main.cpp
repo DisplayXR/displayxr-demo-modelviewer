@@ -2987,6 +2987,15 @@ static void RenderThreadFunc(
                         // depth remap kept (mesh uses the depth buffer).
                         Display3DView stereoViews[8];
                         float rigClipFar[8] = {0};  // per-eye shader/rasterizer far cull (0 = off)
+                        // #127 follow-up: the SAME per-eye frustum with the rear
+                        // budget removed (far = ez + 1000·vH). The depth-budget
+                        // content mask must describe the silhouette at an
+                        // unrestricted budget, and the rasterizer's own NDC z > 1
+                        // clip is part of what has to be removed to get it — so
+                        // the coverage pass needs its own projection, not just a
+                        // fragment shader without a discard. See the comment in
+                        // model_renderer.h's coverage block.
+                        float rigProjUnclipped[8][16] = {};
                         bool useAppProjection = useRig;
                         if (useRig) {
                             // Mono: collapse the active views to their centroid (pose + fov).
@@ -3033,6 +3042,21 @@ static void RenderThreadFunc(
                                 mat4_from_xr_fov(stereoViews[eye].projection_matrix, sv.fov, near_z, far_z);
                                 // GL ([-1,1] clip-z) → Vulkan [0,1] depth for the mesh's depth buffer.
                                 convert_projection_gl_to_zero_to_one(stereoViews[eye].projection_matrix);
+
+                                // The unrestricted twin. Derived from the SAME
+                                // policy helper rather than hand-writing
+                                // "ez + 1000·vH": ResolveClipPlanes with
+                                // transparent=false is by definition the
+                                // farOffsetVH = 1000 (unrestricted) branch, and
+                                // near is budget-independent, so this differs
+                                // from the real frustum in the far plane ONLY.
+                                dxr::ClipPlanes clipU =
+                                    dxr::ResolveClipPlanes(ez, rigVH, nullptr,
+                                                           /*transparent=*/false,
+                                                           IsStandaloneSession(xr));
+                                mat4_from_xr_fov(rigProjUnclipped[eye], sv.fov,
+                                                 clipU.near_z, clipU.far_z);
+                                convert_projection_gl_to_zero_to_one(rigProjUnclipped[eye]);
                                 stereoViews[eye].fov = sv.fov;
                                 stereoViews[eye].eye_world = sv.pose.position;
                                 stereoViews[eye].orientation = sv.pose.orientation;
@@ -3159,12 +3183,16 @@ static void RenderThreadFunc(
                         // Build per-eye view/projection matrices (column-major float[16]).
                         // Sized to the runtime's max view count so Quad mode (4 views) fits.
                         float viewMat[8][16], projMat[8][16];
+                        // Same frustum, unrestricted far plane — the coverage
+                        // pass's projection (#127 follow-up).
+                        float projMatUnclipped[8][16];
                         float clipFar[8] = {0};  // per-eye view-space far cull (0 = off)
                         for (int eye = 0; eye < eyeCount; eye++) {
                             if (useAppProjection) {
                                 int srcEye = monoMode ? 0 : eye;
                                 memcpy(viewMat[eye], stereoViews[srcEye].view_matrix, sizeof(float) * 16);
                                 memcpy(projMat[eye], stereoViews[srcEye].projection_matrix, sizeof(float) * 16);
+                                memcpy(projMatUnclipped[eye], rigProjUnclipped[srcEye], sizeof(float) * 16);
                                 clipFar[eye] = rigClipFar[srcEye];
                             } else {
                                 // Fallback: use DirectXMath mono matrices, store as column-major
@@ -3178,6 +3206,9 @@ static void RenderThreadFunc(
                                 XMMATRIX pT = XMMatrixTranspose(p);
                                 XMStoreFloat4x4((XMFLOAT4X4*)viewMat[eye], vT);
                                 XMStoreFloat4x4((XMFLOAT4X4*)projMat[eye], pT);
+                                // No rig, no depth budget, no mask: this leg
+                                // never clips, so its unclipped twin is itself.
+                                memcpy(projMatUnclipped[eye], projMat[eye], sizeof(float) * 16);
                             }
                         }
 
@@ -3241,8 +3272,12 @@ static void RenderThreadFunc(
                             // RENDER AT UNRESTRICTED BUDGET (spec v4) instead
                             // of the post-clip alpha — which is a function of
                             // the budget the runtime published, and therefore
-                            // oscillates against it. Armed on exactly the
-                            // condition the mask block below chains on, and
+                            // oscillates against it. There are TWO clips and
+                            // both have to go: pbr.frag's discard (removed in
+                            // #128) and the rasterizer's own NDC z > 1 cull,
+                            // which is why projMatUnclipped is handed to
+                            // renderEye alongside the real projection. Armed on
+                            // exactly the condition the mask block below chains on, and
                             // armed regardless of whether clipFar is currently
                             // nonzero: a source that switched rasterisation
                             // when the clip engaged would jitter on its own.
@@ -3266,7 +3301,8 @@ static void RenderThreadFunc(
                                         xr->swapchain.width, xr->swapchain.height,
                                         vpX, vpY, renderW, renderH,
                                         viewMat[eye], projMat[eye],
-                                        g_transparentBg.load(), clipFar[eye]);
+                                        g_transparentBg.load(), clipFar[eye],
+                                        projMatUnclipped[eye]);
                                 }
                                 g_sceneMsAccum.store(
                                     g_sceneMsAccum.load(std::memory_order_relaxed) +

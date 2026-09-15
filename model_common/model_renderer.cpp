@@ -205,6 +205,10 @@ bool ModelRenderer::init(VkInstance instance,
         // maskTestForce_ in the header.
         const char* mp = std::getenv("DXR_MODELVIEWER_MASKPASS_TEST");
         maskTestForce_ = (mp && mp[0] == '1' && mp[1] == '\0');
+        for (uint32_t t = 0; t < kMaskTestTiles; ++t) {
+            maskTestUMin_[t] = (size_t)-1;
+            maskTestUMax_[t] = 0;
+        }
         if (maskTestForce_)
             std::printf("ModelRenderer: MASKPASS TEST on — the unclipped content-mask "
                         "coverage pass runs every frame and reports (#127)\n");
@@ -997,6 +1001,10 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
     w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     w.pBufferInfo = &bi;
     vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+    // The coverage pass's own set 0 carries the same binding 1; the buffer it
+    // pointed at was just destroyed, so re-point it or the next armed frame
+    // binds a dangling descriptor.
+    refreshMaskMaterialBinding();
     return true;
 }
 
@@ -1923,7 +1931,7 @@ float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const
 }
 
 void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
-                                   float clipFar) {
+                                   float clipFar, ModelBuffer *dst) {
     // W7 (#396): consume a plain clean +Y-up-world view matrix (the render-ready
     // XR_DXR_view_rig XrView pose). Vulkan Y-down is handled at the RASTER stage
     // via a negative-height viewport in renderEye — NOT by reflecting the view
@@ -2024,10 +2032,17 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     }();
     ub.viewport[3] = coatSpecHemi ? 1.0f : 0.0f;
 
+    // `dst` lets the coverage pass get the same block through a DIFFERENT
+    // projection into a DIFFERENT buffer. It has to be a different buffer, not
+    // a rewrite between draws: both passes are recorded into one command
+    // buffer and only read their descriptors at submit time, so a second write
+    // to uniformBuffer_ would retroactively change the real pass too.
+    ModelBuffer &target = dst ? *dst : uniformBuffer_;
+    if (target.memory == VK_NULL_HANDLE) return;
     void* mapped = nullptr;
-    vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(UniformBlock), 0, &mapped);
+    vkMapMemory(device_, target.memory, 0, sizeof(UniformBlock), 0, &mapped);
     std::memcpy(mapped, &ub, sizeof(UniformBlock));
-    vkUnmapMemory(device_, uniformBuffer_.memory);
+    vkUnmapMemory(device_, target.memory);
 }
 
 namespace {
@@ -2632,11 +2647,103 @@ bool ModelRenderer::ensureMaskPass() {
         maskFailed_ = true;
         return false;
     }
+    // ── The pass's own set 0 ────────────────────────────────────────────────
+    // This is the actual fix for #127's second clip. pbr.vert takes its
+    // gl_Position from ubo.viewProj, so the ONLY way to hand the coverage draw
+    // an unrestricted far plane is to hand it a different set-0 buffer: the
+    // rasterizer's NDC z > 1 clip is fixed-function and fires before any
+    // fragment shader, so no amount of editing coverage.frag can reach it.
+    // maskTestSet_ exists only for the mutation self-test below.
+    const uint32_t nSets = maskTestForce_ ? 2u : 1u;
+    VkDescriptorPoolSize mps[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nSets},
+                                   {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nSets}};
+    VkDescriptorPoolCreateInfo mdpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    mdpci.maxSets = nSets;
+    mdpci.poolSizeCount = 2;
+    mdpci.pPoolSizes = mps;
+    if (vkCreateDescriptorPool(device_, &mdpci, nullptr, &maskDescPool_) != VK_SUCCESS) {
+        std::fprintf(stderr, "ModelRenderer: content-mask descriptor pool failed\n");
+        maskFailed_ = true;
+        return false;
+    }
+    auto makeSet = [&](VkDescriptorSet &set, ModelBuffer &buf) -> bool {
+        VkDescriptorSetAllocateInfo mdsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        mdsai.descriptorPool = maskDescPool_;
+        mdsai.descriptorSetCount = 1;
+        mdsai.pSetLayouts = &dsLayout_;   // same layout -> pipelineLayout_ stays shared
+        if (vkAllocateDescriptorSets(device_, &mdsai, &set) != VK_SUCCESS) return false;
+        buf = modelCreateBuffer(device_, physDevice_, sizeof(UniformBlock),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (buf.buffer == VK_NULL_HANDLE) return false;
+        VkDescriptorBufferInfo ubi = {buf.buffer, 0, sizeof(UniformBlock)};
+        VkWriteDescriptorSet mw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        mw.dstSet = set;
+        mw.dstBinding = 0;
+        mw.descriptorCount = 1;
+        mw.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        mw.pBufferInfo = &ubi;
+        vkUpdateDescriptorSets(device_, 1, &mw, 0, nullptr);
+        return true;
+    };
+    if (!makeSet(maskSet_, maskUniform_)) {
+        std::fprintf(stderr, "ModelRenderer: content-mask set 0 failed\n");
+        maskFailed_ = true;
+        return false;
+    }
+    if (maskTestForce_ && !makeSet(maskTestSet_, maskTestUniform_)) {
+        maskTestSet_ = VK_NULL_HANDLE;   // test extras are best-effort
+    }
+    // Binding 1 (material-extension SSBO): unused by coverage.frag, but bound
+    // sets are cheaper to keep complete than to reason about. Mirrored from the
+    // main set here and re-mirrored by uploadMaterialExtensions on every load,
+    // which reallocates that buffer.
+    refreshMaskMaterialBinding();
+
     maskCoverage_.assign(size_t(kContentMaskCovW) * kContentMaskCovH, 0);
     return true;
 }
 
-void ModelRenderer::recordMaskPass(VkCommandBuffer cmd) {
+void ModelRenderer::refreshMaskMaterialBinding() {
+    if (materialExtBuffer_.buffer == VK_NULL_HANDLE) return;
+    VkDescriptorSet sets[2] = {maskSet_, maskTestSet_};
+    for (VkDescriptorSet set : sets) {
+        if (set == VK_NULL_HANDLE) continue;
+        VkDescriptorBufferInfo bi = {materialExtBuffer_.buffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = set;
+        w.dstBinding = 1;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bi;
+        vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+    }
+}
+
+namespace {
+
+// Recover (near, far) from a Vulkan-convention ([0,1] clip z) perspective
+// matrix and rebuild it with a different far plane. Column-major:
+//     m[10] = -f / (f - n)      m[14] = -f * n / (f - n)
+// so  n = m[14] / m[10]  and  f = m[10] * n / (m[10] + 1).
+// Only those two lanes depend on the depth range — the off-axis (Kooima)
+// asymmetry lives in m[8]/m[9] and is left exactly as it was. Used ONLY by the
+// mutation self-test, to manufacture the restricted projection that v0.28.5's
+// coverage pass was unknowingly rendering through.
+bool ProjRefarZeroToOne(const float src[16], float newFar, float out[16]) {
+    std::memcpy(out, src, 16 * sizeof(float));
+    const float m10 = src[10], m14 = src[14];
+    if (m10 >= -1.0e-6f || std::fabs(m10 + 1.0f) < 1.0e-6f) return false;
+    const float n = m14 / m10;
+    if (!(n > 0.0f) || !(newFar > n + 1.0e-6f)) return false;
+    out[10] = -newFar / (newFar - n);
+    out[14] = -newFar * n / (newFar - n);
+    return true;
+}
+
+} // namespace
+
+void ModelRenderer::recordMaskPass(VkCommandBuffer cmd, VkDescriptorSet set0) {
     VkClearValue clear;
     clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
     VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -2657,12 +2764,18 @@ void ModelRenderer::recordMaskPass(VkCommandBuffer cmd) {
     vkCmdSetViewport(cmd, 0, 1, &vpRect);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // pbr.vert reads set 0 (the camera UBO — already holding THIS view's
-    // matrices, written by updateUniforms) and set 3 (joint matrices).
+    // pbr.vert reads set 0 (the camera UBO) and set 3 (joint matrices).
     // coverage.frag reads nothing, so sets 1 and 2 are never accessed; they are
     // bound anyway so the bound-set state is complete for any layer that
     // checks the whole layout.
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
+    //
+    // set 0 is `set0`, NOT descriptorSet_ — that is the whole #127 follow-up
+    // fix. descriptorSet_'s viewProj carries the eye's REAL far plane (ez +
+    // farOffsetVH·vH), and the rasterizer's fixed-function NDC z > 1 clip then
+    // deletes the rear half of the model before coverage.frag is ever invoked.
+    // set0's viewProj is built from projUnclipped instead, so this pass sees
+    // the silhouette the content would have at an unrestricted budget.
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &set0, 0, nullptr);
     if (defaultMatSet_ != VK_NULL_HANDLE) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1, &defaultMatSet_, 0, nullptr);
     }
@@ -2739,12 +2852,32 @@ void ModelRenderer::consumeMaskReadback() {
     maskHasView_ = true;
 }
 
+size_t ModelRenderer::countMaskReadback() const {
+    void* mapped = nullptr;
+    if (vkMapMemory(device_, maskReadback_.memory, 0, maskReadback_.size, 0, &mapped) != VK_SUCCESS ||
+        mapped == nullptr) {
+        return 0;
+    }
+    const uint8_t* px = static_cast<const uint8_t*>(mapped);
+    const size_t n = size_t(kContentMaskCovW) * kContentMaskCovH;
+    size_t covered = 0;
+    for (size_t i = 0; i < n; ++i) covered += (px[i] != 0) ? 1u : 0u;
+    vkUnmapMemory(device_, maskReadback_.memory);
+    return covered;
+}
+
 void ModelRenderer::destroyMaskPass() {
     if (maskPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, maskPipeline_, nullptr); maskPipeline_ = VK_NULL_HANDLE; }
     if (maskFramebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, maskFramebuffer_, nullptr); maskFramebuffer_ = VK_NULL_HANDLE; }
     if (maskRenderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, maskRenderPass_, nullptr); maskRenderPass_ = VK_NULL_HANDLE; }
     if (maskImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, maskImage_);
     if (maskReadback_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, maskReadback_);
+    if (maskUniform_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, maskUniform_);
+    if (maskTestUniform_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, maskTestUniform_);
+    // Frees maskSet_ / maskTestSet_ with it.
+    if (maskDescPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, maskDescPool_, nullptr); maskDescPool_ = VK_NULL_HANDLE; }
+    maskSet_ = VK_NULL_HANDLE;
+    maskTestSet_ = VK_NULL_HANDLE;
     maskCoverage_.clear();
     maskHasView_ = false;
     maskArmed_ = false;
@@ -2779,7 +2912,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                               const float viewMatrix[16],
                               const float projMatrix[16],
                               bool transparentBg,
-                              float clipFarViewSpace) {
+                              float clipFarViewSpace,
+                              const float projUnclipped[16]) {
     if (!initialized_ || !modelLoaded_) return;
 
     // Size the internal targets to the SWAPCHAIN (stable), not the per-eye
@@ -2966,10 +3100,53 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // blit below depends on. Armed per frame by beginContentMaskFrame().
     if (maskTestForce_ && viewportX == 0 && viewportY == 0) {
         beginContentMaskFrame(true);   // first tile of the frame resets the union
+        maskTestTile_ = 0;
     }
     const bool maskThisView = (maskArmed_ || maskTestForce_) && ensureMaskPass();
+    // The projection the coverage pass MUST use: same fov, same near, far at
+    // the unrestricted budget. nullptr means the caller's real far plane is
+    // already unrestricted (macOS/Linux never clip), so projMatrix is it.
+    const float *projCov = projUnclipped ? projUnclipped : projMatrix;
+    float projTest[16];
+    bool haveProjTest = false;
     if (maskThisView) {
-        recordMaskPass(cmd);
+        // Its own set-0 buffer, written now: the command buffer below reads
+        // both this and uniformBuffer_ at submit, so they cannot be the same
+        // allocation. clipFar is 0 here on purpose — the value only feeds
+        // pbr.frag's discard, and coverage.frag has no code.
+        updateUniforms(viewMatrix, projCov, 0.0f, &maskUniform_);
+        recordMaskPass(cmd, maskSet_);
+
+        // Mutation arm of the self-test: the SAME coverage draw through a
+        // projection whose far plane slices into the model's view-space depth
+        // range — i.e. exactly the shape of projection v0.28.5 handed this
+        // pass whenever the runtime published a restricted budget. Recorded
+        // into its own submit below so both readbacks survive.
+        if (maskTestForce_ && maskTestSet_ != VK_NULL_HANDLE && hasBBox_) {
+            // Forward distance of an AABB corner = -(view * p).z, matching
+            // pbr.vert's outViewZ (which reads the Z-negated view row).
+            float fwdMin = 1.0e30f, fwdMax = -1.0e30f;
+            for (int c = 0; c < 8; ++c) {
+                const float px = (c & 1) ? bboxMax_[0] : bboxMin_[0];
+                const float py = (c & 2) ? bboxMax_[1] : bboxMin_[1];
+                const float pz = (c & 4) ? bboxMax_[2] : bboxMin_[2];
+                const float fwd = -(viewMatrix[2] * px + viewMatrix[6] * py +
+                                    viewMatrix[10] * pz + viewMatrix[14]);
+                if (fwd < fwdMin) fwdMin = fwd;
+                if (fwd > fwdMax) fwdMax = fwd;
+            }
+            // A quarter of the way into the model's depth range. The midpoint
+            // also works but is weak evidence: coverage is a SILHOUETTE, and
+            // lopping the rear half off a roughly convex subject barely changes
+            // its outline (measured ~8% on the DamagedHelmet). A front-quarter
+            // slice removes an unambiguous chunk, so "R is not smaller" can
+            // only mean the far plane never reached the rasterizer.
+            const float slice = fwdMin + 0.25f * (fwdMax - fwdMin);
+            if (ProjRefarZeroToOne(projCov, slice, projTest)) {
+                updateUniforms(viewMatrix, projTest, 0.0f, &maskTestUniform_);
+                haveProjTest = true;
+            }
+        }
     }
 
     // Swapchain → TRANSFER_DST. First eye (vpX==0): UNDEFINED ok. Second eye:
@@ -3021,7 +3198,51 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // The wait above is this function's existing sync point, so the coverage
     // readback is already complete here — no fence pipeline, no extra stall.
     if (maskThisView) {
+        // This view's UNCLIPPED coverage, read before the union OR so the
+        // mutation arm below compares like with like.
+        const size_t covU = maskTestForce_ ? countMaskReadback() : 0;
         consumeMaskReadback();
+
+        // ── Mutation arm ────────────────────────────────────────────────────
+        // Re-run the identical coverage draw through projTest (far plane a
+        // quarter into the model) in its own submit, so maskReadback_ holds R.
+        // Nothing is OR-ed into the union from it — it is a measurement, not a
+        // contribution. If R is not strictly smaller than U the far plane is
+        // not reaching the rasterizer and the whole test is vacuous, which is
+        // the precise hole the v0.28.5 self-test had.
+        size_t covR = 0;
+        bool haveR = false;
+        if (maskTestForce_ && haveProjTest) {
+            VkCommandBuffer cmd2 = VK_NULL_HANDLE;
+            if (vkAllocateCommandBuffers(device_, &ai, &cmd2) == VK_SUCCESS) {
+                VkCommandBufferBeginInfo bi2 = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                bi2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd2, &bi2);
+                recordMaskPass(cmd2, maskTestSet_);
+                vkEndCommandBuffer(cmd2);
+                VkSubmitInfo si2 = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                si2.commandBufferCount = 1;
+                si2.pCommandBuffers = &cmd2;
+                vkQueueSubmit(queue_, 1, &si2, VK_NULL_HANDLE);
+                vkQueueWaitIdle(queue_);
+                covR = countMaskReadback();
+                haveR = true;
+                vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd2);
+            }
+        }
+        if (maskTestForce_ && haveR) {
+            const uint32_t tile = maskTestTile_ < kMaskTestTiles ? maskTestTile_ : 0;
+            ++maskTestViews_;
+            if (covU < maskTestUMin_[tile]) maskTestUMin_[tile] = covU;
+            if (covU > maskTestUMax_[tile]) maskTestUMax_[tile] = covU;
+            if (covR < maskTestRMin_) maskTestRMin_ = covR;
+            if (covR > maskTestRMax_) maskTestRMax_ = covR;
+            if (covR < covU) ++maskTestRLtU_;
+            std::printf("ModelRenderer: [maskpass] tile %u unclipped U=%zu  restricted R=%zu"
+                        "  (R<U %s)\n", tile, covU, covR, covR < covU ? "yes" : "NO");
+        }
+        if (maskTestForce_) ++maskTestTile_;
+
         if (maskTestForce_ && (maskTestFrames_++ % 60u) == 0u) {
             size_t covered = 0, minX = kContentMaskCovW, maxX = 0, minY = kContentMaskCovH, maxY = 0;
             for (uint32_t y = 0; y < kContentMaskCovH; ++y) {
@@ -3057,6 +3278,24 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                     line[64] = '\0';
                     std::printf("  [maskpass] %s\n", line);
                 }
+            }
+            if (maskTestViews_ > 0) {
+                bool uInvariant = true;
+                for (uint32_t t = 0; t < kMaskTestTiles; ++t) {
+                    if (maskTestUMax_[t] == 0) continue;               // tile unused
+                    if (maskTestUMin_[t] != maskTestUMax_[t]) uInvariant = false;
+                    std::printf("  [maskpass] tile %u unclipped U in [%zu..%zu] (%s)\n",
+                                t, maskTestUMin_[t], maskTestUMax_[t],
+                                maskTestUMin_[t] == maskTestUMax_[t] ? "INVARIANT"
+                                                                     : "VARIES - FAIL");
+                }
+                const bool rSmaller = (maskTestRLtU_ == maskTestViews_);
+                std::printf("  [maskpass] VERDICT over %u views: "
+                            "restricted R in [%zu..%zu], R<U on %u/%u (%s) -> %s\n",
+                            maskTestViews_, maskTestRMin_, maskTestRMax_,
+                            maskTestRLtU_, maskTestViews_,
+                            rSmaller ? "test has teeth" : "VACUOUS - FAIL",
+                            (uInvariant && rSmaller) ? "PASS" : "FAIL");
             }
             std::fflush(stdout);
         }
