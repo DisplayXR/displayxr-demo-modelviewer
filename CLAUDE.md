@@ -53,11 +53,29 @@ model_common/                     — the renderer (vendor-neutral, analog of
                                     prefilter.frag, sky.glsl + ibl_common.glsl
 common/                           — fallback Kooima view math (display3d_view.*,
                                     used only when XR_DXR_view_rig is absent),
-                                    camera3d_view (unused), input, HUD, stb
+                                    camera3d_view (unused), input, HUD, stb,
+                                    dxr_view_config.h (the view-config opt-in,
+                                    vendored from the runtime's test_apps/common/)
 openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 ```
 
 ### Renderer conventions (important)
+- **This is an N-view app, so it begins its session with
+  `PRIMARY_MULTIVIEW_DXR`** (runtime #1486/#1500). Its per-frame view count comes
+  from the ACTIVE DXR rendering mode (sim_display's Quad = 4 views), and
+  `PRIMARY_STEREO` now means **exactly 2** — it reports 2 and rejects an
+  `xrEndFrame` projection layer carrying more, so a Quad-mode frame under it
+  fails validation every frame. Every leg calls
+  `DxrSelectViewConfigType(instance, systemId)` (`common/dxr_view_config.h`)
+  once, right after `xrGetSystem` and **before** the first
+  `xrEnumerateViewConfigurationViews`, then feeds that one variable to
+  `xrEnumerateViewConfigurationViews`, `XrSessionBeginInfo::primaryViewConfigurationType`
+  and `XrViewLocateInfo::viewConfigurationType` (on Windows the latter two live
+  in displayxr-common's `XrSessionManager`, which reads `xr.viewConfigType`).
+  It degrades to `PRIMARY_STEREO` on an older runtime, so it is safe
+  unconditionally. Submitted view count is clamped to
+  **min(active mode, located, view-config/atlas capacity)** with a one-shot
+  `[INV-3.1]` log — never re-derived from the mode at the submit site.
 - **Internal target sized to the swapchain** (not per-eye); recreated only on
   swapchain-size change. `renderEye` sets viewport/scissor to the per-eye tile
   and blits `[0,0..vp]` into the swapchain at `(vpX,vpY)`. Mirrors gs_renderer.

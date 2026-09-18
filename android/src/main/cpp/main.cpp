@@ -42,6 +42,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include "dxr_view_config.h" // DxrSelectViewConfigType — PRIMARY_MULTIVIEW_DXR opt-in (#1486/#1500)
 #include "hud_bar.h"
 #include "model_renderer.h"
 
@@ -92,6 +93,14 @@ log_xr_result(const char *what, XrResult r)
 XrInstance g_instance = XR_NULL_HANDLE;
 XrSystemId g_system_id = XR_NULL_SYSTEM_ID;
 XrVersion g_required_vk_version = XR_MAKE_VERSION(1, 1, 0);
+
+//! The view configuration this session runs under. Resolved once, right after
+//! xrGetSystem, by DxrSelectViewConfigType (runtime #1486/#1500): the app's
+//! per-frame view count comes from the ACTIVE DXR rendering mode, so it must
+//! begin with PRIMARY_MULTIVIEW_DXR wherever the runtime enumerates it —
+//! PRIMARY_STEREO now means EXACTLY 2 views and rejects more at xrEndFrame.
+//! Degrades to PRIMARY_STEREO on an older runtime, which is today's behaviour.
+XrViewConfigurationType g_view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 
 VkInstance g_vk_instance = VK_NULL_HANDLE;
 VkPhysicalDevice g_vk_phys_device = VK_NULL_HANDLE;
@@ -269,7 +278,14 @@ refit_dt_s()
 	return (dt > 0.1f) ? 0.1f : dt;
 }
 
-constexpr uint32_t kViewCount = 2;
+//! Compile-time CAPACITY of every per-view array, not the live view count.
+//! Under PRIMARY_MULTIVIEW_DXR the runtime reports the device MAX across
+//! rendering modes (4 on sim_display), so a hard 2 is no longer a safe size.
+//! 8 == XRT_MAX_VIEWS.
+constexpr uint32_t kMaxViews = 8;
+//! Views the session's view configuration actually reports, filled in
+//! create_swapchains(). This is what the one atlas swapchain was sized for.
+uint32_t g_view_count = 2;
 
 struct PerView
 {
@@ -279,7 +295,7 @@ struct PerView
 	XrSwapchainImageVulkanKHR images[8]{};
 	uint32_t image_count{0};
 };
-PerView g_views[kViewCount];
+PerView g_views[kMaxViews];
 
 VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
 
@@ -604,6 +620,13 @@ query_system_and_graphics_reqs()
 		}
 	}
 
+	// runtime #1486/#1500 — one call, right after xrGetSystem and before the
+	// first xrEnumerateViewConfigurationViews. The instance always enables
+	// XR_DXR_display_info (create_instance), which is what makes the runtime
+	// enumerate PRIMARY_MULTIVIEW_DXR at all.
+	g_view_config_type = DxrSelectViewConfigType(g_instance, g_system_id);
+	LOGI("View configuration: %s", DxrViewConfigTypeName(g_view_config_type));
+
 	PFN_xrGetVulkanGraphicsRequirements2KHR get_reqs = nullptr;
 	res = xrGetInstanceProcAddr(
 	    g_instance, "xrGetVulkanGraphicsRequirements2KHR",
@@ -879,25 +902,33 @@ enumerate_rendering_modes()
 bool
 create_swapchains()
 {
-	uint32_t expected_view_count = 0;
+	uint32_t reported_view_count = 0;
 	XrResult res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-	    0, &expected_view_count, nullptr);
-	if (res != XR_SUCCESS || expected_view_count != kViewCount) {
-		LOGE("Expected %u views, runtime reports %u", kViewCount, expected_view_count);
+	    g_instance, g_system_id, g_view_config_type,
+	    0, &reported_view_count, nullptr);
+	// Was `!= kViewCount` (a hard 2). Under PRIMARY_MULTIVIEW_DXR the runtime
+	// reports the device MAX across rendering modes (4 on sim_display), so the
+	// equality check would now refuse to start. Accept anything the per-view
+	// arrays can hold instead.
+	if (res != XR_SUCCESS || reported_view_count < 1 || reported_view_count > kMaxViews) {
+		LOGE("Runtime reports %u views under %s; supported range is 1..%u",
+		     reported_view_count, DxrViewConfigTypeName(g_view_config_type), kMaxViews);
 		return false;
 	}
-	XrViewConfigurationView view_configs[kViewCount] = {};
-	for (uint32_t i = 0; i < kViewCount; ++i) {
+	g_view_count = reported_view_count;
+	XrViewConfigurationView view_configs[kMaxViews] = {};
+	for (uint32_t i = 0; i < g_view_count; ++i) {
 		view_configs[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
 	}
 	res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-	    kViewCount, &expected_view_count, view_configs);
+	    g_instance, g_system_id, g_view_config_type,
+	    g_view_count, &reported_view_count, view_configs);
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEnumerateViewConfigurationViews", res);
 		return false;
 	}
+	LOGI("View config: %u views (%s)", g_view_count,
+	     DxrViewConfigTypeName(g_view_config_type));
 
 	uint32_t format_count = 0;
 	res = xrEnumerateSwapchainFormats(g_session, 0, &format_count, nullptr);
@@ -935,7 +966,7 @@ create_swapchains()
 	// mode switch / rotation; each frame the app renders the active mode's tiles
 	// into sub-rects of this atlas (active_tile_dims + the tile-layout offsets) and
 	// submits each projection view's subImage.imageRect = its tile rect. All views
-	// reference this single swapchain (g_views[0]); g_views[1] aliases it.
+	// reference this single swapchain (g_views[0]); the other g_views[] entries alias it.
 	uint32_t aw = g_atlas_w, ah = g_atlas_h;
 	if (aw == 0 || ah == 0) { // no mode info → 2x1 of the recommended rect
 		aw = view_configs[0].recommendedImageRectWidth * 2;
@@ -979,8 +1010,13 @@ create_swapchains()
 		return false;
 	}
 	g_views[0].image_count = img_count;
-	g_views[1] = g_views[0]; // alias: all projection views share the one atlas swapchain
-	LOGI("Atlas swapchain: %ux%u, %u images", aw, ah, img_count);
+	// Alias: all projection views share the one atlas swapchain. destroy_all()
+	// therefore destroys g_views[0] ONLY — destroying every entry would call
+	// xrDestroySwapchain N times on the same handle.
+	for (uint32_t i = 1; i < g_view_count; ++i) {
+		g_views[i] = g_views[0];
+	}
+	LOGI("Atlas swapchain: %ux%u, %u images, %u views", aw, ah, img_count, g_view_count);
 	return true;
 }
 
@@ -1167,7 +1203,7 @@ handle_session_state(XrSessionState new_state)
 	case XR_SESSION_STATE_READY: {
 		XrSessionBeginInfo begin = {};
 		begin.type = XR_TYPE_SESSION_BEGIN_INFO;
-		begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		begin.primaryViewConfigurationType = g_view_config_type;
 		XrResult res = xrBeginSession(g_session, &begin);
 		log_xr_result("xrBeginSession", res);
 		if (res == XR_SUCCESS) {
@@ -1253,15 +1289,15 @@ render_frame()
 		return false;
 	}
 
-	XrCompositionLayerProjectionView projection_views[kViewCount] = {};
+	XrCompositionLayerProjectionView projection_views[kMaxViews] = {};
 	bool rendered = false;
-	uint32_t submitted_view_count = kViewCount;
+	uint32_t submitted_view_count = g_view_count;
 	if (frame_state.shouldRender && g_scene_loaded.load(std::memory_order_relaxed)) {
 		XrViewState view_state = {};
 		view_state.type = XR_TYPE_VIEW_STATE;
 		XrViewLocateInfo locate_info = {};
 		locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
-		locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locate_info.viewConfigurationType = g_view_config_type;
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
@@ -1368,23 +1404,48 @@ render_frame()
 			view_state.next = &view_raw;
 		}
 
-		XrView views[kViewCount] = {};
-		for (uint32_t i = 0; i < kViewCount; ++i) {
+		XrView views[kMaxViews] = {};
+		for (uint32_t i = 0; i < kMaxViews; ++i) {
 			views[i].type = XR_TYPE_VIEW;
 		}
 		uint32_t located = 0;
-		res = xrLocateViews(g_session, &locate_info, &view_state, kViewCount, &located, views);
+		res = xrLocateViews(g_session, &locate_info, &view_state, kMaxViews, &located, views);
 		// Multiview-tiling invariant: submit the ACTIVE mode's view count — 2D = 1
 		// tile (1x1), 3D = 2 tiles (2x1). Each tile is rendered at the active tile
 		// size (display × view_scale; computed below once g_win_px is fresh) into a
 		// sub-rect of the worst-case swapchain, and submitted as subImage.imageRect.
 		// The runtime z-fix (displayxr-runtime#538) keeps the 2D eye distance right.
-		uint32_t view_count = located < kViewCount ? located : kViewCount;
-		{
-			const uint32_t mode = g_rmode_current.load(std::memory_order_relaxed);
-			const uint32_t mvc = (mode < 8 && g_rmode_vc[mode] > 0) ? g_rmode_vc[mode] : view_count;
-			if (mvc < view_count)
-				view_count = mvc;
+		// INV-3.1 clamp — min(active mode, located, view-config/atlas capacity).
+		// g_view_count is what the ONE atlas swapchain was worst-case-sized for
+		// (arraySize is 1: the views are tiles in image 0, so tile capacity is the
+		// slice bound). Log ONCE per disagreeing combination, never per frame, and
+		// never drop to a zero-view projection layer.
+		const uint32_t mode = g_rmode_current.load(std::memory_order_relaxed);
+		const uint32_t mode_vc = (mode < 8 && g_rmode_vc[mode] > 0) ? g_rmode_vc[mode] : g_view_count;
+		uint32_t view_count = mode_vc;
+		if (g_view_count < view_count)
+			view_count = g_view_count;
+		if (view_count > kMaxViews)
+			view_count = kMaxViews;
+		// `located` is the last bound. A FAILED locate leaves it 0, which
+		// collapses view_count to 0 so the `>= 1` guard below still skips the
+		// frame (pre-existing behaviour); that is a transient miss, not a count
+		// disagreement, so only a non-zero located short of the mode count is
+		// worth a line.
+		const bool located_short = (located > 0 && located < view_count);
+		if (located < view_count) {
+			view_count = located;
+		}
+		if (located_short || (located > 0 && view_count != mode_vc)) {
+			static uint32_t s_last_clamp_key = 0;
+			const uint32_t key = (mode_vc << 16) | ((located & 0xffu) << 8) | (g_view_count & 0xffu);
+			if (key != s_last_clamp_key) {
+				s_last_clamp_key = key;
+				LOGW("[INV-3.1] submitted view count clamped %u -> %u "
+				     "(mode=%u located=%u viewConfig=%u, %s)",
+				     mode_vc, view_count, mode_vc, located, g_view_count,
+				     DxrViewConfigTypeName(g_view_config_type));
+			}
 		}
 		if (res == XR_SUCCESS && view_count >= 1) {
 			DXR_HW_DBG_ONCE("first xrLocateViews success");
@@ -1667,11 +1728,12 @@ destroy_all()
 		xrDestroySession(g_session);
 		g_session = XR_NULL_HANDLE;
 	}
-	for (uint32_t i = 0; i < kViewCount; ++i) {
-		if (g_views[i].swapchain != XR_NULL_HANDLE) {
-			xrDestroySwapchain(g_views[i].swapchain);
-			g_views[i].swapchain = XR_NULL_HANDLE;
-		}
+	// ONE atlas swapchain, aliased into every g_views[] entry — destroy it once.
+	if (g_views[0].swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(g_views[0].swapchain);
+	}
+	for (uint32_t i = 0; i < kMaxViews; ++i) {
+		g_views[i].swapchain = XR_NULL_HANDLE;
 	}
 	if (g_app_space != XR_NULL_HANDLE) {
 		xrDestroySpace(g_app_space);

@@ -185,6 +185,16 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     XR_CHECK_LOG(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
     LOG_INFO("System ID: %llu", (unsigned long long)xr.systemId);
 
+    // runtime #1486/#1500: this app's per-frame view count comes from the ACTIVE
+    // DXR rendering mode (the 1/2/3 mode keys, sim_display Quad = 4 views), so it
+    // must begin its session with PRIMARY_MULTIVIEW_DXR — PRIMARY_STEREO now means
+    // EXACTLY 2 views and rejects an xrEndFrame projection layer carrying more.
+    // One call here, before the first xrEnumerateViewConfigurationViews; the same
+    // xr.viewConfigType then feeds xrBeginSession + xrLocateViews (displayxr::common
+    // reads it for both). Degrades to PRIMARY_STEREO on an older runtime.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
+
     // Get system name
     {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};

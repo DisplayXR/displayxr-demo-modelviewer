@@ -104,6 +104,7 @@ target_include_directories(model_viewer_vk_android PRIVATE
     ${tinygltf_SOURCE_DIR}                      # tiny_gltf.h + json.hpp + stb_image.h
     ${glm_SOURCE_DIR}                           # glm/ (header-only)
     ${stb_SOURCE_DIR}                           # stb_truetype.h (button bar)
+    ${REPO_ROOT}/common                         # dxr_view_config.h (app-side helpers)
     ${REPO_ROOT}/openxr_includes)               # DisplayXR XR_EXT_* headers
 
 set_target_properties(model_viewer_vk_android PROPERTIES
