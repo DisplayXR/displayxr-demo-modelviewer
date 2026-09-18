@@ -18,7 +18,10 @@
 #include <openxr/XR_DXR_depth_budget.h>
 // DxrSelectViewConfigType / DxrViewConfigTypeName (runtime #1486/#1500): the
 // PRIMARY_MULTIVIEW_DXR opt-in every N-view app needs. Vendored in common/.
-#include "dxr_view_config.h"
+// Explicit relative path on purpose: displayxr-common v2.14.0 ships an
+// identical dxr_view_config.h via displayxr::rules, so a bare include is
+// ambiguous once displayxr::common is on the include path.
+#include "../common/dxr_view_config.h"
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
 // returns render-ready XrView{pose, fov}; the app deletes its own. App-owned

@@ -53,7 +53,7 @@
 #include <sys/stat.h>
 
 #include "view_params.h"
-#include "dxr_view_config.h" // DxrSelectViewConfigType — PRIMARY_MULTIVIEW_DXR opt-in (#1486/#1500)
+#include "../common/dxr_view_config.h" // DxrSelectViewConfigType — PRIMARY_MULTIVIEW_DXR opt-in (#1486/#1500)
 #include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
 #include "display3d_view.h"
 #include "camera3d_view.h"
