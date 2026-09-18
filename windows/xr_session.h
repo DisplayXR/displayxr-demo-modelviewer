@@ -16,6 +16,9 @@
 #include <openxr/XR_DXR_display_zones.h>
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_depth_budget.h>
+// DxrSelectViewConfigType / DxrViewConfigTypeName (runtime #1486/#1500): the
+// PRIMARY_MULTIVIEW_DXR opt-in every N-view app needs. Vendored in common/.
+#include "dxr_view_config.h"
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
 // returns render-ready XrView{pose, fov}; the app deletes its own. App-owned

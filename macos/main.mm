@@ -53,6 +53,7 @@
 #include <sys/stat.h>
 
 #include "view_params.h"
+#include "dxr_view_config.h" // DxrSelectViewConfigType — PRIMARY_MULTIVIEW_DXR opt-in (#1486/#1500)
 #include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
 #include "display3d_view.h"
 #include "camera3d_view.h"
@@ -1194,6 +1195,16 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XrSystemGetInfo si = {XR_TYPE_SYSTEM_GET_INFO};
     si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &si, &xr.systemId));
+
+    // runtime #1486/#1500: this app's per-frame view count comes from the ACTIVE
+    // DXR rendering mode (sim_display's Quad mode = 4 views), so it must begin its
+    // session with PRIMARY_MULTIVIEW_DXR — PRIMARY_STEREO now reports EXACTLY 2 and
+    // rejects an xrEndFrame projection layer carrying more. One call here, before
+    // the first xrEnumerateViewConfigurationViews (CreateSwapchains); the same
+    // xr.viewConfigType feeds XrSessionBeginInfo + XrViewLocateInfo below.
+    // Degrades to PRIMARY_STEREO on an older runtime.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
     { XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
       xrGetSystemProperties(xr.instance, xr.systemId, &sp);
@@ -2459,7 +2470,33 @@ int main() {
                         uint32_t modeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                             ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
                         if (modeViewCount < 1) modeViewCount = 1;
-                        if (modeViewCount > runtimeViewCount) modeViewCount = runtimeViewCount;
+                        // INV-3.1 clamp: the mode's advertised count is one of three
+                        // bounds. `runtimeViewCount` now holds what xrLocateViews
+                        // actually wrote; xr.maxViewCount is the session view
+                        // configuration's count, which is what the atlas swapchain was
+                        // worst-case-sized for (arraySize is 1 — the views are tiles in
+                        // image 0, so tile capacity is the slice bound). Submitting past
+                        // any of them fails xrEndFrame validation every frame — exactly
+                        // what a Quad mode did before the PRIMARY_MULTIVIEW_DXR opt-in.
+                        // Log ONCE per disagreeing combination, never per frame.
+                        {
+                            uint32_t bound = modeViewCount;
+                            if (runtimeViewCount > 0 && runtimeViewCount < bound) bound = runtimeViewCount;
+                            if (xr.maxViewCount > 0 && xr.maxViewCount < bound) bound = xr.maxViewCount;
+                            if (bound < 1) bound = 1;
+                            if (bound != modeViewCount) {
+                                static uint32_t s_lastClampKey = 0;
+                                const uint32_t key = (modeViewCount << 16) | (runtimeViewCount << 8) | xr.maxViewCount;
+                                if (key != s_lastClampKey) {
+                                    s_lastClampKey = key;
+                                    LOG_WARN("[INV-3.1] submitted view count clamped %u -> %u "
+                                             "(mode=%u located=%u viewConfig=%u, %s)",
+                                             modeViewCount, bound, modeViewCount, runtimeViewCount,
+                                             xr.maxViewCount, DxrViewConfigTypeName(xr.viewConfigType));
+                                }
+                                modeViewCount = bound;
+                            }
+                        }
                         bool display3D = (xr.renderingModeCount > 0)
                             ? xr.renderingModeDisplay3D[g_input.currentRenderingMode] : true;
                         bool monoMode = !display3D;

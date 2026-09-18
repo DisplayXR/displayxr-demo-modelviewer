@@ -2770,6 +2770,11 @@ static void RenderThreadFunc(
                 // Sized to runtime's max possible view count (sim_display Quad mode = 4).
                 // Active mode's view count drives how many slots are actually filled and submitted.
                 XrCompositionLayerProjectionView projectionViews[8] = {};
+                // INV-3.1: how many of projectionViews[] were actually written this
+                // frame. Set in the locate/render block below (which does not survive
+                // to the Submit-frame section) and consumed there, so the submitted
+                // count can never exceed what was located + rendered. 0 until set.
+                uint32_t submittedViewCount = 0;
                 bool rendered = false;
                 bool hudSubmitted = false;
                 bool loadBtnSubmitted = false;
@@ -2946,7 +2951,40 @@ static void RenderThreadFunc(
                             ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2u;
                         if (activeViewCount == 0) activeViewCount = 1u;
                         if (activeViewCount > 8) activeViewCount = 8u;
+
+                        // INV-3.1 clamp. The mode's advertised count is only ONE of the
+                        // three bounds; the other two are what xrLocateViews actually
+                        // wrote (`viewCount`) and what the session's view configuration
+                        // reports (`configViews`, which is what the atlas swapchain was
+                        // worst-case-sized for — arraySize is 1, the views are tiles in
+                        // image 0, so the tile capacity is the slice bound here).
+                        // Submitting past any of them is an xrEndFrame validation
+                        // failure every frame; that is exactly what happened before the
+                        // PRIMARY_MULTIVIEW_DXR opt-in above (Quad mode advertises 4,
+                        // PRIMARY_STEREO reports and accepts 2). Log ONCE per disagreeing
+                        // combination — never per frame, and never silently drop to 0.
+                        {
+                            const uint32_t configCount = xr->configViews.empty()
+                                ? activeViewCount : (uint32_t)xr->configViews.size();
+                            uint32_t bound = activeViewCount;
+                            if (viewCount > 0 && viewCount < bound) bound = viewCount;
+                            if (configCount > 0 && configCount < bound) bound = configCount;
+                            if (bound < 1) bound = 1;
+                            if (bound != activeViewCount) {
+                                static uint32_t s_lastClampKey = 0;
+                                const uint32_t key = (activeViewCount << 16) | (viewCount << 8) | configCount;
+                                if (key != s_lastClampKey) {
+                                    s_lastClampKey = key;
+                                    LOG_WARN("[INV-3.1] submitted view count clamped %u -> %u "
+                                             "(mode=%u located=%u viewConfig=%u, %s)",
+                                             activeViewCount, bound, activeViewCount, viewCount,
+                                             configCount, DxrViewConfigTypeName(xr->viewConfigType));
+                                }
+                                activeViewCount = bound;
+                            }
+                        }
                         const int eyeCount = monoMode ? 1 : (int)activeViewCount;
+                        submittedViewCount = (uint32_t)eyeCount;
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims
@@ -3902,8 +3940,13 @@ static void RenderThreadFunc(
                     }
                 }
 
-                // Submit frame
-                uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
+                // Submit frame. INV-3.1: submit exactly the views the locate/render
+                // block wrote into projectionViews[] — already clamped there to
+                // min(active mode, located, view-config/atlas capacity). Re-deriving
+                // it from the mode here is what let a Quad-mode (4-view) submission
+                // outrun a 2-view locate. The fallback only covers the (unreachable)
+                // case of `rendered` true with nothing recorded.
+                uint32_t submitViewCount = submittedViewCount;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
                 if (rendered) {
