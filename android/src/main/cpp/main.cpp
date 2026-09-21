@@ -42,7 +42,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
-#include "dxr_view_config.h" // DxrSelectViewConfigType — PRIMARY_MULTIVIEW_DXR opt-in (#1486/#1500)
+#include "dxr_view_config.h" // displayxr-common: DxrSelectViewConfigType (#1486/#1500) + DxrAliasInactiveViews (ADR-041)
 #include "hud_bar.h"
 #include "model_renderer.h"
 
@@ -1555,6 +1555,17 @@ render_frame()
 					projection_views[i].subImage.imageRect.offset = {(int32_t)tile_x, (int32_t)tile_y};
 					projection_views[i].subImage.imageRect.extent = {(int32_t)tile_w, (int32_t)tile_h};
 					projection_views[i].subImage.imageArrayIndex = 0;
+				}
+				// ADR-041 (runtime #1612): the layer carries EVERY located view.
+				// Only [0, view_count) were rendered (1 in 2D); point the inactive
+				// tail at view 0's tile — the runtime ignores those pixels. Under
+				// PRIMARY_MULTIVIEW_DXR xrEndFrame rejects a shorter layer, which
+				// froze the panel on the last 3D frame.
+				{
+					const uint32_t located_n = (located < kMaxViews) ? located : kMaxViews;
+					DxrAliasInactiveViews(projection_views, views, located_n, view_count);
+					if (located_n > submitted_view_count)
+						submitted_view_count = located_n;
 				}
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;

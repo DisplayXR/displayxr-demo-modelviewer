@@ -75,6 +75,6 @@ Refreshed for the PRIMARY_MULTIVIEW_DXR opt-in (runtime #1486/#1500):
 `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` enumerator
 (`((XrViewConfigurationType)1004999212)`); no struct this app passes over the
 wire changed shape. The app-side helper that consumes it,
-`common/dxr_view_config.h`, is vendored from the runtime's
-`test_apps/common/` — a different source path, so it is deliberately **not** in
-`VENDORED.json` (which pins only `src/external/openxr_includes/openxr/`).
+`dxr_view_config.h`, is no longer vendored here: it comes from displayxr-common
+(`displayxr::rules`), the one shared implementation (runtime #1612). It was never
+in `VENDORED.json` (which pins only `src/external/openxr_includes/openxr/`).

@@ -55,9 +55,9 @@ model_common/                     — the renderer (vendor-neutral, analog of
                                     prefilter.frag, sky.glsl + ibl_common.glsl
 common/                           — fallback Kooima view math (display3d_view.*,
                                     used only when XR_DXR_view_rig is absent),
-                                    camera3d_view (unused), input, HUD, stb,
-                                    dxr_view_config.h (the view-config opt-in,
-                                    vendored from the runtime's test_apps/common/)
+                                    camera3d_view (unused), input, HUD, stb.
+                                    dxr_view_config.h is NOT here: it comes from
+                                    displayxr-common (displayxr::rules)
 openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 ```
 
@@ -68,16 +68,24 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   `PRIMARY_STEREO` now means **exactly 2** — it reports 2 and rejects an
   `xrEndFrame` projection layer carrying more, so a Quad-mode frame under it
   fails validation every frame. Every leg calls
-  `DxrSelectViewConfigType(instance, systemId)` (`common/dxr_view_config.h`)
+  `DxrSelectViewConfigType(instance, systemId)` (displayxr-common's `dxr_view_config.h`)
   once, right after `xrGetSystem` and **before** the first
   `xrEnumerateViewConfigurationViews`, then feeds that one variable to
   `xrEnumerateViewConfigurationViews`, `XrSessionBeginInfo::primaryViewConfigurationType`
   and `XrViewLocateInfo::viewConfigurationType` (on Windows the latter two live
   in displayxr-common's `XrSessionManager`, which reads `xr.viewConfigType`).
   It degrades to `PRIMARY_STEREO` on an older runtime, so it is safe
-  unconditionally. Submitted view count is clamped to
+  unconditionally. The RENDERED view count is clamped to
   **min(active mode, located, view-config/atlas capacity)** with a one-shot
-  `[INV-3.1]` log — never re-derived from the mode at the submit site.
+  `[INV-3.1]` log — never re-derived from the mode at the submit site — and a
+  `hardwareDisplay3D=false` mode renders one view.
+- **Every projection layer carries EVERY located view (ADR-041, runtime
+  #1612).** Under `PRIMARY_MULTIVIEW_DXR` the located count is fixed for the
+  session; `xrEndFrame` rejects a layer that carries only the active mode's
+  views, and the panel then keeps the last woven 3D frame (a frozen double
+  image in 2D). Each leg renders `[0, active)` and calls
+  `DxrAliasInactiveViews(projViews, views, located, active)` (displayxr-common)
+  to point the inactive tail at view 0's tile.
 - **Internal target sized to the swapchain** (not per-eye); recreated only on
   swapchain-size change. `renderEye` sets viewport/scissor to the per-eye tile
   and blits `[0,0..vp]` into the swapchain at `(vpX,vpY)`. Mirrors gs_renderer.

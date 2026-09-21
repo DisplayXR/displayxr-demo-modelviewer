@@ -2770,10 +2770,14 @@ static void RenderThreadFunc(
                 // Sized to runtime's max possible view count (sim_display Quad mode = 4).
                 // Active mode's view count drives how many slots are actually filled and submitted.
                 XrCompositionLayerProjectionView projectionViews[8] = {};
-                // INV-3.1: how many of projectionViews[] were actually written this
+                // How many of projectionViews[] the projection layer carries this
                 // frame. Set in the locate/render block below (which does not survive
-                // to the Submit-frame section) and consumed there, so the submitted
-                // count can never exceed what was located + rendered. 0 until set.
+                // to the Submit-frame section) and consumed there. ADR-041 (runtime
+                // #1612): this is the LOCATED view count, not the active mode's —
+                // the render block renders [0, eyeCount) and aliases the inactive
+                // tail onto view 0 with DxrAliasInactiveViews. Under
+                // PRIMARY_MULTIVIEW_DXR xrEndFrame rejects a shorter layer, which
+                // froze the panel on the last 3D frame in 2D mode. 0 until set.
                 uint32_t submittedViewCount = 0;
                 bool rendered = false;
                 bool hudSubmitted = false;
@@ -3430,6 +3434,17 @@ static void RenderThreadFunc(
                                 }
                             }
 
+                            // ADR-041 (runtime #1612): the layer carries EVERY
+                            // located view. Only [0, eyeCount) were rendered (1 in
+                            // a 2D mode); point the inactive tail at view 0's tile
+                            // — the runtime ignores those pixels. Each aliased view
+                            // keeps its own located pose/fov.
+                            {
+                                const uint32_t located = (viewCount < 8u) ? viewCount : 8u;
+                                DxrAliasInactiveViews(projectionViews, rawViews, located, (uint32_t)eyeCount);
+                                if (located > submittedViewCount) submittedViewCount = located;
+                            }
+
                             // #833 punch-through: while Ctrl+T transparent AND
                             // borderless, shape the window from view 0's alpha
                             // (fence-pipelined, ~2-frame lag — no waits). The
@@ -3940,12 +3955,14 @@ static void RenderThreadFunc(
                     }
                 }
 
-                // Submit frame. INV-3.1: submit exactly the views the locate/render
-                // block wrote into projectionViews[] — already clamped there to
-                // min(active mode, located, view-config/atlas capacity). Re-deriving
-                // it from the mode here is what let a Quad-mode (4-view) submission
-                // outrun a 2-view locate. The fallback only covers the (unreachable)
-                // case of `rendered` true with nothing recorded.
+                // Submit frame. Submit exactly the views the locate/render block
+                // wrote into projectionViews[]: the rendered [0, eyeCount) (clamped
+                // there to min(active mode, located, view-config/atlas capacity) —
+                // INV-3.1) plus the aliased inactive tail up to the located count
+                // (ADR-041). Re-deriving it from the mode here is what let a
+                // Quad-mode (4-view) submission outrun a 2-view locate. The fallback
+                // only covers the (unreachable) case of `rendered` true with
+                // nothing recorded.
                 uint32_t submitViewCount = submittedViewCount;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
