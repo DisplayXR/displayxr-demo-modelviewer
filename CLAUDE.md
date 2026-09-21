@@ -210,11 +210,33 @@ Ctrl+O, F11, P-then-X/Y/Z, ESC. Two divergences, both forced by X11:
    would have been a toast is a `LOG_INFO` line instead. TAB tracks a
    `hudVisible` flag that nothing draws yet.
 
-Also absent on Linux, and not planned in this pass: transparent-background mode
-(Ctrl+T) and its shaped punch-through, the capture-flash overlay, drag-and-drop
-(XDND), the `displayxr-view:` protocol handler, and the `--src` URL download.
-The positional model path and `--vh` DO work (`dxr::ParseLaunchArgs`); the other
-launch flags are parsed and reported as unsupported rather than ignored
+**Transparent background (Ctrl+T) + click-through — Windows parity.** The window
+is always created on a 32-bit ARGB visual and the session with
+`XR_DXR_xlib_window_binding`'s `transparentBackgroundEnabled = XR_TRUE`, exactly
+as `windows/xr_session.cpp` does unconditionally: the runtime fixes the
+swapchain's compositeAlpha at `xrCreateSession`, so Ctrl+T can only change what
+the app draws (alpha-0 clear + no skybox), never the session. Transparent mode
+sets an XShape **ShapeInput** region from the frame's own rendered alpha
+(`linux/clickthrough.{h,cpp}`: downscale-blit of the first+last view tiles out of
+the atlas, fence-pipelined HOST_CACHED readback, alpha > 8, 1-texel dilation,
+run/band-folded rects — the Windows `dxr::ClickThroughRegion` recipe with the
+avatar's X11 application code), so clicks land on the model and pass through
+elsewhere; it also sets `_NET_WM_STATE_ABOVE` (Windows' HWND_TOPMOST). Opaque
+mode drops the shape and the ABOVE state. It does NOT re-render the model into a
+scratch raster the way `displayxr-demo-avatar/linux/clickthrough.cpp` does: this
+repo's `renderEye` sizes its MSAA targets to `imageWidth/imageHeight`, so a
+second, smaller target would recreate them every frame. `MODEL_TRANSPARENT=1`
+(or `--transparent`) starts transparent; `MODEL_TRANSPARENT=0` turns the
+capability off (root visual, `XR_FALSE`) — the exact pre-transparency behaviour —
+and Ctrl+T then refuses with a log line rather than drawing black. Levers shared
+with Windows: `DXR_CLICKTHROUGH_TEXEL_PX` / `_DILATE` / `_ALPHA`. The silhouette
+is the RMB drag target in transparent mode; if it shrinks below 64×64 px of
+window area the shape is dropped so the window stays reachable.
+
+Still absent on Linux: the capture-flash overlay, drag-and-drop (XDND), the
+`displayxr-view:` protocol handler, and the `--src` URL download. The positional
+model path, `--vh` and `--transparent` DO work (`dxr::ParseLaunchArgs`); the
+other launch flags are parsed and reported as unsupported rather than ignored
 silently. Note `launch_args.h` must be included **before** the X11 headers —
 `<X11/X.h>` `#define`s `None`, which mangles `dxr::LaunchSrcKind::None`.
 
