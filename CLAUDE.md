@@ -189,19 +189,33 @@ sensitivities and clamps included — LMB-drag orbit at 0.005 rad/px with the
 variants, WASDEQ, SPACE, C, V, 0-8, T, I, M, N, K, L, G, `[`/`]`, `-`/`=`,
 Ctrl+O, F11, P-then-X/Y/Z, ESC. Two divergences, both forced by X11:
 
-1. **RMB drags the window** (Windows reserves RMB for the borderless overlay
-   and gets its window move from the title bar). A windowed 3D app has to keep
-   the woven interlace phase invariant while it moves, Windows gets that from
-   the OS modal move loop (the DP hooks `WM_WINDOWPOSCHANGING`), and X11 offers
-   the client no equivalent hook — a mutter `_NET_WM_MOVERESIZE` grab cannot be
-   intercepted. So the window goes undecorated and the app owns the drag,
-   routing every step through `xrWeaveSnapWindowRectDXR` (INV-1.3, runtime
-   #1588). That leaves no title bar to aim at, and LMB is spoken for by the
-   orbit, so RMB moves the window — the same convention `dxr::RmbWindowDrag`
-   uses for the Windows borderless overlay. `DXR_X11_WM_DECORATIONS=1` restores
-   a decorated, WM-dragged window and gives up the phase snap;
+1. **The app owns the window drag, so the decorations are client-side.**
+   A windowed 3D app has to keep the woven interlace phase invariant while it
+   moves. Windows gets that with an ordinary title bar because the OS modal move
+   loop sends `WM_WINDOWPOSCHANGING`, proposing each step for the DP to rewrite.
+   X11 has no equivalent — a WM-drawn title bar is mutter's, the drag runs in
+   mutter's grab loop, and the client only learns the result via
+   `ConfigureNotify` — and Wayland has no client positioning at all. So the
+   window draws its own GNOME-style header bar (`linux/csd_titlebar.{h,cpp}`):
+   LMB on it drags through `xrWeaveSnapWindowRectDXR` (INV-1.3, runtime #1588),
+   with minimize + close buttons; RMB-drag anywhere also moves the window (the
+   `dxr::RmbWindowDrag` convention). **The bar is OUTSIDE the window the runtime
+   sees**, via a parent/child pair (the Windows client-area split): the
+   top-level is bar + content, owns the bar (plain 2D, `XPutImage`, never in the
+   atlas), gets all input, and carries the Ctrl+T XShape (bar ∪ silhouette
+   offset by the bar height); a CHILD window covering exactly the content is
+   what `XR_DXR_xlib_window_binding` binds, so the runtime's `get_window_metrics`
+   (child geometry + root-translated origin) gives Kooima, the canvas and the
+   weave present origin the visible 3D area only. Drag snapping is done in the
+   content child's coordinates; only the final `XMoveWindow` shifts to the
+   top-level. `MODEL_WINDOW="WxH+X+Y"` names the CONTENT rect; the top-level
+   sits the bar's height above it. Fullscreen hides the bar and the child fills
+   the panel exactly.
+   `DXR_X11_WM_DECORATIONS=1` restores a WM-decorated, unsnapped window;
    `DXR_X11_TEST_DRAG="dx,dy,steps"` walks the window through the identical
-   snap path with nobody at the mouse.
+   snap path with nobody at the mouse; `DXR_CSD_SCALE` / `DXR_CSD_FONT` override
+   the bar's scale (default `Xft.dpi`/96) and title font (default fontconfig bold
+   sans).
    **`XR_DXR_weave` is strictly optional here:** the entry point is resolved at
    runtime and desktop Linux does not serve it yet (runtime#1588 / PR#1592 is
    unmerged), in which case the app logs one line and drags unsnapped.

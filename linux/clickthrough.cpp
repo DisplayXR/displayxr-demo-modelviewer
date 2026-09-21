@@ -365,7 +365,7 @@ ApplyRegion(const ClickthroughParams &p)
 		}
 		if (bandFirst != (size_t)-1 && runs == prevRuns) {
 			for (size_t i = bandFirst; i < rects.size(); ++i) {
-				rects[i].height = (unsigned short)(bottom - (int64_t)rects[i].y);
+				rects[i].height = (unsigned short)(bottom + p.contentOffsetY - (int64_t)rects[i].y);
 			}
 			continue;
 		}
@@ -375,8 +375,8 @@ ApplyRegion(const ClickthroughParams &p)
 			const int64_t left = (int64_t)runs[i] * winW / cw;
 			const int64_t right = (int64_t)runs[i + 1] * winW / cw;
 			XRectangle r;
-			r.x = (short)left;
-			r.y = (short)top;
+			r.x = (short)(left + p.contentOffsetX);
+			r.y = (short)(top + p.contentOffsetY);
 			r.width = (unsigned short)(right > left ? right - left : 1);
 			r.height = (unsigned short)(bottom > top ? bottom - top : 1);
 			rects.push_back(r);
@@ -412,7 +412,7 @@ ApplyRegion(const ClickthroughParams &p)
 		g_lastReachableState = 1;
 	}
 
-	// Chrome (the client-side title bar) is already in client px — append
+	// Chrome (the client-side title bar) is already in top-level px — append
 	// unscaled. UNIONED IN, never punched out: a shaped window delivers no
 	// pointer event outside its input region, so an un-unioned band would be
 	// visible and dead.
