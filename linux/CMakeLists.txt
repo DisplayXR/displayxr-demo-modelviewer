@@ -9,12 +9,15 @@
 #
 # linux/main.cpp is the Linux entry point (issue #40, M8 Linux epic
 # runtime#699): system Vulkan (native ICD, no MoltenVK) + OpenXR session +
-# ModelRenderer, as a HANDLE app — the app owns a decorated X11 window on the
-# 3D panel and passes it via XR_DXR_xlib_window_binding (runtime weaves
-# window-relative; keyboard: O / Ctrl+O = zenity file-open). Falls back to
-# hosted-NULL when no X server is available, which also keeps CI build-green
-# (compiled on CI, not run — CI has no GPU/display). See ../PORTING.md and the
-# runtime's docs/guides/linux-demo-port.md.
+# ModelRenderer, as a HANDLE app — the app owns an X11 toplevel on the 3D panel
+# and passes it via XR_DXR_xlib_window_binding, so the runtime weaves
+# window-relative. Full mouse + keyboard parity with the Windows leg (LMB
+# orbit, wheel zoom, V/0-8 rendering mode, ...) and a client-owned, phase-
+# snapped window drag on RMB. Falls back to hosted-NULL when no X server is
+# available, which also keeps CI compiling (CI builds, it does not run — no
+# GPU/display). Validated on real hardware (Acer SpatialLabs DS1, Ubuntu 26.04
+# GNOME/XWayland). See ../PORTING.md and the runtime's
+# docs/guides/displayxr-app-rules.md (INV-1.3).
 
 cmake_minimum_required(VERSION 3.21)
 
