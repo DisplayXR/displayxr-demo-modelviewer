@@ -34,6 +34,9 @@ find_package(X11 REQUIRED)
 if(NOT X11_Xrandr_LIB)
     message(FATAL_ERROR "libxrandr-dev not found — required for panel-centered window placement")
 endif()
+if(NOT X11_Xext_LIB)
+    message(FATAL_ERROR "libXext not found — install libxext-dev (XShape click-through)")
+endif()
 
 # OpenXR loader — CONFIG package first (a dev/CI loader built to
 # CMAKE_PREFIX_PATH, e.g. /tmp/openxr-install), else a plain find_library.
@@ -62,6 +65,7 @@ endif()
 
 add_executable(model_viewer_handle_vk_linux
     main.cpp
+    clickthrough.cpp    # XShape input-region punch-through (Ctrl+T transparent mode)
     # The single stb_image implementation TU (displayxr::common only ships it
     # for Win/macOS; the model_common loaders take declarations only).
     stb_image_impl_linux.cpp
@@ -80,6 +84,7 @@ target_link_libraries(model_viewer_handle_vk_linux PRIVATE
     Vulkan::Vulkan
     ${X11_LIBRARIES}
     ${X11_Xrandr_LIB}   # Xrandr — panel rect for window centering (needs libxrandr-dev)
+    ${X11_Xext_LIB}     # XShape — click-through input region (needs libxext-dev)
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a

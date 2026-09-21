@@ -39,10 +39,27 @@
  * restores a decorated, WM-dragged window; DXR_X11_TEST_DRAG="dx,dy,steps"
  * walks the window through the same snap path with nobody at the mouse.
  *
+ * TRANSPARENT BACKGROUND (Ctrl+T) + CLICK-THROUGH — Windows parity. The window
+ * is created on a 32-bit ARGB visual and the session is created with
+ * XR_DXR_xlib_window_binding's transparentBackgroundEnabled, exactly as the
+ * Windows leg sets it unconditionally (windows/xr_session.cpp): the runtime
+ * wires the non-opaque swapchain compositeAlpha at xrCreateSession and it
+ * CANNOT be flipped afterwards, so the capability is always on and Ctrl+T only
+ * changes what the app draws. Opaque mode writes alpha = 1 everywhere, which a
+ * PRE_MULTIPLIED surface shows exactly as before. Transparent mode clears to
+ * alpha 0, skips the skybox, and punches the window through to the desktop with
+ * an XShape ShapeInput region built from the frame's own rendered alpha
+ * (linux/clickthrough.cpp — the X11 analogue of the Windows SetWindowRgn
+ * punch). A compositing WM must be running for the desktop to show through.
+ *   MODEL_TRANSPARENT=1 (or --transparent) starts transparent instead of opaque.
+ *   MODEL_TRANSPARENT=0 opts out of the capability entirely — opaque root
+ *   visual, transparentBackgroundEnabled = XR_FALSE, Ctrl+T reports and no-ops.
+ *   That is the exact pre-transparency behaviour, kept as an escape hatch.
+ *
  * NOT PORTED from the Windows leg (see the repo CLAUDE.md for why): the HUD /
- * button bar / toasts (Direct2D + DirectWrite), transparent-background mode
- * and its shaped punch-through, the capture flash overlay, drag-and-drop,
- * the displayxr-view: protocol handler and the --src URL download.
+ * button bar / toasts (Direct2D + DirectWrite), the capture flash overlay,
+ * drag-and-drop, the displayxr-view: protocol handler and the --src URL
+ * download.
  */
 
 #include <vulkan/vulkan.h>
@@ -102,6 +119,7 @@
 #include "mode_switch.h"       // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (V / 0-8)
 #include "rig_mode.h"          // dxr::RigResetToInitial / RigToggleMode — SPACE + C
 #include "dxr_view_math.h"     // dxr_rig_max_ipd_factor — camera-rig IPD comfort ceiling
+#include "clickthrough.h"      // XShape input-region punch-through (Ctrl+T transparent mode)
 
 // ============================================================================
 // Logging
@@ -127,6 +145,28 @@ static volatile bool g_running = true;
 static ModelRenderer g_modelRenderer;
 static std::string g_loadedFileName;
 static uint32_t g_windowW = 1280, g_windowH = 720;
+
+// ----------------------------------------------------------------------------
+// Transparent background (Ctrl+T) — the Windows leg's g_transparentBg, with
+// the two-flag split collapsed to one because X11 needs no style swap.
+//
+// On Windows, Ctrl+T ALSO flips the window between WS_OVERLAPPEDWINDOW and
+// WS_POPUP+topmost, because a shaped WS_EX_NOREDIRECTIONBITMAP window cannot
+// paint an OS frame. This window is already undecorated and client-dragged in
+// every mode (the drag phase snap needs that — see the header block), so there
+// is no style to swap and no second flag: the only structural side effect of
+// Ctrl+T here is the XShape input region, plus _NET_WM_STATE_ABOVE to mirror
+// the Windows HWND_TOPMOST / HWND_NOTOPMOST behaviour.
+//
+// g_transparentCapable is fixed at startup: the ARGB visual is chosen at
+// XCreateWindow and transparentBackgroundEnabled at xrCreateSession, and
+// NEITHER can be changed live. Drawing a transparent frame into an opaque
+// session gives BLACK where the desktop should be, not see-through — so when
+// the capability is off, Ctrl+T must refuse rather than "work" and look broken.
+static bool g_transparentCapable = true;
+static bool g_transparentBg = false;
+static bool g_launchTransparent = false; //!< --transparent on the command line
+static Colormap g_argbColormap = 0;   //!< freed with the window; 0 = root visual
 
 // ----------------------------------------------------------------------------
 // Input state — the Linux transliteration of displayxr-common's InputState
@@ -168,6 +208,7 @@ struct InputState {
     bool playPauseRequested = false;            // K
     bool loadRequested = false;                 // Ctrl+O
     bool fullscreenToggleRequested = false;     // F11
+    bool transparentBgToggleRequested = false;  // Ctrl+T
     bool hudVisible = false;                    // TAB (no HUD on this leg yet — tracked only)
 
     uint32_t renderingModeCount = 0;
@@ -835,14 +876,24 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     xlibBinding.next = &vkBinding;
     xlibBinding.xDisplay = xr.xDisplay;
     xlibBinding.window = xr.xWindow;
-    xlibBinding.transparentBackgroundEnabled = XR_FALSE;
+    // Always-on transparent-window support when the window carries an ARGB
+    // visual, exactly as windows/xr_session.cpp sets it unconditionally: the
+    // runtime picks the swapchain's compositeAlpha here and cannot change it
+    // later, so Ctrl+T can only work if the session was created this way.
+    // Opaque mode then writes alpha = 1 throughout, which a PRE_MULTIPLIED
+    // surface composites identically to a non-transparent session.
+    xlibBinding.transparentBackgroundEnabled = g_transparentCapable ? XR_TRUE : XR_FALSE;
     const bool useAppWindow = (xr.xDisplay != nullptr && xr.xWindow != 0);
 
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
     si.next = useAppWindow ? (const void*)&xlibBinding : (const void*)&vkBinding;
     si.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
-    LOG_INFO("Session created (%s)", useAppWindow ? "app-owned window, handle app" : "hosted-NULL");
+    LOG_INFO("Session created (%s%s)", useAppWindow ? "app-owned window, handle app" : "hosted-NULL",
+             (useAppWindow && g_transparentCapable)
+                 ? (g_transparentBg ? ", transparent-capable — starting TRANSPARENT"
+                                    : ", transparent-capable — starting opaque (Ctrl+T toggles)")
+                 : ", opaque only (no Ctrl+T)");
 
     // Drag-time window-origin phase snap (runtime#1588). Resolved here and
     // used by the client-owned RMB drag; identity when the runtime does not
@@ -929,7 +980,13 @@ static bool CreateSwapchains(AppXrSession& xr) {
     }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    // TRANSFER_SRC is what lets the click-through pass downscale-blit the
+    // frame's own alpha out of the atlas (linux/clickthrough.cpp) instead of
+    // re-rendering the model into a scratch raster. The compositor happens to
+    // add this bit unconditionally today (comp_swapchain.c), but relying on
+    // that would be relying on someone else's implementation detail.
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
     sci.format = selectedFmt;
     sci.sampleCount = 1;
     sci.width = w; sci.height = h;
@@ -1023,6 +1080,7 @@ static void CleanupOpenXR(AppXrSession& xr) {
 //! ordering contract as the runtime's DxrLinuxWindow (destroy() LAST).
 static void DestroyAppWindow(AppXrSession& xr) {
     if (xr.xWindow != 0 && xr.xDisplay != nullptr) XDestroyWindow(xr.xDisplay, xr.xWindow);
+    if (g_argbColormap != 0 && xr.xDisplay != nullptr) { XFreeColormap(xr.xDisplay, g_argbColormap); g_argbColormap = 0; }
     if (xr.xDisplay != nullptr) XCloseDisplay(xr.xDisplay);
     xr.xWindow = 0;
     xr.xDisplay = nullptr;
@@ -1242,8 +1300,34 @@ static bool CreateAppWindow(AppXrSession& xr) {
     int screen = DefaultScreen(dpy);
     Window root = RootWindow(dpy, screen);
 
+    // Transparent-background capability (Ctrl+T). The visual is fixed for the
+    // window's whole life, so it has to be decided HERE, before the session
+    // exists — a depth-32 TrueColor visual is what lets the runtime's
+    // swapchain advertise a non-opaque compositeAlpha and a compositing WM
+    // blend us over the desktop. A window whose depth differs from its
+    // parent's must carry its own colormap AND an explicit border pixel or X
+    // raises BadMatch, so both go in the attribute mask.
+    //
+    // Diverges from the avatar deliberately: the avatar abandons the
+    // app-owned window entirely (falls back to hosted-NULL) when there is no
+    // ARGB visual. This leg keeps the handle-app path — which is what weaves
+    // window-relative, and what was hardware-validated — and just loses
+    // transparency.
+    XVisualInfo vinfo = {};
+    bool haveArgb = false;
+    if (g_transparentCapable) {
+        haveArgb = XMatchVisualInfo(dpy, screen, 32, TrueColor, &vinfo) != 0;
+        if (!haveArgb) {
+            LOG_WARN("No 32-bit ARGB visual on this screen — transparent background "
+                     "(Ctrl+T) is unavailable; continuing opaque on the root visual");
+            g_transparentCapable = false;
+            g_transparentBg = false;
+        }
+    }
+
     XSetWindowAttributes attrs = {};
-    attrs.background_pixel = BlackPixel(dpy, screen);
+    attrs.background_pixel = haveArgb ? 0UL : BlackPixel(dpy, screen);
+    attrs.border_pixel = 0;
     // Button + motion events are what the LMB orbit, the wheel and the
     // client-owned RMB window drag all run on. Selecting only
     // StructureNotify|KeyPress is why nothing was clickable before this pass.
@@ -1314,10 +1398,22 @@ static bool CreateAppWindow(AppXrSession& xr) {
     g_clientOwnedDrag = !wantFullscreen && !wmDrag;
     g_windowIsFullscreen = wantFullscreen;
 
-    Window win = XCreateWindow(dpy, root, px, py, w, h, 0, CopyFromParent, InputOutput,
-                               CopyFromParent, CWBackPixel | CWEventMask, &attrs);
+    int depth = CopyFromParent;
+    Visual* visual = CopyFromParent;
+    unsigned long attrMask = CWBackPixel | CWBorderPixel | CWEventMask;
+    if (haveArgb) {
+        g_argbColormap = XCreateColormap(dpy, root, vinfo.visual, AllocNone);
+        attrs.colormap = g_argbColormap;
+        attrMask |= CWColormap;
+        depth = 32;
+        visual = vinfo.visual;
+    }
+
+    Window win = XCreateWindow(dpy, root, px, py, w, h, 0, depth, InputOutput,
+                               visual, attrMask, &attrs);
     if (win == 0) {
         LOG_ERROR("XCreateWindow failed — using hosted-NULL windowing");
+        if (g_argbColormap != 0) { XFreeColormap(dpy, g_argbColormap); g_argbColormap = 0; }
         XCloseDisplay(dpy);
         return false;
     }
@@ -1406,12 +1502,29 @@ static bool CreateAppWindow(AppXrSession& xr) {
         }
     }
 
-    LOG_INFO("Created %ux%u app window at root (%d,%d) — XR_DXR_xlib_window_binding, %s",
-             w, h, g_dragAtX, g_dragAtY,
+    LOG_INFO("Created %ux%u %s app window at root (%d,%d) — XR_DXR_xlib_window_binding, %s",
+             w, h, haveArgb ? "32-bit ARGB" : "opaque",
+             g_dragAtX, g_dragAtY,
              wantFullscreen ? "fullscreen on the panel (no drag)"
                             : (g_clientOwnedDrag ? "undecorated + client-owned RMB drag (phase-snapped)"
                                                  : "decorated, WM-dragged (DXR_X11_WM_DECORATIONS — no phase snap)"));
     return true;
+}
+
+//! _NET_WM_STATE_ABOVE, the X11 analogue of the Windows leg's
+//! HWND_TOPMOST/HWND_NOTOPMOST flip on Ctrl+T: a transparent overlay floats
+//! over other apps so a click punched through to a window behind activates it
+//! without burying the model. Best-effort — a WM that ignores the hint just
+//! leaves the window in its normal z-band.
+static void X11SetAboveState(Display* dpy, Window win, bool above) {
+    if (dpy == nullptr || win == 0) return;
+    Atom wmState = XInternAtom(dpy, "_NET_WM_STATE", False);
+    Atom aboveAtom = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
+    if (wmState == None || aboveAtom == None) return;
+    X11SendRootMessage(dpy, win, wmState,
+                       above ? 1 /* _NET_WM_STATE_ADD */ : 0 /* _NET_WM_STATE_REMOVE */,
+                       (long)aboveAtom, 0, 1 /* source: normal application */, 0);
+    XFlush(dpy);
 }
 
 // ============================================================================
@@ -1725,6 +1838,15 @@ static void PumpXEvents(AppXrSession& xr) {
             // Ctrl+O = open a model (uniform across demos + platforms, incl.
             // the mediaplayer). Strict: Ctrl must be held.
             if ((sym == XK_o || sym == XK_O) && ctrl) { StartFilePicker(); break; }
+            // Ctrl+T = transparent background. Must be checked BEFORE the bare
+            // switch below or plain-T (eye-tracking mode) swallows it — the
+            // same ordering displayxr-common's input_handler.cpp uses on
+            // Windows. A request flag, not a direct flip: the render loop stays
+            // the single owner of the transition, as on Windows.
+            if ((sym == XK_t || sym == XK_T) && ctrl) {
+                g_input.transparentBgToggleRequested = true;
+                break;
+            }
 
             switch (sym) {
             // Movement (held)
@@ -1975,6 +2097,32 @@ static void PumpXEvents(AppXrSession& xr) {
         g_input.fullscreenToggleRequested = false;
         ToggleFullscreen(xr);
     }
+
+    if (g_input.transparentBgToggleRequested) {
+        g_input.transparentBgToggleRequested = false;
+        if (!g_transparentCapable) {
+            // Refuse loudly. The session's transparency was fixed at
+            // xrCreateSession; flipping the flag now would clear to alpha 0
+            // into an OPAQUE surface, i.e. a black window, not a see-through
+            // one. Better an explanation than a convincing-looking bug.
+            LOG_WARN("Ctrl+T ignored — this session is not transparent-capable "
+                     "(MODEL_TRANSPARENT=0, no 32-bit ARGB visual, or hosted-NULL). "
+                     "Restart without MODEL_TRANSPARENT=0 to enable it.");
+        } else {
+            g_transparentBg = !g_transparentBg;
+            LOG_INFO("Transparent background: %s (Ctrl+T)", g_transparentBg ? "ON" : "OFF");
+            // Windows parity: transparent floats above other apps, opaque
+            // returns to the normal z-band (kBorderlessMsg's HWND_TOPMOST /
+            // HWND_NOTOPMOST). Skipped while fullscreen, where the WM already
+            // owns the stacking.
+            if (!g_windowIsFullscreen) {
+                X11SetAboveState(xr.xDisplay, xr.xWindow, g_transparentBg);
+            }
+            // The input shape itself is re-applied (or dropped) by
+            // ClickthroughUpdate on the next frame, which is also the only
+            // place that calls XShape — one owner, as on Windows.
+        }
+    }
 }
 
 // ============================================================================
@@ -2062,6 +2210,72 @@ static std::string MakeCaptureAtlasPrefix(const std::string& stem, uint32_t cols
     return dir + "/" + stem;
 }
 
+// ============================================================================
+// Placeholder clear — the "no model loaded yet" frame
+// ============================================================================
+// ModelRenderer::renderEye is the only thing that writes the atlas, and it is
+// skipped when nothing is loaded, so without this the swapchain shows stale
+// content. That was survivable while this leg was opaque-only; in transparent
+// mode it would park a dark rectangle on the desktop for as long as no model
+// is loaded, and the click-through region (derived from the atlas alpha) would
+// be built from garbage. windows/main.cpp:2393 does exactly this, for exactly
+// this reason.
+static VkCommandPool g_clearPool = VK_NULL_HANDLE;
+
+static void ClearAtlasImage(VkDevice dev, VkQueue queue, uint32_t queueFamily,
+                            VkImage image, bool transparent) {
+    if (dev == VK_NULL_HANDLE || image == VK_NULL_HANDLE) return;
+    if (g_clearPool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = queueFamily;
+        if (vkCreateCommandPool(dev, &pci, nullptr, &g_clearPool) != VK_SUCCESS) return;
+    }
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = g_clearPool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(dev, &ai, &cmd) != VK_SUCCESS) return;
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = range;
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+
+    // Fully transparent in transparent mode (the desktop shows through while
+    // the user is still picking a file); the viewer's usual slate otherwise.
+    VkClearColorValue color = transparent ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
+                                          : VkClearColorValue{{0.1f, 0.1f, 0.12f, 1.0f}};
+    vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(dev, g_clearPool, 1, &cmd);
+}
+
 static void SignalHandler(int) { g_running = false; }
 
 // ============================================================================
@@ -2104,7 +2318,11 @@ int main(int argc, char** argv) {
             else
                 cliModelPath = la.src;
         }
-        if (la.transparent) LOG_WARN("launch: --transparent has no Linux path yet — ignored");
+        // --transparent: start in transparent mode (the undock contract's
+        // flag). On Windows it also creates the window borderless + topmost
+        // from frame 0; this window is borderless in every mode already, and
+        // _NET_WM_STATE_ABOVE is applied once the window exists (below).
+        if (la.transparent) { g_launchTransparent = true; LOG_INFO("launch: --transparent"); }
         if (la.hasRect) LOG_WARN("launch: --rect has no Linux path yet — use MODEL_WINDOW=\"WxH+X+Y\"");
         if (la.hasPose) LOG_WARN("launch: --pose has no Linux path yet — ignored");
     }
@@ -2125,7 +2343,32 @@ int main(int argc, char** argv) {
     // Handle app: own an X11 window on the 3D panel (display_info queried in
     // InitializeOpenXR gives the panel rect). Falls back to hosted-NULL when
     // no X server is available (also the CI-safe path — CI never runs this).
+    // MODEL_TRANSPARENT — the analogue of the avatar's AVATAR_TRANSPARENT,
+    // named after this leg's MODEL_WINDOW. Unlike the avatar (an overlay by
+    // nature, transparent by default) the model viewer starts OPAQUE, as the
+    // Windows leg does:
+    //   unset / empty  transparent-capable, start opaque, Ctrl+T toggles
+    //   1 (non-zero)   transparent-capable, start transparent (= --transparent)
+    //   0              NOT capable: opaque root visual, transparentBackground-
+    //                  Enabled = XR_FALSE — the pre-transparency behaviour.
+    {
+        const char* te = getenv("MODEL_TRANSPARENT");
+        if (te != nullptr && te[0] == '0') {
+            g_transparentCapable = false;
+            if (g_launchTransparent) LOG_WARN("launch: --transparent overridden by MODEL_TRANSPARENT=0");
+            LOG_INFO("MODEL_TRANSPARENT=0 — transparent background disabled for this session");
+        } else if ((te != nullptr && te[0] != '\0') || g_launchTransparent) {
+            g_transparentBg = true;
+        }
+    }
     CreateAppWindow(xr);
+    if (xr.xDisplay == nullptr) {
+        // hosted-NULL: the runtime owns the window; no ARGB visual, no shape.
+        g_transparentCapable = false;
+        g_transparentBg = false;
+    } else if (g_transparentBg && !g_windowIsFullscreen) {
+        X11SetAboveState(xr.xDisplay, xr.xWindow, true);
+    }
 
     if (!GetVulkanGraphicsRequirements(xr)) { CleanupOpenXR(xr); DestroyAppWindow(xr); return 1; }
 
@@ -2485,14 +2728,19 @@ int main(int argc, char** argv) {
                         pv.fov = hasKooima ? eyeViews[eye].fov : views[srcView].fov;
                     }
 
+                    const VkImage targetImage = swapchainImages[imageIndex].image;
+                    const VkFormat swapFormat = (VkFormat)xr.swapchain.format;
+                    if (!g_modelRenderer.hasModel()) {
+                        ClearAtlasImage(vkDevice, graphicsQueue, queueFamilyIndex,
+                                        targetImage, g_transparentBg);
+                    }
                     if (g_modelRenderer.hasModel()) {
-                        VkImage targetImage = swapchainImages[imageIndex].image;
-                        VkFormat swapFormat = (VkFormat)xr.swapchain.format;
                         for (int eye = 0; eye < eyeCount; eye++)
                             g_modelRenderer.renderEye(targetImage, swapFormat,
                                 xr.swapchain.width, xr.swapchain.height,
                                 tileOffsets[eye].first, tileOffsets[eye].second,
-                                renderW, renderH, viewMat[eye].data(), projMat[eye].data());
+                                renderW, renderH, viewMat[eye].data(), projMat[eye].data(),
+                                g_transparentBg);
                     }
                     // 'I' — snapshot the multi-view atlas. Runtime-owned
                     // readback via xrCaptureAtlasDXR (no app-side staging
@@ -2527,6 +2775,52 @@ int main(int argc, char** argv) {
                         }
                     }
 
+                    // Click-through punch (Ctrl+T). Must run BEFORE the
+                    // release — it reads the atlas the frame just rendered and
+                    // hands it back in COLOR_ATTACHMENT_OPTIMAL, which is the
+                    // layout the runtime expects at xrReleaseSwapchainImage.
+                    // Same placement as windows/main.cpp:3439.
+                    if (xr.xDisplay != nullptr && xr.xWindow != 0) {
+                        // LIVE client rect, queried once a frame. xr.xWinW/H
+                        // track ConfigureNotify, but the runtime can move or
+                        // resize a bound window without one, and a stale rect
+                        // puts the input region in the wrong place.
+                        unsigned int winPxW = xr.xWinW, winPxH = xr.xWinH;
+                        {
+                            Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
+                            if (XGetGeometry(xr.xDisplay, xr.xWindow, &gRoot, &gx, &gy,
+                                             &gw, &gh, &gbw, &gd) && gw > 0 && gh > 0) {
+                                winPxW = gw; winPxH = gh;
+                            }
+                        }
+                        const uint32_t lastEye = (uint32_t)(eyeCount - 1);
+                        ClickthroughParams cp;
+                        cp.dev = vkDevice;
+                        cp.phys = physDevice;
+                        cp.queue = graphicsQueue;
+                        cp.queueFamily = queueFamilyIndex;
+                        cp.viewImage = targetImage;
+                        cp.viewFormat = swapFormat;
+                        cp.tileW = renderW;
+                        cp.tileH = renderH;
+                        cp.firstTileX = tileOffsets[0].first;
+                        cp.firstTileY = tileOffsets[0].second;
+                        cp.lastTileX = tileOffsets[lastEye].first;
+                        cp.lastTileY = tileOffsets[lastEye].second;
+                        cp.twoViews = eyeCount > 1;
+                        cp.dpy = xr.xDisplay;
+                        cp.win = xr.xWindow;
+                        cp.winW = winPxW;
+                        cp.winH = winPxH;
+                        cp.transparentBg = g_transparentBg;
+                        // A WM-decorated window (DXR_X11_WM_DECORATIONS=1) or
+                        // a fullscreen one is never shaped: the frame needs the
+                        // whole window for move/resize, and a fullscreen
+                        // overlay has no desktop beside it to click through to.
+                        cp.decorated = !g_clientOwnedDrag || g_windowIsFullscreen;
+                        ClickthroughUpdate(cp);
+                    }
+
                     ReleaseSwapchainImage(xr);
                 }
             }
@@ -2546,6 +2840,10 @@ int main(int argc, char** argv) {
 
     g_modelRenderer.cleanup();
     if (vkDevice) vkDeviceWaitIdle(vkDevice);
+    if (vkDevice) {
+        ClickthroughDestroy(vkDevice);
+        if (g_clearPool != VK_NULL_HANDLE) { vkDestroyCommandPool(vkDevice, g_clearPool, nullptr); g_clearPool = VK_NULL_HANDLE; }
+    }
     CleanupOpenXR(xr);
     if (vkDevice) vkDestroyDevice(vkDevice, nullptr);
     if (vkInstance) vkDestroyInstance(vkInstance, nullptr);
