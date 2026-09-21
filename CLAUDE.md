@@ -29,10 +29,12 @@ Apps load the runtime via the registry-resolved manifest (no `XR_RUNTIME_JSON`).
 ## Architecture
 
 ```
-windows/main.cpp, macos/main.mm  — platform entry: window, OpenXR session,
-                                    input/HUD, per-frame view/projection, atlas
-                                    capture ('I'), file load (Ctrl+O / drag-drop --
-                                    drag-drop is Windows + macOS, not Linux)
+windows/main.cpp, macos/main.mm,  — platform entry: window, OpenXR session,
+linux/main.cpp                      input (+HUD on Win/macOS), per-frame
+                                    view/projection, atlas capture ('I'), file
+                                    load (Ctrl+O / drag-drop -- drag-drop is
+                                    Windows + macOS, not Linux; the Linux leg
+                                    also owns its window drag, see Build/Linux)
 model_common/                     — the renderer (vendor-neutral, analog of
                                     3dgs_common in the gaussiansplat demo):
   model_loader.{h,cpp}            — format dispatcher (by extension) + path
@@ -163,19 +165,58 @@ Vulkan/MoltenVK via brew). Run via **`./scripts/run_macos_dev.sh`**, not the
 bare binary (the dev launcher aligns the app + runtime on one Vulkan loader).
 `./scripts/build_macos.sh --installer` builds the `.pkg`.
 
-### Linux (local dev — build-green only)
+### Linux (local dev — runs on real hardware)
 `./scripts/build_linux.sh` builds `build/linux/model_viewer_handle_vk_linux`
 (system Vulkan via `libvulkan-dev`, OpenXR loader built from source pinned to
-release **1.1.43** — do NOT bump). The Linux entry point (`linux/main.cpp`) is
-**hosted-NULL**: it passes no window binding, so the runtime self-creates the
-presentation window (the faithful `XR_DXR_xlib_window_binding` arm is
-Phase-3b/hardware-gated — see the TODO in `linux/main.cpp` + `PORTING.md`). This
-is **build-green only** (compile on CI; the app is not run — no GPU/display).
+release **1.1.43** — do NOT bump). The Linux entry point (`linux/main.cpp`) is a
+**HANDLE app**: it creates its own X11 toplevel on the 3D panel and passes it
+via `XR_DXR_xlib_window_binding`, so the runtime weaves window-relative.
+(Hosted-NULL survives only as the no-X-server fallback, which is what keeps the
+target compiling and startable on a headless CI runner.) First validated on
+real hardware 2026-09-20: Acer SpatialLabs DS1 on Ubuntu 26.04 / GNOME Wayland,
+the app running as an X11/XWayland client — it renders and weaves.
 `linux/stb_image_impl_linux.cpp` supplies the single `STB_IMAGE_IMPLEMENTATION`
 TU (displayxr::common only ships it for Win/macOS). Dev run (needs a Linux
 runtime + GPU + X server): `build/linux/run_modelviewer_linux.sh`. CI:
 `.github/workflows/build-linux.yml` (dispatch + `linux*` branches only —
 non-required until reliably green).
+
+**Input parity with Windows, and the two places it deliberately diverges.**
+The Linux leg transliterates `windows/main.cpp` plus displayxr-common's
+`input_handler.cpp` (which is `<windows.h>`-gated and cannot be linked here),
+sensitivities and clamps included — LMB-drag orbit at 0.005 rad/px with the
+±1.4 rad pitch clamp, double-click focus, wheel zoom with the Shift/Ctrl/Alt
+variants, WASDEQ, SPACE, C, V, 0-8, T, I, M, N, K, L, G, `[`/`]`, `-`/`=`,
+Ctrl+O, F11, P-then-X/Y/Z, ESC. Two divergences, both forced by X11:
+
+1. **RMB drags the window** (Windows reserves RMB for the borderless overlay
+   and gets its window move from the title bar). A windowed 3D app has to keep
+   the woven interlace phase invariant while it moves, Windows gets that from
+   the OS modal move loop (the DP hooks `WM_WINDOWPOSCHANGING`), and X11 offers
+   the client no equivalent hook — a mutter `_NET_WM_MOVERESIZE` grab cannot be
+   intercepted. So the window goes undecorated and the app owns the drag,
+   routing every step through `xrWeaveSnapWindowRectDXR` (INV-1.3, runtime
+   #1588). That leaves no title bar to aim at, and LMB is spoken for by the
+   orbit, so RMB moves the window — the same convention `dxr::RmbWindowDrag`
+   uses for the Windows borderless overlay. `DXR_X11_WM_DECORATIONS=1` restores
+   a decorated, WM-dragged window and gives up the phase snap;
+   `DXR_X11_TEST_DRAG="dx,dy,steps"` walks the window through the identical
+   snap path with nobody at the mouse.
+   **`XR_DXR_weave` is strictly optional here:** the entry point is resolved at
+   runtime and desktop Linux does not serve it yet (runtime#1588 / PR#1592 is
+   unmerged), in which case the app logs one line and drags unsnapped.
+2. **No HUD, no toasts, no button bar.** `HudRenderer` is a Direct2D +
+   DirectWrite rasterizer; there is no Linux backend. Every state change that
+   would have been a toast is a `LOG_INFO` line instead. TAB tracks a
+   `hudVisible` flag that nothing draws yet.
+
+Also absent on Linux, and not planned in this pass: transparent-background mode
+(Ctrl+T) and its shaped punch-through, the capture-flash overlay, drag-and-drop
+(XDND), the `displayxr-view:` protocol handler, and the `--src` URL download.
+The positional model path and `--vh` DO work (`dxr::ParseLaunchArgs`); the other
+launch flags are parsed and reported as unsupported rather than ignored
+silently. Note `launch_args.h` must be included **before** the X11 headers —
+`<X11/X.h>` `#define`s `None`, which mangles `dxr::LaunchSrcKind::None`.
 
 ### CI (`.github/workflows/`)
 `build-windows.yml` + `build-macos.yml` run on **`pull_request` + push to main**
