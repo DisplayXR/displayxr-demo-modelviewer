@@ -63,9 +63,19 @@ if(NOT OPENXR_FOUND)
                         "-DCMAKE_PREFIX_PATH=<install> (scripts/build_linux.sh does this).")
 endif()
 
+# stb_truetype for the client-side header bar's title (csd_titlebar.cpp).
+# displayxr::common ships stb_image{,_write}.h but not stb_truetype.h. Pinned to
+# the commit the avatar demo's Linux leg builds and runs with, not `master`.
+include(FetchContent)
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        2c980bb59875b0d32144a71867fbdebb2f77cd20)
+FetchContent_MakeAvailable(stb)
+
 add_executable(model_viewer_handle_vk_linux
     main.cpp
     clickthrough.cpp    # XShape input-region punch-through (Ctrl+T transparent mode)
+    csd_titlebar.cpp    # client-side header bar (app-owned, phase-snappable drag)
     # The single stb_image implementation TU (displayxr::common only ships it
     # for Win/macOS; the model_common loaders take declarations only).
     stb_image_impl_linux.cpp
@@ -75,6 +85,7 @@ target_include_directories(model_viewer_handle_vk_linux PRIVATE
     ${CMAKE_SOURCE_DIR}/openxr_includes
     ${CMAKE_SOURCE_DIR}/common
     ${CMAKE_SOURCE_DIR}/model_common
+    ${stb_SOURCE_DIR}
 )
 
 target_link_libraries(model_viewer_handle_vk_linux PRIVATE

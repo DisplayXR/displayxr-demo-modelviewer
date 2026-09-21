@@ -95,9 +95,21 @@ struct ClickthroughParams {
 	bool twoViews = false;
 
 	Display *dpy = nullptr;
+	//! The TOP-LEVEL window: the one the WM and XWayland hit-test, so the one
+	//! that carries the input shape. When the content is a child window (the
+	//! client-side-decorations layout) its own input region is left at the
+	//! default full rect — the server never descends into a child at a point
+	//! outside the PARENT's input shape, so shaping the parent alone gates both.
 	Window win = 0;
-	uint32_t winW = 0; //!< live client width in px (XGetGeometry, not the cached create size)
-	uint32_t winH = 0; //!< live client height in px
+	//! Live CONTENT size in px — the area the view tiles map onto (the bound
+	//! content child's XGetGeometry, not a cached create size).
+	uint32_t winW = 0;
+	uint32_t winH = 0;
+	//! Where the content sits inside @ref win (the header bar's height when
+	//! one is shown, else 0). Silhouette rects are offset by it; chrome rects
+	//! are already in top-level px.
+	int32_t contentOffsetX = 0;
+	int32_t contentOffsetY = 0;
 
 	//! Ctrl+T state. An opaque frame covers every pixel of the window, so the
 	//! whole window must stay interactive.
@@ -106,7 +118,7 @@ struct ClickthroughParams {
 	//! the WM frame needs the whole window for move/resize.
 	bool decorated = false;
 
-	//! App-drawn chrome in CLIENT px (the client-side title bar), unioned into
+	//! App-drawn chrome in TOP-LEVEL px (the client-side title bar), unioned into
 	//! the region so it stays clickable over a punched-through background.
 	const XRectangle *chrome = nullptr;
 	uint32_t chromeCount = 0;
