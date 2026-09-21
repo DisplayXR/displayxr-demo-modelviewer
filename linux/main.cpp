@@ -114,7 +114,7 @@
 #include <unistd.h>
 
 #include "view_params.h"
-#include "../common/dxr_view_config.h" // DxrSelectViewConfigType — PRIMARY_MULTIVIEW_DXR opt-in (#1486/#1500)
+#include "dxr_view_config.h" // displayxr-common: DxrSelectViewConfigType (#1486/#1500) + DxrAliasInactiveViews (ADR-041)
 #include "display3d_view.h"
 #include "projection_depth.h"
 #include "model_renderer.h"
@@ -2935,7 +2935,14 @@ int main(int argc, char** argv) {
                 uint32_t imageIndex;
                 if (AcquireSwapchainImage(xr, imageIndex)) {
                     rendered = true;
-                    projectionViews.assign((size_t)eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                    // ADR-041 (runtime #1612): the layer carries EVERY located
+                    // view; only [0, eyeCount) are rendered (1 in a 2D mode) and
+                    // the tail is aliased onto view 0 after the loop below. Under
+                    // PRIMARY_MULTIVIEW_DXR xrEndFrame rejects a shorter layer —
+                    // the panel then froze on the last 3D frame.
+                    const uint32_t locatedViewCount =
+                        (runtimeViewCount > (uint32_t)eyeCount) ? runtimeViewCount : (uint32_t)eyeCount;
+                    projectionViews.assign((size_t)locatedViewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
                     std::vector<std::array<float,16>> viewMat((size_t)eyeCount), projMat((size_t)eyeCount);
                     std::vector<std::pair<uint32_t,uint32_t>> tileOffsets((size_t)eyeCount);
                     for (int eye = 0; eye < eyeCount; eye++) {
@@ -2962,6 +2969,9 @@ int main(int argc, char** argv) {
                         pv.pose = views[srcView].pose;
                         pv.fov = hasKooima ? eyeViews[eye].fov : views[srcView].fov;
                     }
+                    // Inactive tail -> view 0's tile, own located pose/fov.
+                    DxrAliasInactiveViews(projectionViews.data(), views, locatedViewCount,
+                                          (uint32_t)eyeCount);
 
                     const VkImage targetImage = swapchainImages[imageIndex].image;
                     const VkFormat swapFormat = (VkFormat)xr.swapchain.format;

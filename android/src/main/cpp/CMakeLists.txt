@@ -46,6 +46,22 @@ FetchContent_Declare(stb
     GIT_TAG        master)
 FetchContent_MakeAvailable(stb)
 
+# ── displayxr-common (header-only rules: dxr_view_config.h) ───────────────
+# DxrSelectViewConfigType + DxrAliasInactiveViews (runtime #1486 / ADR-041)
+# come from displayxr-common — the ONE shared implementation every leg uses.
+# Sources only: don't run its CMake (the STATIC lib carries desktop platform
+# sources); the header-only common/ dir is appended LAST to the include path
+# so no local header is shadowed.
+# TODO(runtime #1612): TEMPORARY pin to displayxr-common PR #50's commit. Repin to the release tag that contains DxrAliasInactiveViews (and restore GIT_SHALLOW TRUE) BEFORE this PR merges.
+FetchContent_Declare(displayxr_common_rules
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG        7a5acac5b15b6826cd88aa9ef616a8b480270bed
+    GIT_SHALLOW    FALSE)
+FetchContent_GetProperties(displayxr_common_rules)
+if(NOT displayxr_common_rules_POPULATED)
+    FetchContent_Populate(displayxr_common_rules)
+endif()
+
 # ── PBR/IBL shaders → SPIR-V header arrays ────────────────────────────────
 # Compiled from the SHARED model_common/shaders. var name = <name>_<stage>_data,
 # header = <name>.<stage>.h (matches the #includes in model_renderer.cpp).
@@ -104,8 +120,8 @@ target_include_directories(model_viewer_vk_android PRIVATE
     ${tinygltf_SOURCE_DIR}                      # tiny_gltf.h + json.hpp + stb_image.h
     ${glm_SOURCE_DIR}                           # glm/ (header-only)
     ${stb_SOURCE_DIR}                           # stb_truetype.h (button bar)
-    ${REPO_ROOT}/common                         # dxr_view_config.h (app-side helpers)
-    ${REPO_ROOT}/openxr_includes)               # DisplayXR XR_EXT_* headers
+    ${REPO_ROOT}/openxr_includes                # DisplayXR XR_EXT_* headers
+    ${displayxr_common_rules_SOURCE_DIR}/common) # dxr_view_config.h (displayxr-common, LAST)
 
 set_target_properties(model_viewer_vk_android PROPERTIES
     LINK_FLAGS "-u ANativeActivity_onCreate")
