@@ -112,3 +112,10 @@ if(EXISTS "${MATERIAL_GRID}")
         COMMENT "Copying material_grid.glb next to exe"
     )
 endif()
+
+# Copy the DisplayXR workspace sidecar (.displayxr.json + icons) next to the
+# exe so a workspace launcher / packager can discover it (INV-9.1). Same
+# treatment the Windows leg gets; the file is a plain sidecar, so it is
+# harmless on a box with no workspace controller.
+displayxr_install_manifest(model_viewer_handle_vk_linux
+    "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")
