@@ -36,8 +36,9 @@
  * X11 only reports the result afterwards), so the app owns the drag itself,
  * routing every step through xrWeaveSnapWindowRectDXR (XR_DXR_weave). That
  * rules out SERVER-side decorations, not decorations: the window carries a
- * CLIENT-side GNOME-style header bar (linux/csd_titlebar.{h,cpp}) — LMB on the
- * bar drags through the same snapped path, with close and minimize buttons —
+ * CLIENT-side GNOME-style header bar (displayxr-common's displayxr::csd,
+ * glued to X11 by linux/csd_titlebar_x11.{h,cpp}) — translucent with rounded
+ * corners on the ARGB visual — LMB on the bar drags through the same snapped path, with close and minimize buttons —
  * and RMB-drag anywhere still moves it too (useful when mostly transparent). That
  * extension is OPTIONAL and currently unserved on desktop Linux
  * (runtime#1588 / PR#1592): the entry point is resolved at runtime and, when
@@ -126,7 +127,7 @@
 #include "rig_mode.h"          // dxr::RigResetToInitial / RigToggleMode — SPACE + C
 #include "dxr_view_math.h"     // dxr_rig_max_ipd_factor — camera-rig IPD comfort ceiling
 #include "clickthrough.h"      // XShape input-region punch-through (Ctrl+T transparent mode)
-#include "csd_titlebar.h"      // client-side header bar (the app owns the drag -> phase snap)
+#include "csd_titlebar_x11.h" // shared client-side header bar (displayxr::csd) + its X11 glue
 
 // ============================================================================
 // Logging
@@ -176,7 +177,7 @@ static bool g_launchTransparent = false; //!< --transparent on the command line
 static Colormap g_argbColormap = 0;   //!< freed with the window; 0 = root visual
 static Visual* g_visual = nullptr;     //!< the top-level's visual (the header bar packs pixels for it)
 
-// Client-side decorations — see linux/csd_titlebar.h and the window-pair
+// Client-side decorations — see linux/csd_titlebar_x11.h and the window-pair
 // notes on AppXrSession::xContent.
 static dxr_csd::TitleBar g_titleBar;
 static bool g_csdEnabled = false;   // client-owned drag at create time (not WM-decorated, not fullscreen)
@@ -1116,7 +1117,7 @@ static void CleanupOpenXR(AppXrSession& xr) {
 //! closing the Display before vkDestroyInstance is a use-after-free. Same
 //! ordering contract as the runtime's DxrLinuxWindow (destroy() LAST).
 static void DestroyAppWindow(AppXrSession& xr) {
-    g_titleBar.release(xr.xDisplay);
+    dxr_csd_x11::Release(xr.xDisplay);
     if (xr.xWindow != 0 && xr.xDisplay != nullptr) XDestroyWindow(xr.xDisplay, xr.xWindow);
     if (g_argbColormap != 0 && xr.xDisplay != nullptr) { XFreeColormap(xr.xDisplay, g_argbColormap); g_argbColormap = 0; }
     if (xr.xDisplay != nullptr) XCloseDisplay(xr.xDisplay);
@@ -1440,7 +1441,7 @@ static bool CreateAppWindow(AppXrSession& xr) {
     g_clientOwnedDrag = !wantFullscreen && !wmDrag;
     g_windowIsFullscreen = wantFullscreen;
 
-    // Client-side decorations (csd_titlebar.h): only on a windowed,
+    // Client-side decorations (csd_titlebar_x11.h): only on a windowed,
     // client-dragged window. The bar's height depends on the desktop scale, so
     // it is known before anything is created. w x h and (px, py) above are the
     // CONTENT rect — what the runtime will see — and the top-level grows UP by
@@ -1449,8 +1450,17 @@ static bool CreateAppWindow(AppXrSession& xr) {
     g_csdEnabled = g_clientOwnedDrag;
     uint32_t barH = 0;
     if (g_csdEnabled) {
-        g_titleBar.configure(dpy);
+        g_titleBar.configure(dxr_csd_x11::DesktopScale(dpy));
+        // Translucent + rounded only where the alpha is real (32-bit ARGB
+        // visual, composited); an opaque visual gets an opaque, square bar.
+        g_titleBar.setSurfaceHasAlpha(haveArgb);
+        // X11 resize stays the WM's (Super+middle-drag); the bar is a drag
+        // handle and two buttons, as before.
+        g_titleBar.setResizable(false);
         barH = g_titleBar.height();
+        LOG_INFO("csd: header bar %u px (scale %.2f), %s, title font %s", barH, g_titleBar.scale(),
+                 haveArgb ? "translucent with rounded corners (ARGB visual)" : "opaque, square (no ARGB visual)",
+                 g_titleBar.fontPath().empty() ? "NONE (set DXR_CSD_FONT)" : g_titleBar.fontPath().c_str());
     }
     const unsigned int contentW = w, contentH = h;
     h = contentH + barH;
@@ -1866,9 +1876,9 @@ static void ApplyWheel(InputState& st, bool up, unsigned int mods) {
 // ============================================================================
 // Client-side decorations + the app-owned window drag
 // ============================================================================
-// The header bar (linux/csd_titlebar.{h,cpp}) exists so a visible, ordinary
+// The header bar (displayxr::csd + linux/csd_titlebar_x11.{h,cpp}) exists so a visible, ordinary
 // title bar can drive the SAME phase-snapped drag the RMB gesture uses. Read
-// csd_titlebar.h before touching this: X11 gives a client no hook into a
+// csd_titlebar_x11.h before touching this: X11 gives a client no hook into a
 // WM-owned move (Windows has WM_WINDOWPOSCHANGING; X11 only reports the result
 // afterwards via ConfigureNotify), which is why the decorations are ours.
 
@@ -2163,7 +2173,7 @@ static void PumpXEvents(AppXrSession& xr) {
                 const dxr_csd::Hit hit = g_titleBar.hitTest(ev.xbutton.x, ev.xbutton.y, xr.xWinW);
                 if (hit == dxr_csd::Hit::Drag) {
                     // Same snapped path as the RMB drag — this is the reason
-                    // the bar is client-side at all (csd_titlebar.h).
+                    // the bar is client-side at all (csd_titlebar_x11.h).
                     if (!g_testDragArmed && !g_dragging) {
                         BeginWindowDrag(xr, ev.xbutton.x_root, ev.xbutton.y_root, Button1);
                     }
@@ -2324,7 +2334,8 @@ static void PumpXEvents(AppXrSession& xr) {
         std::string title = "3D Model Viewer";
         if (!g_loadedFileName.empty()) title += " \u2014 " + g_loadedFileName;
         g_titleBar.setTitle(title);
-        if (g_titleBar.dirty()) g_titleBar.paint(xr.xDisplay, xr.xWindow, g_visual, xr.xWinW);
+        if (g_titleBar.dirty() || g_titleBar.renderedWidth() != xr.xWinW)
+            dxr_csd_x11::Paint(g_titleBar, xr.xDisplay, xr.xWindow, g_visual, xr.xWinW);
     }
 
     if (g_input.fullscreenToggleRequested) {
@@ -3070,7 +3081,7 @@ int main(int argc, char** argv) {
                         // The header bar is UNIONED into the input shape — it
                         // must stay clickable over a punched-through background
                         // (the avatar's un-unioned speech bubble was dead).
-                        XRectangle barRect = g_titleBar.rect(xr.xWinW);
+                        XRectangle barRect = dxr_csd_x11::BarRect(g_titleBar, xr.xWinW);
                         if (CsdVisible(xr)) { cp.chrome = &barRect; cp.chromeCount = 1; }
                         ClickthroughUpdate(cp);
                     }

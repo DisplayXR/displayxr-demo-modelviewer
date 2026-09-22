@@ -204,7 +204,12 @@ Ctrl+O, F11, P-then-X/Y/Z, ESC. Two divergences, both forced by X11:
    X11 has no equivalent — a WM-drawn title bar is mutter's, the drag runs in
    mutter's grab loop, and the client only learns the result via
    `ConfigureNotify` — and Wayland has no client positioning at all. So the
-   window draws its own GNOME-style header bar (`linux/csd_titlebar.{h,cpp}`):
+   window draws its own GNOME-style header bar. The bar is displayxr-common's
+   `displayxr::csd`, the ONE chrome implementation, shared with the runtime's
+   native-Wayland test-app leg (displayxr-common#52). This app keeps only the
+   X11 glue, in `linux/csd_titlebar_x11.{h,cpp}`. On the ARGB visual the bar is
+   translucent with rounded top corners; on an opaque visual it is opaque and
+   square. Never re-vendor the painter here:
    LMB on it drags through `xrWeaveSnapWindowRectDXR` (INV-1.3, runtime #1588),
    with minimize + close buttons; RMB-drag anywhere also moves the window (the
    `dxr::RmbWindowDrag` convention). **The bar is OUTSIDE the window the runtime

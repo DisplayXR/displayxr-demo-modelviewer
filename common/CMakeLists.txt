@@ -30,8 +30,10 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.15.0
-    GIT_SHALLOW TRUE
+    # TEMPORARY: displayxr-common feat/csd-titlebar head (displayxr-common#53),
+    # for displayxr::csd (the shared header bar, Linux leg). Replace with
+    # `GIT_TAG v2.17.0` + `GIT_SHALLOW TRUE` once that is tagged.
+    GIT_TAG 85c7cb3a71134e26447de7218449b890e53c31c7
 )
 FetchContent_MakeAvailable(displayxr_common)
 
