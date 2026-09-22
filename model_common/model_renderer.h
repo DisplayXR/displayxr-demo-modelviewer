@@ -604,7 +604,37 @@ private:
     // ── Pipeline ──────────────────────────────────────────────────────────
     VkDescriptorSetLayout dsLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    // Four raster variants of the SAME shaders (#99), chosen per primitive in
+    // renderEye's drawPrimitive(). The selectors are deliberately NOT in the
+    // UBO or the push block — that is the layout-drift hazard #81 was, and
+    // cull mode / winding are pipeline state anyway.
+    //   pipeline_            CULL_NONE, frontFace_   doubleSided, or cull off
+    //   pipelineCull_        CULL_BACK, frontFace_   single-sided (glTF default)
+    //   pipelineMirror_      CULL_NONE, flipped      node transform has det < 0
+    //   pipelineMirrorCull_  CULL_BACK, flipped      both
+    // glTF 3.7.4: a node whose world transform has a negative determinant
+    // reverses its primitives' winding, so the front face flips with it.
+    // Without the mirror pair, culling would delete a mirrored instance's
+    // visible faces, and even unculled, gl_FrontFacing would invert its
+    // normals. Skinned primitives are drawn with an identity model matrix and
+    // are never classed as mirrored.
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline pipelineCull_ = VK_NULL_HANDLE;
+    VkPipeline pipelineMirror_ = VK_NULL_HANDLE;
+    VkPipeline pipelineMirrorCull_ = VK_NULL_HANDLE;
+    // DXR_MODELVIEWER_CULL=0 (Android: debug.dxr.mv.cull 0) → every
+    // primitive CULL_NONE, the pre-#99 render. =all additionally culls
+    // transmissive single-sided materials; that exists to MEASURE whether the
+    // exemption below is load-bearing, not to ship.
+    bool cullSingleSided_ = true;
+    bool cullExemptTransmissive_ = true;
+    // A transmissive material's far interface is not hidden surface: the glass
+    // lobe shades what the viewer sees THROUGH the object, and transmission
+    // assets are routinely authored single-sided while meant to show both.
+    bool cullExempt(const ModelMaterial& m) const {
+        return cullExemptTransmissive_ &&
+               (m.transmissionFactor > 0.0f || m.volumeThickness > 0.0f);
+    }
     VkPipeline skyboxPipeline_ = VK_NULL_HANDLE;   // analytic-sky background (opaque mode)
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
