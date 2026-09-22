@@ -30,7 +30,9 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.15.0
+    # v2.17.0 ships displayxr::csd — the shared header bar the Linux leg draws
+    # with (displayxr-common#52/#53).
+    GIT_TAG v2.17.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
