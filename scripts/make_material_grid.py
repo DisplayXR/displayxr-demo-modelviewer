@@ -77,8 +77,15 @@ def uv_sphere(radius, lon, lat):
         for i in range(lon):
             a = j * (lon + 1) + i
             b = a + lon + 1
-            # CCW when viewed from outside, matching glTF's front-face winding.
-            idx += [a, b, a + 1, a + 1, b, b + 1]
+            # CCW seen from OUTSIDE, which is glTF's front face. a -> a+1 steps
+            # east (+phi), a -> b steps south (+theta); east x south points
+            # inward, so the outward-facing order is (a, a+1, b). This used
+            # to be (a, b, a+1) under the same comment claiming CCW, and every
+            # sphere this script emits came out wound against its own NORMALs
+            # (0% of triangles CCW-consistent). Invisible while the renderer
+            # was two-sided with a mis-set front face; it is what #87 measured
+            # and "fixed" by flipping the pipeline's winding instead (#98).
+            idx += [a, a + 1, b, a + 1, b + 1, b]
     return pos, nrm, uv, tan, idx
 
 

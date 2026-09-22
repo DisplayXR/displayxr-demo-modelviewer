@@ -12,6 +12,7 @@
  */
 
 #include "model_loader.h"
+#include "mv_log.h"
 #include "model_loader_backends.h"
 
 #include <algorithm>
@@ -64,9 +65,9 @@ bool model_loader_load(const char* path, ModelData& out) {
 #endif
         default:
 #if defined(__ANDROID__)
-            std::fprintf(stderr, "[model_loader] '%s': only glTF is supported on Android\n", path);
+            MV_ERR("[model_loader] '%s': only glTF is supported on Android\n", path);
 #else
-            std::fprintf(stderr, "[model_loader] '%s': unsupported format\n", path);
+            MV_ERR("[model_loader] '%s': unsupported format\n", path);
 #endif
             return false;
     }

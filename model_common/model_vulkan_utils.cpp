@@ -6,6 +6,7 @@
  */
 
 #include "model_vulkan_utils.h"
+#include "mv_log.h"
 #include <cstdio>
 #include <cstring>
 
@@ -21,7 +22,7 @@ uint32_t modelFindMemoryType(VkPhysicalDevice physDevice,
             return i;
         }
     }
-    fprintf(stderr, "model_vulkan_utils: failed to find suitable memory type\n");
+    MV_ERR("model_vulkan_utils: failed to find suitable memory type\n");
     return 0;
 }
 
@@ -40,7 +41,7 @@ ModelBuffer modelCreateBuffer(VkDevice device,
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     if (vkCreateBuffer(device, &ci, nullptr, &buf.buffer) != VK_SUCCESS) {
-        fprintf(stderr, "model_vulkan_utils: failed to create buffer (%llu bytes)\n",
+        MV_ERR("model_vulkan_utils: failed to create buffer (%llu bytes)\n",
                 (unsigned long long)size);
         return buf;
     }
@@ -53,7 +54,7 @@ ModelBuffer modelCreateBuffer(VkDevice device,
     ai.memoryTypeIndex = modelFindMemoryType(physDevice, memReq.memoryTypeBits, memProps);
 
     if (vkAllocateMemory(device, &ai, nullptr, &buf.memory) != VK_SUCCESS) {
-        fprintf(stderr, "model_vulkan_utils: failed to allocate buffer memory (%llu bytes)\n",
+        MV_ERR("model_vulkan_utils: failed to allocate buffer memory (%llu bytes)\n",
                 (unsigned long long)memReq.size);
         vkDestroyBuffer(device, buf.buffer, nullptr);
         buf.buffer = VK_NULL_HANDLE;
@@ -101,7 +102,7 @@ ModelImage modelCreateImage2D(VkDevice device,
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (vkCreateImage(device, &ici, nullptr, &img.image) != VK_SUCCESS) {
-        fprintf(stderr, "model_vulkan_utils: failed to create image (%ux%u)\n", width, height);
+        MV_ERR("model_vulkan_utils: failed to create image (%ux%u)\n", width, height);
         return img;
     }
 
@@ -114,7 +115,7 @@ ModelImage modelCreateImage2D(VkDevice device,
                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     if (vkAllocateMemory(device, &ai, nullptr, &img.memory) != VK_SUCCESS) {
-        fprintf(stderr, "model_vulkan_utils: failed to allocate image memory\n");
+        MV_ERR("model_vulkan_utils: failed to allocate image memory\n");
         vkDestroyImage(device, img.image, nullptr);
         img.image = VK_NULL_HANDLE;
         return img;
@@ -128,7 +129,7 @@ ModelImage modelCreateImage2D(VkDevice device,
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     if (vkCreateImageView(device, &vci, nullptr, &img.view) != VK_SUCCESS) {
-        fprintf(stderr, "model_vulkan_utils: failed to create image view\n");
+        MV_ERR("model_vulkan_utils: failed to create image view\n");
     }
 
     return img;
