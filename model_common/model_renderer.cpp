@@ -248,6 +248,23 @@ bool ModelRenderer::init(VkInstance instance,
         }
     }
     {
+        // #99 back-face culling of single-sided glTF materials. ON by default;
+        // see cullSingleSided_ in the header for the switch values.
+        const char* cull = std::getenv("DXR_MODELVIEWER_CULL");
+#if defined(__ANDROID__)
+        char cullProp[PROP_VALUE_MAX] = {0};
+        if (!cull && __system_property_get("debug.dxr.mv.cull", cullProp) > 0) cull = cullProp;
+#endif
+        if (cull && *cull) {
+            cullSingleSided_ = (cull[0] != '0');
+            cullExemptTransmissive_ = (std::strcmp(cull, "all") != 0);
+        }
+        MV_LOG("ModelRenderer: back-face culling of single-sided materials: %s%s\n",
+               cullSingleSided_ ? "on" : "OFF (DXR_MODELVIEWER_CULL=0)",
+               !cullSingleSided_ ? "" : (cullExemptTransmissive_ ? " (transmissive exempt)"
+                                                                  : " (transmissive culled too)"));
+    }
+    {
         // #127 content-mask coverage pass, forced on for testing. See
         // maskTestForce_ in the header.
         const char* mp = std::getenv("DXR_MODELVIEWER_MASKPASS_TEST");
@@ -876,6 +893,34 @@ bool ModelRenderer::createPipeline() {
     gpci.renderPass = renderPass_;
     gpci.subpass = 0;
     VkResult pr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipeline_);
+
+    // The other three variants (#99; see pipeline_ in the header). Built from
+    // COPIES of rs so the skybox below, which clones gpci, keeps CULL_NONE —
+    // its single fullscreen triangle would otherwise be culled outright.
+    //
+    // Cull BACK, not a per-platform side: cullMode is defined relative to
+    // frontFace, and frontFace_ is glTF's CCW on every platform (#98), so BACK
+    // is the geometric back face everywhere. (#101 had to cull FRONT on macOS
+    // only because macOS then shipped frontFace CW, which was the bug.) With
+    // DXR_MODELVIEWER_FRONT_FACE=cw this still culls the faces the pipeline
+    // calls back — on a correctly wound asset that is the visible side, which
+    // makes a wrong winding impossible to miss; add DXR_MODELVIEWER_CULL=0 for
+    // a like-for-like comparison with the unculled render.
+    auto makeVariant = [&](VkCullModeFlags cullMode, VkFrontFace front, VkPipeline* out) {
+        VkPipelineRasterizationStateCreateInfo rsV = rs;
+        rsV.cullMode = cullMode;
+        rsV.frontFace = front;
+        VkGraphicsPipelineCreateInfo gpV = gpci;
+        gpV.pRasterizationState = &rsV;
+        return vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpV, nullptr, out);
+    };
+    const VkFrontFace mirrored = (frontFace_ == VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                                     ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    if (pr == VK_SUCCESS) pr = makeVariant(VK_CULL_MODE_NONE, mirrored, &pipelineMirror_);
+    if (pr == VK_SUCCESS && cullSingleSided_) {
+        pr = makeVariant(VK_CULL_MODE_BACK_BIT, frontFace_, &pipelineCull_);
+        if (pr == VK_SUCCESS) pr = makeVariant(VK_CULL_MODE_BACK_BIT, mirrored, &pipelineMirrorCull_);
+    }
 
     vkDestroyShaderModule(device_, vs, nullptr);
     vkDestroyShaderModule(device_, fs, nullptr);
@@ -3038,7 +3083,9 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    // The model pipeline is bound per primitive (drawPrimitive picks the #99
+    // variant); only the geometry bindings are frame-wide here.
+    VkPipeline boundPipe = VK_NULL_HANDLE;
     VkDeviceSize voff = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
     vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
@@ -3085,6 +3132,25 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                 ? materialSets_[p.material] : defaultMatSet_;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
                                 1, 1, &matSet, 0, nullptr);
+
+        // #99 raster variant. A material with no index (-1) takes
+        // ModelMaterial's default, doubleSided — the safe side for geometry we
+        // know nothing about. Bound only when the variant changes.
+        const bool cull = cullSingleSided_ && !m.doubleSided && !cullExempt(m);
+        bool mirror = false;
+        if (p.skin < 0) {
+            const float* M = p.modelMatrix;   // column-major; upper 3x3
+            const float det = M[0] * (M[5] * M[10] - M[9] * M[6])
+                            - M[4] * (M[1] * M[10] - M[9] * M[2])
+                            + M[8] * (M[1] * M[6]  - M[5] * M[2]);
+            mirror = det < 0.0f;
+        }
+        const VkPipeline want = mirror ? (cull ? pipelineMirrorCull_ : pipelineMirror_)
+                                       : (cull ? pipelineCull_ : pipeline_);
+        if (want != boundPipe) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
+            boundPipe = want;
+        }
 
         vkCmdDrawIndexed(cmd, p.indexCount, 1, p.firstIndex, 0, 0);
     };
@@ -3133,7 +3199,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+        boundPipe = VK_NULL_HANDLE;   // new render pass: drawPrimitive rebinds
         vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
         vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
         for (const auto& p : primitives_) if (transmits(p)) drawPrimitive(p);
@@ -3511,6 +3577,8 @@ void ModelRenderer::cleanup() {
     if (materialExtBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, materialExtBuffer_);
     if (descriptorPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
+    for (VkPipeline* v : {&pipelineCull_, &pipelineMirror_, &pipelineMirrorCull_})
+        if (*v != VK_NULL_HANDLE) { vkDestroyPipeline(device_, *v, nullptr); *v = VK_NULL_HANDLE; }
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
     destroyMaskPass();   // before pipelineLayout_ — the mask pipeline shares it
     if (pipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
