@@ -24,6 +24,7 @@
 
 #include "model_loader.h"
 #include "model_loader_backends.h"
+#include "mv_log.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -533,9 +534,9 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         ? loader.LoadBinaryFromFile(&model, &err, &warn, path)
         : loader.LoadASCIIFromFile(&model, &err, &warn, path);
 
-    if (!warn.empty()) std::fprintf(stderr, "[model_loader] warn: %s\n", warn.c_str());
+    if (!warn.empty()) MV_ERR("[model_loader] warn: %s\n", warn.c_str());
     if (!ok) {
-        std::fprintf(stderr, "[model_loader] error: %s\n",
+        MV_ERR("[model_loader] error: %s\n",
                      err.empty() ? "unknown parse error" : err.c_str());
         return false;
     }
@@ -586,8 +587,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
                 if (i) list += ", ";
                 list += out.unsupportedExtensions[i];
             }
-            std::fprintf(stderr,
-                "[model_loader] NOT IMPLEMENTED — %zu extension(s) declared by this "
+            MV_ERR("[model_loader] NOT IMPLEMENTED — %zu extension(s) declared by this "
                 "asset are ignored; affected materials render as their base "
                 "metallic-roughness layer: %s\n",
                 out.unsupportedExtensions.size(), list.c_str());
@@ -601,7 +601,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         const tinygltf::Image& img = model.images[i];
         if (img.image.empty() || img.width <= 0 || img.height <= 0 ||
             img.bits != 8 || img.pixel_type != TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-            std::fprintf(stderr, "[model_loader] image %zu skipped (w=%d h=%d bits=%d comp=%d)\n",
+            MV_ERR("[model_loader] image %zu skipped (w=%d h=%d bits=%d comp=%d)\n",
                          i, img.width, img.height, img.bits, img.component);
             continue;
         }
@@ -678,7 +678,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
 
     out.primitiveCount = (uint32_t)out.primitives.size();
     if (out.primitiveCount == 0 || out.vertices.empty()) {
-        std::fprintf(stderr, "[model_loader] '%s' has no drawable triangle geometry\n", gltfPath);
+        MV_ERR("[model_loader] '%s' has no drawable triangle geometry\n", gltfPath);
         return false;
     }
 
@@ -797,8 +797,7 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         if (!anim.channels.empty()) out.animations.push_back(std::move(anim));
     }
 
-    std::fprintf(stderr,
-        "[model_loader] '%s': %u prims, %zu verts, %zu indices, %zu materials, "
+    MV_ERR("[model_loader] '%s': %u prims, %zu verts, %zu indices, %zu materials, "
         "%zu nodes, %zu animations\n",
         gltfPath, out.primitiveCount, out.vertices.size(), out.indices.size(),
         out.materials.size(), out.nodes.size(), out.animations.size());

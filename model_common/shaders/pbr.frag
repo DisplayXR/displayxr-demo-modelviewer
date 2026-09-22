@@ -31,8 +31,12 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 lightDir;     // .xyz = light dir, .w = clipFar (view-space; 0=off)
     mat4 invViewProj;  // (skybox only)
     vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale,
-                       // w=transmission probe (issue #75; 0 = normal shading)
-    vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target
+                       // w=probe SELECT: 0 = normal shading, 1 = transmission
+                       //   probe (#75), 2 = facing probe (#98)
+    vec4 viewport;     // xy = this eye's viewport as a fraction of the colour target,
+                       // z = DXR_MODELVIEWER_KULLA_CONTY, w = DXR_MODELVIEWER_COAT_SPEC_HEMI.
+                       // NEITHER is spare — every lane's owner is listed at
+                       // ModelRenderer::UniformBlock; read that before borrowing one.
     // ── Studio rig (undocked-page parity) ────────────────────────────────────
     // The DisplayXR storefront's inline-3D tile lights every model with a
     // three.js three-point rig plus a hemisphere ambient, no environment map
@@ -410,6 +414,7 @@ void main() {
 
     vec3 V = normalize(ubo.cameraPos.xyz - inWorldPos);
     vec3 Ng = normalize(inNormal);
+    vec3 NgRaw = Ng;   // pre-flip geometric normal, for the facing probe below
     // Two-sided: flip the normal for genuinely back-facing triangles (cull is
     // NONE) using the rasterizer's winding, NOT dot(N,V). The view test wrongly
     // flips large flat *front* faces seen near edge-on, sending their normal to
@@ -418,11 +423,14 @@ void main() {
     // to a view test — that regression has already been paid for once.
     //
     // gl_FrontFacing is geometric ONLY when the pipeline's front-face constant
-    // matches the platform's measured facing parity — which differs between
-    // MoltenVK (clockwise, #87) and native Vulkan (counter-clockwise, #92).
-    // Getting it wrong inverts the normal on every visible fragment and turns
-    // all materials into environment mirrors; see the winding block in
-    // ModelRenderer::createPipeline() before touching either side.
+    // matches the asset's winding. That constant is COUNTER_CLOCKWISE (glTF's)
+    // on every platform: the negative-height viewport in renderEye does NOT
+    // reverse the facing test on any stack measured (MoltenVK, native Vulkan,
+    // Adreno — #98). Getting it wrong inverts the normal on every visible
+    // fragment and turns all materials into environment mirrors; so does an
+    // asset wound against its own normals. Read the winding block in
+    // ModelRenderer::createPipeline(), and run the facing probe, before
+    // touching either.
     if (!gl_FrontFacing) Ng = -Ng;
     vec3 frameT, frameB; bool frameValid;
     // An authored TANGENT is continuous across UV seams and well-defined at
@@ -451,6 +459,27 @@ void main() {
     float ndotv = max(dot(N, V), 1e-4);
     float ndoth = max(dot(N, H), 0.0);
 
+    // ── Facing probe (#98) ──────────────────────────────────────────────────
+    // ubo.tone.w == 2 turns every fragment into a raw measurement of facing
+    // and skips shading. Read back by ModelRenderer::readFacingProbe():
+    //   R = 0.5 + 0.5*dot(N, V)      shading normal, AFTER the two-sided flip
+    //                                (and after normal mapping, so compare
+    //                                means, not pixels, against B)
+    //   G = gl_FrontFacing
+    //   B = 0.5 + 0.5*dot(NgRaw, V)  raw vertex normal, BEFORE the flip
+    //   A = 1                        "geometry was here" (the probe clear is A=0)
+    // R vs B separates the stories: B positive head-on (the mesh faces us)
+    // with R negative means the flip is firing on front faces — the winding
+    // constant disagrees with the asset. B negative too means we really are
+    // looking at back faces. No display transform — these are numbers.
+    if (ubo.tone.w > 1.5) {
+        outColor = vec4(0.5 + 0.5 * dot(N, V),
+                        gl_FrontFacing ? 1.0 : 0.0,
+                        0.5 + 0.5 * dot(NgRaw, V),
+                        1.0);
+        outSceneLinear = outColor;
+        return;
+    }
 
     float ior                = MAT.p0.x;
     float specularFactor     = MAT.p0.y;
@@ -869,7 +898,7 @@ void main() {
     // exactly once, so a correct sample makes every transmissive surface
     // reproduce the pixels behind it and visually vanish. Enable with
     // DXR_MODELVIEWER_TRANSMISSION_PROBE=1.
-    bool probe = ubo.tone.w > 0.5;
+    bool probe = ubo.tone.w > 0.5 && ubo.tone.w < 1.5;   // transmission probe ONLY
     if (transmissionFactor > 0.0) {
         // Ray through the volume. thickness 0 (a thin surface) degenerates to
         // sampling straight behind the fragment, which is the correct

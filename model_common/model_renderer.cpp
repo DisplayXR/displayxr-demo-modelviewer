@@ -15,6 +15,11 @@
 
 #include "model_renderer.h"
 #include "model_loader.h"
+#include "mv_log.h"
+
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>   // debug.dxr.mv.* switches (no env in a NativeActivity)
+#endif
 
 // Declarations only — the stb_image implementation is linked from the platform
 // target (see linux/stb_image_impl_linux.cpp and the displayxr::common
@@ -187,7 +192,7 @@ bool ModelRenderer::init(VkInstance instance,
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = queueFamilyIndex;
     if (vkCreateCommandPool(device, &poolInfo, nullptr, &cmdPool_) != VK_SUCCESS) {
-        std::fprintf(stderr, "ModelRenderer: failed to create command pool\n");
+        MV_ERR("ModelRenderer: failed to create command pool\n");
         return false;
     }
 
@@ -197,8 +202,50 @@ bool ModelRenderer::init(VkInstance instance,
         const char* probe = std::getenv("DXR_MODELVIEWER_TRANSMISSION_PROBE");
         transmissionProbe_ = (probe && probe[0] == '1' && probe[1] == '\0');
         if (transmissionProbe_)
-            std::printf("ModelRenderer: TRANSMISSION PROBE on — transmissive surfaces "
+            MV_LOG("ModelRenderer: TRANSMISSION PROBE on — transmissive surfaces "
                         "show their raw scene sample, not shading (issue #75)\n");
+    }
+    {
+        // Front-face winding (#98) and the facing probe that measures it. Both
+        // read ONCE here. Android has no environment for a NativeActivity
+        // launched by `am start`, so each also reads a system property there.
+        // Only the exact values below are honoured; anything else keeps the
+        // default, so a typo cannot silently flip the winding.
+        const char* ff = std::getenv("DXR_MODELVIEWER_FRONT_FACE");
+#if defined(__ANDROID__)
+        char ffProp[PROP_VALUE_MAX] = {0};
+        if (!ff && __system_property_get("debug.dxr.mv.frontface", ffProp) > 0) ff = ffProp;
+#endif
+        if (ff && std::strcmp(ff, "cw") == 0)       frontFace_ = VK_FRONT_FACE_CLOCKWISE;
+        else if (ff && std::strcmp(ff, "ccw") == 0) frontFace_ = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        else if (ff && *ff)
+            MV_ERR("ModelRenderer: DXR_MODELVIEWER_FRONT_FACE='%s' ignored (want cw|ccw)\n", ff);
+        if (ff && *ff)
+            MV_LOG("ModelRenderer: frontFace = %s (DXR_MODELVIEWER_FRONT_FACE, #98)\n",
+                   frontFace_ == VK_FRONT_FACE_CLOCKWISE ? "CLOCKWISE" : "COUNTER_CLOCKWISE");
+
+        const char* fp = std::getenv("DXR_MODELVIEWER_FACING_PROBE");
+        facingProbe_ = (fp && fp[0] == '1' && fp[1] == '\0');
+#if defined(__ANDROID__)
+        if (!facingProbe_) {
+            char v[PROP_VALUE_MAX] = {0};
+            if (__system_property_get("debug.dxr.mv.facingprobe", v) > 0)
+                facingProbe_ = (v[0] == '1' && v[1] == '\0');
+        }
+#endif
+        if (facingProbe_) {
+            if (transmissionProbe_) {
+                // One UBO lane (tone.w) selects the probe; they cannot both run.
+                MV_ERR("ModelRenderer: FACING PROBE overrides the TRANSMISSION PROBE\n");
+                transmissionProbe_ = false;
+            }
+            // State the constant being measured, so a readback is never quoted
+            // without it.
+            MV_LOG("ModelRenderer: FACING PROBE on (#98) — frontFace=%s, viewport height "
+                   "NEGATIVE; a correctly wound model head-on must read dot(N,V) > 0 and "
+                   "gl_FrontFacing ~1\n",
+                   frontFace_ == VK_FRONT_FACE_CLOCKWISE ? "CLOCKWISE" : "COUNTER_CLOCKWISE");
+        }
     }
     {
         // #127 content-mask coverage pass, forced on for testing. See
@@ -210,7 +257,7 @@ bool ModelRenderer::init(VkInstance instance,
             maskTestUMax_[t] = 0;
         }
         if (maskTestForce_)
-            std::printf("ModelRenderer: MASKPASS TEST on — the unclipped content-mask "
+            MV_LOG("ModelRenderer: MASKPASS TEST on — the unclipped content-mask "
                         "coverage pass runs every frame and reports (#127)\n");
     }
 
@@ -227,7 +274,7 @@ bool ModelRenderer::init(VkInstance instance,
             VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
             VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         if ((fp.optimalTilingFeatures & need) != need) {
-            std::printf("ModelRenderer: WARNING scene-linear format %d lacks features "
+            MV_LOG("ModelRenderer: WARNING scene-linear format %d lacks features "
                         "0x%x (has 0x%x) — transmission may be wrong\n",
                         (int)sceneLinearFormat_, (unsigned)(need & ~fp.optimalTilingFeatures),
                         (unsigned)fp.optimalTilingFeatures);
@@ -250,16 +297,16 @@ bool ModelRenderer::init(VkInstance instance,
         const uint32_t need = (uint32_t)MTEX_COUNT + 5;
         const uint32_t have = props.limits.maxPerStageDescriptorSampledImages;
         if (have < need) {
-            std::printf("ModelRenderer: WARNING device allows %u sampled images per stage, "
+            MV_LOG("ModelRenderer: WARNING device allows %u sampled images per stage, "
                         "this pipeline needs %u — material textures may fail to bind\n", have, need);
         } else {
-            std::printf("ModelRenderer: sampled images per stage: need %u, device allows %u\n",
+            MV_LOG("ModelRenderer: sampled images per stage: need %u, device allows %u\n",
                         need, have);
         }
     }
 
     initialized_ = true;
-    std::printf("ModelRenderer: initialized (%ux%u)\n", width_, height_);
+    MV_LOG("ModelRenderer: initialized (%ux%u)\n", width_, height_);
     return true;
 }
 
@@ -318,7 +365,7 @@ void ModelRenderer::chooseSampleCount() {
             samples_ = VK_SAMPLE_COUNT_2_BIT;
         }
     }
-    std::printf("ModelRenderer: MSAA %ux%s\n", (unsigned)samples_,
+    MV_LOG("ModelRenderer: MSAA %ux%s\n", (unsigned)samples_,
                 (samples_ == want) ? "" : " (requested level unsupported)");
 }
 
@@ -751,40 +798,37 @@ bool ModelRenderer::createPipeline() {
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;       // two-sided shading handles back faces
-    // Front-face winding is PER-PLATFORM, and both sides are empirical.
+    // Front-face winding: COUNTER_CLOCKWISE on every platform (glTF's winding),
+    // resolved once in init() into frontFace_ so DXR_MODELVIEWER_FRONT_FACE=cw
+    // (Android: `setprop debug.dxr.mv.frontface cw`) can flip it on a device
+    // without a rebuild. Do not reintroduce a per-platform constant here without
+    // running the facing probe (DXR_MODELVIEWER_FACING_PROBE=1) on the platform
+    // being changed and recording the numbers on issue #98.
     //
-    // The #87 analysis (unconditional CLOCKWISE, v0.21.1) held on macOS: under
-    // MoltenVK the negative-height viewport in renderEye reverses facing, every
-    // visible fragment reported gl_FrontFacing == false with CCW, and pbr.frag's
-    // two-sided flip inverted the normal on all of them — dot(N,V) measured
-    // -0.983 head-on where it must be +1, Fresnel pinned near f90, materials
-    // rendered as environment mirrors (blue gold, black clearcoat). CLOCKWISE
-    // fixed it there, verified by probe (dot(N,V) +0.987) and by eye.
-    //
-    // On WINDOWS (native Vulkan, NVIDIA) the SAME change inverted the normals
-    // instead: v0.20.1 and v0.21.0 render sample.glb's materials correctly with
-    // COUNTER_CLOCKWISE, and v0.21.1 — whose only functional change was this
-    // constant — renders every material as a sky mirror. Reproduced 2026-08-13
-    // on one box with the runtime held constant, deterministic captures,
-    // releases bisected: 0.20.1 OK, 0.21.0 OK (pixel-identical), 0.21.1 chrome,
-    // 0.22.0 chrome. Rejected on the panel by David.
-    //
-    // So the effective facing parity of the chain (rig view + GL-style
-    // projection + negative-height viewport) DIFFERS between MoltenVK and
-    // native Vulkan here. Which stack deviates from the VK spec's
-    // framebuffer-space rule — and why — is deliberately left open (#92): this
-    // constant follows the measurement on each platform, not the theory.
-    // Linux/Android ship the native-Vulkan value; on-hardware verification of
-    // those two is part of #92.
+    // History, because this constant has been flipped three times on inference:
+    //  - #87 (v0.21.1) set CLOCKWISE everywhere after measuring dot(N,V) -0.983
+    //    head-on at a sphere centre of material_grid.glb. That number was real,
+    //    but the ASSET was wrong: scripts/make_material_grid.py's uv_sphere()
+    //    wound every triangle CW seen from outside (fixed in the same change as
+    //    this comment; material_grid / coat_test / diffuse_fuzz_test /
+    //    transmission_test spheres were 0% CCW-consistent with their NORMALs).
+    //    So CLOCKWISE "fixed" the spheres and inverted every correctly wound
+    //    model (DamagedHelmet is 100% CCW-consistent).
+    //  - #92 restored CCW on native Vulkan after Windows renders of
+    //    sample.glb went chrome, and kept CLOCKWISE under __APPLE__, reading the
+    //    difference as a MoltenVK facing-parity quirk.
+    //  - #98 / PR #103 measured it with the facing probe (which reports the raw
+    //    pre-flip geometric normal next to the shading normal): on MoltenVK and
+    //    Adreno alike, sample.glb gives gl_FrontFacing 1.000 and dot(N,V) +0.660
+    //    / +0.476 under CCW, and exactly the negation under CW. There is no
+    //    platform difference. The negative-height viewport in renderEye is the
+    //    standard VK_KHR_maintenance1 Y flip and leaves GL-style CCW front faces
+    //    CCW, as the Vulkan spec says it should, on every stack measured.
     //
     // cullMode is NONE, so this changes gl_FrontFacing ONLY — nothing is culled
     // either way, and genuine back faces still get their normal flipped, which
     // is what the two-sided path is for.
-#ifdef __APPLE__
-    rs.frontFace = VK_FRONT_FACE_CLOCKWISE;          // MoltenVK — measured (#87)
-#else
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;  // native VK — measured (#92)
-#endif
+    rs.frontFace = frontFace_;
     rs.lineWidth = 1.0f;
 
     // Must equal the render pass's attachment sample count. `ms` is shared with
@@ -836,7 +880,7 @@ bool ModelRenderer::createPipeline() {
     vkDestroyShaderModule(device_, vs, nullptr);
     vkDestroyShaderModule(device_, fs, nullptr);
     if (pr != VK_SUCCESS) {
-        std::fprintf(stderr, "ModelRenderer: failed to create pipeline (%d)\n", pr);
+        MV_ERR("ModelRenderer: failed to create pipeline (%d)\n", pr);
         return false;
     }
 
@@ -858,7 +902,7 @@ bool ModelRenderer::createPipeline() {
         VkResult spr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp2, nullptr, &skyboxPipeline_);
         vkDestroyShaderModule(device_, svs, nullptr);
         vkDestroyShaderModule(device_, sfs, nullptr);
-        if (spr != VK_SUCCESS) { std::fprintf(stderr, "ModelRenderer: failed to create skybox pipeline (%d)\n", spr); return false; }
+        if (spr != VK_SUCCESS) { MV_ERR("ModelRenderer: failed to create skybox pipeline (%d)\n", spr); return false; }
     }
 
     // Descriptor pool + set + the host-visible uniform buffer.
@@ -1294,7 +1338,7 @@ bool ModelRenderer::createIbl() {
     dsai.descriptorPool = iblPool_; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &iblSetLayout_;
     if (vkAllocateDescriptorSets(device_, &dsai, &iblSet_) != VK_SUCCESS) return false;
     writeIblSet();
-    std::printf("ModelRenderer: IBL ready (irradiance 32, prefilter 128x%u, BRDF LUT 256)\n", prefilterCube_.mips);
+    MV_LOG("ModelRenderer: IBL ready (irradiance 32, prefilter 128x%u, BRDF LUT 256)\n", prefilterCube_.mips);
     return true;
 }
 
@@ -1433,14 +1477,14 @@ bool ModelRenderer::setEnvironment(const char* hdriPath) {
         // Dropping an HDRI while lighting=room must land on the ROOM, not on
         // the sky — envUsesRoom() is the one place that decision is made.
         envName_ = envUsesRoom() ? "analytic room" : "analytic sky";
-        std::printf("ModelRenderer: environment → %s\n", envName_.c_str());
+        MV_LOG("ModelRenderer: environment → %s\n", envName_.c_str());
         return bakeIblCubes();
     }
 
     int w = 0, h = 0, comp = 0;
     float* px = stbi_loadf(hdriPath, &w, &h, &comp, 4);   // force RGBA
     if (!px) {
-        std::printf("ModelRenderer: HDRI load failed (%s): %s — keeping %s\n", hdriPath,
+        MV_LOG("ModelRenderer: HDRI load failed (%s): %s — keeping %s\n", hdriPath,
                     stbi_failure_reason() ? stbi_failure_reason() : "unknown", envName_.c_str());
         return false;
     }
@@ -1502,7 +1546,7 @@ bool ModelRenderer::setEnvironment(const char* hdriPath) {
     envIsHdri_ = true;
     envName_ = std::filesystem::path(hdriPath).filename().string();
     bindEnvEquirect(envEquirect_.view);
-    std::printf("ModelRenderer: environment → %s (%dx%d HDRI); analytic key light off\n",
+    MV_LOG("ModelRenderer: environment → %s (%dx%d HDRI); analytic key light off\n",
                 envName_.c_str(), w, h);
     return bakeIblCubes();
 }
@@ -1615,7 +1659,7 @@ void ModelRenderer::setLightingMode(LightingMode m) {
     }
     if (initialized_ && envUsesRoom() != wasRoom) {
         if (!bakeIblCubes()) {
-            std::printf("ModelRenderer: IBL rebake for lighting=%s FAILED — "
+            MV_LOG("ModelRenderer: IBL rebake for lighting=%s FAILED — "
                         "the previous environment is gone; expect a black ambient\n",
                         lightingModeName());
         }
@@ -1637,7 +1681,7 @@ void ModelRenderer::setLightingMode(LightingMode m) {
         exposureEV_ = 1.0f;
         toneCurve_  = ToneCurve::PbrNeutral;
     }
-    std::printf("ModelRenderer: lighting = %s (exposure %+.2f EV, tone %s)\n",
+    MV_LOG("ModelRenderer: lighting = %s (exposure %+.2f EV, tone %s)\n",
                 lightingModeName(), exposureEV_, toneCurveName());
 }
 
@@ -1993,7 +2037,9 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     // model.
     ub.tone[2] = (lightingMode_ == LightingMode::NoLights
                   || lightingMode_ == LightingMode::Room || envIsHdri_) ? 0.0f : 1.0f;
-    ub.tone[3] = transmissionProbe_ ? 1.0f : 0.0f;
+    // Probe SELECT, not a bool: 1 = transmission (#75), 2 = facing (#98). One
+    // lane, one meaning — init() makes the two mutually exclusive.
+    ub.tone[3] = facingProbe_ ? 2.0f : (transmissionProbe_ ? 1.0f : 0.0f);
     ub.viewport[0] = (width_  > 0) ? (float)vpWidth_  / (float)width_  : 1.0f;
     ub.viewport[1] = (height_ > 0) ? (float)vpHeight_ / (float)height_ : 1.0f;
 
@@ -2536,7 +2582,7 @@ bool ModelRenderer::ensureMaskPass() {
     rpci.dependencyCount = 1;
     rpci.pDependencies = &dep;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &maskRenderPass_) != VK_SUCCESS) {
-        std::fprintf(stderr, "ModelRenderer: content-mask render pass failed\n");
+        MV_ERR("ModelRenderer: content-mask render pass failed\n");
         maskFailed_ = true;
         return false;
     }
@@ -2604,8 +2650,8 @@ bool ModelRenderer::ensureMaskPass() {
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     // Cull nothing, and never mind frontFace: with no depth test and no
-    // shading, facing is not observable here — the per-platform frontFace
-    // argument the main pipeline agonises over (#87/#92) has no analogue.
+    // shading, facing is not observable here — the frontFace question the main
+    // pipeline documents (#87/#92/#98) has no analogue.
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -2643,7 +2689,7 @@ bool ModelRenderer::ensureMaskPass() {
     vkDestroyShaderModule(device_, vs, nullptr);
     vkDestroyShaderModule(device_, fs, nullptr);
     if (pr != VK_SUCCESS) {
-        std::fprintf(stderr, "ModelRenderer: content-mask pipeline failed (%d)\n", pr);
+        MV_ERR("ModelRenderer: content-mask pipeline failed (%d)\n", pr);
         maskFailed_ = true;
         return false;
     }
@@ -2662,7 +2708,7 @@ bool ModelRenderer::ensureMaskPass() {
     mdpci.poolSizeCount = 2;
     mdpci.pPoolSizes = mps;
     if (vkCreateDescriptorPool(device_, &mdpci, nullptr, &maskDescPool_) != VK_SUCCESS) {
-        std::fprintf(stderr, "ModelRenderer: content-mask descriptor pool failed\n");
+        MV_ERR("ModelRenderer: content-mask descriptor pool failed\n");
         maskFailed_ = true;
         return false;
     }
@@ -2687,7 +2733,7 @@ bool ModelRenderer::ensureMaskPass() {
         return true;
     };
     if (!makeSet(maskSet_, maskUniform_)) {
-        std::fprintf(stderr, "ModelRenderer: content-mask set 0 failed\n");
+        MV_ERR("ModelRenderer: content-mask set 0 failed\n");
         maskFailed_ = true;
         return false;
     }
@@ -2947,6 +2993,11 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     VkClearValue clears[3];
     if (transparentBg) clears[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
     else               clears[0].color = {{0.05f, 0.05f, 0.06f, 1.0f}};
+    // Facing probe: clear to ALPHA 0 and skip the sky (below). pbr.frag writes
+    // alpha 1 on every probed fragment, so alpha is the "geometry was here"
+    // marker — without it a 0.5 readback is ambiguous between "dot(N,V) = 0"
+    // and "nothing was drawn". RGB stay free to carry the measurement.
+    if (facingProbe_) clears[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
     // Scene-linear attachment. The clear value is never observed by anything
     // that matters: transmission only samples this image in opaque mode, where
     // the fullscreen skybox overwrites every pixel of the render area before a
@@ -2982,7 +3033,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // Opaque mode: paint the analytic sky behind the model. Skipped in
     // transparent mode so the desktop shows through (depth untouched).
-    if (!transparentBg) {
+    if (!transparentBg && !facingProbe_) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipeline_);
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
@@ -3095,6 +3146,37 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     vkCmdEndRenderPass(cmd);
     // colorImage_ is now in TRANSFER_SRC_OPTIMAL (render-pass finalLayout).
 
+    // Facing probe (#98): copy the WHOLE first tile back, on the throttled
+    // frame only. Whole tile, not a centre block — "which 64x64 did we land
+    // on" is exactly the sampling accident that produces a confident wrong
+    // answer here, and a diagnostic that runs once in kFacingProbeEvery frames
+    // can afford the copy. colorImage_ is the single-sample (resolved)
+    // R8G8B8A8_UNORM target, in TRANSFER_SRC_OPTIMAL, which is what the copy
+    // wants; the blit below reads it in the same layout, so no barrier is
+    // needed between the two reads.
+    bool probeThisFrame = false;
+    if (facingProbe_ && viewportX == 0 && viewportY == 0) {
+        probeThisFrame = (facingProbeFrame_++ % kFacingProbeEvery) == 0;
+        const VkDeviceSize need = (VkDeviceSize)viewportWidth * viewportHeight * 4;
+        if (probeThisFrame && facingProbeBuf_.size < need) {
+            if (facingProbeBuf_.buffer != VK_NULL_HANDLE)
+                modelDestroyBuffer(device_, facingProbeBuf_);
+            facingProbeBuf_ = modelCreateBuffer(
+                device_, physDevice_, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        }
+        if (probeThisFrame && facingProbeBuf_.buffer != VK_NULL_HANDLE) {
+            VkBufferImageCopy bic = {};
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            bic.imageExtent = {viewportWidth, viewportHeight, 1};
+            vkCmdCopyImageToBuffer(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   facingProbeBuf_.buffer, 1, &bic);
+            facingProbePixels_ = viewportWidth * viewportHeight;
+        } else {
+            probeThisFrame = false;
+        }
+    }
+
     // #127: the unclipped silhouette for XR_DXR_depth_budget's content mask.
     // Its own target and its own trivial pipeline, so it touches nothing the
     // blit below depends on. Armed per frame by beginContentMaskFrame().
@@ -3197,6 +3279,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     vkQueueWaitIdle(queue_);
     // The wait above is this function's existing sync point, so the coverage
     // readback is already complete here — no fence pipeline, no extra stall.
+    if (probeThisFrame) readFacingProbe();   // same sync point covers it
     if (maskThisView) {
         // This view's UNCLIPPED coverage, read before the union OR so the
         // mutation arm below compares like with like.
@@ -3238,7 +3321,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
             if (covR < maskTestRMin_) maskTestRMin_ = covR;
             if (covR > maskTestRMax_) maskTestRMax_ = covR;
             if (covR < covU) ++maskTestRLtU_;
-            std::printf("ModelRenderer: [maskpass] tile %u unclipped U=%zu  restricted R=%zu"
+            MV_LOG("ModelRenderer: [maskpass] tile %u unclipped U=%zu  restricted R=%zu"
                         "  (R<U %s)\n", tile, covU, covR, covR < covU ? "yes" : "NO");
         }
         if (maskTestForce_) ++maskTestTile_;
@@ -3256,7 +3339,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                     }
                 }
             }
-            std::printf("ModelRenderer: [maskpass] %zu/%u texels covered (%.1f%%)"
+            MV_LOG("ModelRenderer: [maskpass] %zu/%u texels covered (%.1f%%)"
                         ", bbox x[%zu..%zu] y[%zu..%zu], clipFar=%.3f\n",
                         covered, kContentMaskCovW * kContentMaskCovH,
                         100.0 * (double)covered / (double)(kContentMaskCovW * kContentMaskCovH),
@@ -3276,7 +3359,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                         line[rx] = maskCoverage_[size_t(sy) * kContentMaskCovW + sx] ? '#' : '.';
                     }
                     line[64] = '\0';
-                    std::printf("  [maskpass] %s\n", line);
+                    MV_LOG("  [maskpass] %s\n", line);
                 }
             }
             if (maskTestViews_ > 0) {
@@ -3284,13 +3367,13 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                 for (uint32_t t = 0; t < kMaskTestTiles; ++t) {
                     if (maskTestUMax_[t] == 0) continue;               // tile unused
                     if (maskTestUMin_[t] != maskTestUMax_[t]) uInvariant = false;
-                    std::printf("  [maskpass] tile %u unclipped U in [%zu..%zu] (%s)\n",
+                    MV_LOG("  [maskpass] tile %u unclipped U in [%zu..%zu] (%s)\n",
                                 t, maskTestUMin_[t], maskTestUMax_[t],
                                 maskTestUMin_[t] == maskTestUMax_[t] ? "INVARIANT"
                                                                      : "VARIES - FAIL");
                 }
                 const bool rSmaller = (maskTestRLtU_ == maskTestViews_);
-                std::printf("  [maskpass] VERDICT over %u views: "
+                MV_LOG("  [maskpass] VERDICT over %u views: "
                             "restricted R in [%zu..%zu], R<U on %u/%u (%s) -> %s\n",
                             maskTestViews_, maskTestRMin_, maskTestRMax_,
                             maskTestRLtU_, maskTestViews_,
@@ -3301,6 +3384,55 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         }
     }
     vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+}
+
+// Decode what pbr.frag's facing probe wrote (see its encoding comment) and log
+// the means. Called only on a throttled frame, only after the queue has idled.
+void ModelRenderer::readFacingProbe() {
+    void* mapped = nullptr;
+    if (vkMapMemory(device_, facingProbeBuf_.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+        return;
+    const uint8_t* px = (const uint8_t*)mapped;   // colorFormat_ = R8G8B8A8_UNORM
+    const uint32_t n = facingProbePixels_;
+    double sumShaded = 0.0, sumRaw = 0.0, sumFront = 0.0;
+    uint32_t hits = 0, shadedPos = 0, rawPos = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (px[i * 4 + 3] < 128) continue;        // the probe clear, not geometry
+        const double shaded = 2.0 * ((double)px[i * 4 + 0] / 255.0) - 1.0;
+        const double raw    = 2.0 * ((double)px[i * 4 + 2] / 255.0) - 1.0;
+        sumShaded += shaded;
+        sumRaw += raw;
+        sumFront += (px[i * 4 + 1] > 127) ? 1.0 : 0.0;
+        if (shaded > 0.0) ++shadedPos;
+        if (raw > 0.0) ++rawPos;
+        ++hits;
+    }
+    vkUnmapMemory(device_, facingProbeBuf_.memory);
+    const char* wind = (frontFace_ == VK_FRONT_FACE_CLOCKWISE) ? "CW" : "CCW";
+    if (hits == 0) {
+        MV_LOG("ModelRenderer: FACING PROBE [frontFace=%s] — no geometry in tile 0 (0/%u px)\n",
+               wind, n);
+        return;
+    }
+    const double inv = 1.0 / (double)hits;
+    // dot(N,V) is what the SHADER ends up using; dot(Ng_raw,V) is what the mesh
+    // actually is. Correct winding => both positive, gl_FrontFacing ~1.
+    // Wrong winding constant => raw positive, shaded its negation, facing 0.
+    // Asset wound against its normals => the same signature, which is why the
+    // verdict names both candidates and the winding script settles which.
+    const double meanShaded = sumShaded * inv, meanRaw = sumRaw * inv;
+    const char* verdict =
+        (meanShaded > 0.0) ? "OK (shading normal faces the camera)"
+        : (meanRaw > 0.0)  ? "INVERTED (raw normal faces the camera, shading normal does not: "
+                             "frontFace disagrees with this asset's winding)"
+                           : "BACK FACES (raw normal points away too: looking at back faces)";
+    MV_LOG("ModelRenderer: FACING PROBE [frontFace=%s] geometry=%u/%u px | "
+           "mean dot(N,V)=%+.3f (%.1f%% positive) | mean dot(Ng_raw,V)=%+.3f (%.1f%% positive) | "
+           "gl_FrontFacing=%.3f | %s\n",
+           wind, hits, n,
+           meanShaded, 100.0 * (double)shadedPos * inv,
+           meanRaw, 100.0 * (double)rawPos * inv,
+           sumFront * inv, verdict);
 }
 
 void ModelRenderer::cleanupModel() {
@@ -3346,6 +3478,7 @@ void ModelRenderer::cleanup() {
 
     cleanupModel();
 
+    if (facingProbeBuf_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, facingProbeBuf_);
     if (sampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
     if (whiteTex_.image != VK_NULL_HANDLE) modelDestroyImage(device_, whiteTex_);
     if (flatNormalTex_.image != VK_NULL_HANDLE) modelDestroyImage(device_, flatNormalTex_);

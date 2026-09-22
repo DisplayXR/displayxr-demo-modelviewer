@@ -319,13 +319,26 @@ private:
         float cameraPos[4];
         float lightDir[4];     // .xyz = light direction, .w = clipFar (view-space; 0=off)
         float invViewProj[16]; // inverse(viewProj), for the skybox ray reconstruction
+        // Every lane below has an owner. There are no spare lanes in this
+        // block: #98 lost a device round to a probe that rode viewport.z on
+        // the belief that it was padding — updateUniforms() overwrote it a few
+        // lines later and the "probe" readback decoded the ordinary shaded
+        // image. Before borrowing a lane, grep updateUniforms() AND the
+        // shaders for it. Owners of every .w / partial lane today:
+        //   cameraPos.w  = shader sRGB-encode flag (1 = UNORM swapchain)
+        //   lightDir.w   = foreground clip, view-space far (0 = off)
+        //   tone.w       = probe SELECT (0 none, 1 transmission #75, 2 facing #98)
+        //   viewport.zw  = DXR_MODELVIEWER_KULLA_CONTY / _COAT_SPEC_HEMI
+        //   studio.xyzw, studioFill.w, studioRim.w = the Studio rig
+        //   hemiSky.w, hemiGround.w = unused (ub{} zeroes them; the only free lanes)
         float tone[4];         // x=exposure (2^EV), y=curve id, z=directional-light scale,
-                               // w=transmission probe (issue #75; 0 = normal shading)
+                               // w=probe select (0 = normal shading; see above)
         // The internal colour target is the size of the whole SWAPCHAIN IMAGE,
         // but each eye renders into only the top-left viewport of it. Scene-
         // colour sampling (transmission) therefore has to scale clip-space UVs
         // by the viewport's fraction of the image, or it reads past the region
-        // that was actually rendered. x,y = viewport/image ratio.
+        // that was actually rendered. x,y = viewport/image ratio;
+        // z = DXR_MODELVIEWER_KULLA_CONTY, w = DXR_MODELVIEWER_COAT_SPEC_HEMI.
         float viewport[4];
         // ── Studio rig; mirrors the tail of pbr.frag's UBO. Zero (and dead in
         // the shader) in every mode but Studio.
@@ -557,6 +570,33 @@ private:
     // Reusing the shader's own tone/encode tail is deliberate — a probe with a
     // hand-copied display transform can drift away from the one it is testing.
     bool       transmissionProbe_ = false;
+    // Front-face winding for the model pipeline (#98). COUNTER_CLOCKWISE (glTF)
+    // on every platform; DXR_MODELVIEWER_FRONT_FACE=cw|ccw, or on Android the
+    // property `debug.dxr.mv.frontface`, overrides it at init so a wrong call
+    // is undone on a device without a rebuild. See createPipeline().
+    VkFrontFace frontFace_ = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    // DXR_MODELVIEWER_FACING_PROBE=1 (desktop env) / `debug.dxr.mv.facingprobe`
+    // = 1 (Android property) — the #98 facing measurement. Read ONCE at init;
+    // off, the renderer behaves byte-for-byte as without it.
+    //
+    // When frontFace_ disagrees with the asset's winding, gl_FrontFacing is
+    // false on every visible fragment, pbr.frag's two-sided flip inverts N,
+    // and the whole scene shades at grazing incidence (materials render as
+    // environment mirrors). Two different faults produce that look — a wrong
+    // winding constant, or an asset wound against its own normals — and only
+    // the probe separates them, because it reports the raw pre-flip normal
+    // alongside the shading normal. See pbr.frag for the encoding.
+    //
+    // On: ubo.tone.w = 2, shading is replaced by that encoding, the sky is
+    // skipped, the colour clear is alpha 0 ("no geometry here"), and the FIRST
+    // tile is read back whole and its mean logged, 1 frame in
+    // kFacingProbeEvery. Mutually exclusive with transmissionProbe_ (same lane).
+    bool       facingProbe_ = false;
+    ModelBuffer facingProbeBuf_;           // host-visible readback staging
+    uint32_t   facingProbeFrame_ = 0;      // tile-0 renders since the probe started
+    uint32_t   facingProbePixels_ = 0;     // pixels in the pending readback
+    static constexpr uint32_t kFacingProbeEvery = 120;
+    void readFacingProbe();                // after renderEye's queue idle
     bool createTransmissionTarget(uint32_t w, uint32_t h);
     void captureSceneColor(VkCommandBuffer cmd, uint32_t w, uint32_t h);
     void writeIblSet();                    // (re)write set 2, incl. the transmission image
