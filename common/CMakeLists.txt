@@ -30,9 +30,12 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    # v2.17.0 ships displayxr::csd — the shared header bar the Linux leg draws
-    # with (displayxr-common#52/#53).
-    GIT_TAG v2.17.0
+    # v2.19.0 ships the clear-space policy (clear_policy.h + vk_clear.h,
+    # displayxr-common#56) this repo's clears now go through. It contains
+    # v2.17.0's displayxr::csd (the shared header bar the Linux leg draws with,
+    # #52/#53) and v2.18.0's TRANSFER_DST colour swapchains (#51), which is
+    # what makes the renderer's blit-into-the-swapchain legal.
+    GIT_TAG v2.19.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

@@ -43,6 +43,7 @@
 #include "toast.h"             // dxr::ToastState — transient on-screen confirmation
 #include "zone_default.h"      // dxr::FullWindowZone — zones-by-default (#63 / INV-5.6)
 #include "auto_fit.h"          // dxr::AutoFitVHeight / FitTransition — shared width-aware framing
+#include "vk_clear.h"         // dxr::VkDisplayReferredClearColor — clear-space policy (#1647)
 #include "auto_fit_canvas.h"   // dxr::AutoFitCanvas — the runtime-resolved viewport (shell tile)
 #include "model_fit.h"         // modelviewer::FitVHeight — the page-parity framing rule
 // ── The undock launch contract (displayxr-common v2.9.0) ──────────────────
@@ -2364,7 +2365,8 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 
 // Render a simple "no scene" placeholder by clearing to dark gray
 static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdPool,
-                               VkImage image, uint32_t width, uint32_t height) {
+                               VkImage image, VkFormat imageFormat,
+                               uint32_t width, uint32_t height) {
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = cmdPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -2396,9 +2398,20 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     // an undock launch spends downloading its --src). Clear to fully
     // transparent instead; the toast band stays in-region and carries the
     // progress. Opaque mode keeps the slate it always had.
-    VkClearColorValue clearColor = g_transparentBg.load()
-        ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
-        : VkClearColorValue{{0.1f, 0.1f, 0.12f, 1.0f}};
+    //
+    // This clear lands DIRECTLY on the swapchain image — no intermediate, no
+    // blit — so unlike ModelRenderer's clear the target's own format IS the
+    // answer, and the format-derived helper is the right one (clear_policy.h;
+    // runtime #1647/#1644). On an `_SRGB` swapchain the clear is taken as
+    // scene-linear and encoded on write, so the authored display-referred
+    // slate must be linearised first or it comes out washed out. (0,0,0,0) is
+    // a fixed point of the EOTF, so the transparent arm is unchanged either
+    // way; it goes through the same call so there is one rule here, not two.
+    float slate[4] = {0.1f, 0.1f, 0.12f, 1.0f};
+    if (g_transparentBg.load()) {
+        slate[0] = slate[1] = slate[2] = slate[3] = 0.0f;
+    }
+    VkClearColorValue clearColor = dxr::VkDisplayReferredClearColor(imageFormat, slate);
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
 
@@ -3354,7 +3367,8 @@ static void RenderThreadFunc(
                                 g_sceneMsFrames.fetch_add(1, std::memory_order_relaxed);
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
+                                    (*swapchainVkImages)[imageIndex], colorFormat,
+                                    xr->swapchain.width, xr->swapchain.height);
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime

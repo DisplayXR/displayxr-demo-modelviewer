@@ -121,6 +121,7 @@
 #include "model_renderer.h"
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z, or DXR_RECENTER_PIN)
 #include "auto_fit.h"          // dxr::AutoFitVHeight — shared width-aware load-time framing
+#include "vk_clear.h"         // dxr::VkDisplayReferredClearColor — clear-space policy (#1647)
 #include "model_fit.h"         // modelviewer::FitVHeight — the page-parity framing rule
 #include "model_loader.h"
 #include "mode_switch.h"       // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (V / 0-8)
@@ -2468,7 +2469,7 @@ static std::string MakeCaptureAtlasPrefix(const std::string& stem, uint32_t cols
 static VkCommandPool g_clearPool = VK_NULL_HANDLE;
 
 static void ClearAtlasImage(VkDevice dev, VkQueue queue, uint32_t queueFamily,
-                            VkImage image, bool transparent) {
+                            VkImage image, VkFormat imageFormat, bool transparent) {
     if (dev == VK_NULL_HANDLE || image == VK_NULL_HANDLE) return;
     if (g_clearPool == VK_NULL_HANDLE) {
         VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -2501,8 +2502,20 @@ static void ClearAtlasImage(VkDevice dev, VkQueue queue, uint32_t queueFamily,
 
     // Fully transparent in transparent mode (the desktop shows through while
     // the user is still picking a file); the viewer's usual slate otherwise.
-    VkClearColorValue color = transparent ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
-                                          : VkClearColorValue{{0.1f, 0.1f, 0.12f, 1.0f}};
+    //
+    // This clear lands DIRECTLY on the swapchain image — no intermediate, no
+    // blit — so unlike ModelRenderer's clear the target's own format IS the
+    // answer, and the format-derived helper is the right one (clear_policy.h;
+    // runtime #1647/#1644). On an `_SRGB` swapchain the clear is taken as
+    // scene-linear and encoded on write, so the authored display-referred
+    // slate must be linearised first or it comes out washed out. (0,0,0,0) is
+    // a fixed point of the EOTF, so the transparent arm is unchanged either
+    // way; it goes through the same call so there is one rule here, not two.
+    float slate[4] = {0.1f, 0.1f, 0.12f, 1.0f};
+    if (transparent) {
+        slate[0] = slate[1] = slate[2] = slate[3] = 0.0f;
+    }
+    VkClearColorValue color = dxr::VkDisplayReferredClearColor(imageFormat, slate);
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
 
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2988,7 +3001,7 @@ int main(int argc, char** argv) {
                     const VkFormat swapFormat = (VkFormat)xr.swapchain.format;
                     if (!g_modelRenderer.hasModel()) {
                         ClearAtlasImage(vkDevice, graphicsQueue, queueFamilyIndex,
-                                        targetImage, g_transparentBg);
+                                        targetImage, swapFormat, g_transparentBg);
                     }
                     if (g_modelRenderer.hasModel()) {
                         for (int eye = 0; eye < eyeCount; eye++)

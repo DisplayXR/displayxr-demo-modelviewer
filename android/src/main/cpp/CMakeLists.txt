@@ -46,15 +46,20 @@ FetchContent_Declare(stb
     GIT_TAG        master)
 FetchContent_MakeAvailable(stb)
 
-# ── displayxr-common (header-only rules: dxr_view_config.h) ───────────────
-# DxrSelectViewConfigType + DxrAliasInactiveViews (runtime #1486 / ADR-041)
-# come from displayxr-common — the ONE shared implementation every leg uses.
-# Sources only: don't run its CMake (the STATIC lib carries desktop platform
-# sources); the header-only common/ dir is appended LAST to the include path
-# so no local header is shadowed.
+# ── displayxr-common (header-only rules: dxr_view_config.h, vk_clear.h) ───
+# DxrSelectViewConfigType + DxrAliasInactiveViews (runtime #1486 / ADR-041) and
+# the clear-space policy (clear_policy.h + vk_clear.h, displayxr-common#56 —
+# model_renderer.cpp includes it) come from displayxr-common: the ONE shared
+# implementation every leg uses. Sources only: don't run its CMake (the STATIC
+# lib carries desktop platform sources); the header-only common/ dir is appended
+# LAST to the include path so no local header is shadowed.
+#
+# Keep this tag EQUAL to the desktop pin in common/CMakeLists.txt — the two legs
+# compile the same model_common sources, so a skew here is a header that exists
+# on one leg and not the other.
 FetchContent_Declare(displayxr_common_rules
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG        v2.15.0
+    GIT_TAG        v2.19.0
     GIT_SHALLOW    TRUE)
 FetchContent_GetProperties(displayxr_common_rules)
 if(NOT displayxr_common_rules_POPULATED)
