@@ -169,6 +169,7 @@ STABLE_SONAMES=(
     libxcb.so.1                     # libxcb1
     libwayland-client.so.0          # libwayland-client0 (native-Wayland window, displayxr::linux_window)
     libxkbcommon.so.0               # libxkbcommon0 (Wayland keysyms)
+    libdbus-1.so.3                  # libdbus-1-3 (Wayland drag lattice, displayxr::linux_window)
     libz.so.1                       # zlib1g
 )
 

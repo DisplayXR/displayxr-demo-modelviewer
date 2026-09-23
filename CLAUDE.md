@@ -186,9 +186,12 @@ runtime weaves window-relative.
 
 The platform is picked by capability at startup, never from session
 environment variables. `--platform=x11|wayland|auto` selects it, and the
-default is `auto`: X11 whenever an X server answers (XWayland counts), native
-Wayland otherwise. On each auto run the probe also logs whether native Wayland
-is "ready".
+default is `auto`, which picks native Wayland when the compositor is ready and
+X11 otherwise (XWayland counts). "Ready" means the compositor offers
+fractional-scale and viewporter, and the window-geometry extension is live on
+D-Bus. Ubuntu 22.04 therefore gets X11. The verdict is logged on every auto
+run. On native Wayland the drag is phase-snapped through the compositor's drag
+lattice, which needs the extension version that serves it.
 
 Hosted-NULL survives only as the fallback when no window system answers. That
 fallback is what keeps the target compiling and startable on a headless CI

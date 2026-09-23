@@ -15,9 +15,10 @@
  * other demos. It owns a toplevel on the 3D panel and passes it via
  * XR_DXR_xlib_window_binding or XR_DXR_wayland_surface_binding, so the runtime
  * weaves window-relative and the app receives input. The platform is chosen
- * by capability at startup (--platform=x11|wayland|auto, default auto: X11
- * whenever an X server answers — XWayland counts — else native Wayland; never
- * by reading session environment variables). The window defaults to
+ * by capability at startup (--platform=x11|wayland|auto; default auto: native
+ * Wayland when the compositor is ready — fractional-scale + viewporter + the
+ * window-geometry extension on D-Bus — else X11, XWayland counting; never by
+ * reading session environment variables). The window defaults to
  * 1920x1080 centred on the panel (XR_DXR_display_info desktop rect);
  * MODEL_WINDOW="WxH+X+Y" overrides (the position is X11-only — a Wayland
  * client cannot place itself). Asking for exactly the panel's size makes it

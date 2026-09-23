@@ -10,7 +10,7 @@
 #
 # Needs an X server (XWayland counts) or a Wayland compositor. The app picks the
 # window platform by capability: --platform=x11|wayland|auto (default auto =
-# X11 whenever an X server answers, native Wayland otherwise).
+# native Wayland when the compositor is ready, else X11).
 #
 # Usage: scripts/run_modelviewer_handle_vk_linux.sh [--platform=x11|wayland|auto] [extra args...]
 set -euo pipefail
