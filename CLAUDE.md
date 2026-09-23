@@ -177,12 +177,24 @@ bare binary (the dev launcher aligns the app + runtime on one Vulkan loader).
 `./scripts/build_linux.sh` builds `build/linux/model_viewer_handle_vk_linux`
 (system Vulkan via `libvulkan-dev`, OpenXR loader built from source pinned to
 release **1.1.43** — do NOT bump). The Linux entry point (`linux/main.cpp`) is a
-**HANDLE app**: it creates its own X11 toplevel on the 3D panel and passes it
-via `XR_DXR_xlib_window_binding`, so the runtime weaves window-relative.
-(Hosted-NULL survives only as the no-X-server fallback, which is what keeps the
-target compiling and startable on a headless CI runner.) First validated on
-real hardware 2026-09-20: Acer SpatialLabs DS1 on Ubuntu 26.04 / GNOME Wayland,
-the app running as an X11/XWayland client — it renders and weaves.
+**HANDLE app** and **one binary for X11 and native Wayland**. Its window is
+displayxr-common's `displayxr::linux_window` (`dxr_linux_window.h`), the one
+Linux window implementation, shared with the runtime's test apps and the other
+demos. **Never copy window code back into this repo.** The window passes
+`XR_DXR_xlib_window_binding` or `XR_DXR_wayland_surface_binding`, so the
+runtime weaves window-relative.
+
+The platform is picked by capability at startup, never from session
+environment variables. `--platform=x11|wayland|auto` selects it, and the
+default is `auto`: X11 whenever an X server answers (XWayland counts), native
+Wayland otherwise. On each auto run the probe also logs whether native Wayland
+is "ready".
+
+Hosted-NULL survives only as the fallback when no window system answers. That
+fallback is what keeps the target compiling and startable on a headless CI
+runner. The app was first validated on real hardware 2026-09-20, on a
+3840x2160 panel under Ubuntu 26.04 / GNOME Wayland, running as an X11/XWayland
+client: it renders and weaves.
 `linux/stb_image_impl_linux.cpp` supplies the single `STB_IMAGE_IMPLEMENTATION`
 TU (displayxr::common only ships it for Win/macOS). Dev run (needs a Linux
 runtime + GPU + X server): `build/linux/run_modelviewer_linux.sh`. CI:
@@ -195,7 +207,9 @@ The Linux leg transliterates `windows/main.cpp` plus displayxr-common's
 sensitivities and clamps included — LMB-drag orbit at 0.005 rad/px with the
 ±1.4 rad pitch clamp, double-click focus, wheel zoom with the Shift/Ctrl/Alt
 variants, WASDEQ, SPACE, C, V, 0-8, T, I, M, N, K, L, G, `[`/`]`, `-`/`=`,
-Ctrl+O, F11, P-then-X/Y/Z, ESC. Two divergences, both forced by X11:
+Ctrl+O, F11, P-then-X/Y/Z, ESC. Keys come from the window helper as X11
+keysyms on both backends, so the one key switch serves X11 and Wayland. Two
+divergences, both forced by the Linux window systems:
 
 1. **The app owns the window drag, so the decorations are client-side.**
    A windowed 3D app has to keep the woven interlace phase invariant while it
@@ -204,12 +218,11 @@ Ctrl+O, F11, P-then-X/Y/Z, ESC. Two divergences, both forced by X11:
    X11 has no equivalent — a WM-drawn title bar is mutter's, the drag runs in
    mutter's grab loop, and the client only learns the result via
    `ConfigureNotify` — and Wayland has no client positioning at all. So the
-   window draws its own GNOME-style header bar. The bar is displayxr-common's
-   `displayxr::csd`, the ONE chrome implementation, shared with the runtime's
-   native-Wayland test-app leg (displayxr-common#52). This app keeps only the
-   X11 glue, in `linux/csd_titlebar_x11.{h,cpp}`. On the ARGB visual the bar is
-   translucent with rounded top corners; on an opaque visual it is opaque and
-   square. Never re-vendor the painter here:
+   window draws its own GNOME-style header bar: `displayxr::csd`, drawn by the
+   window helper on both backends (`desc.x11_header_bar` on X11; the Wayland
+   chrome is always on). On the ARGB visual the bar is translucent with rounded
+   top corners; on an opaque visual it is opaque and square. Never re-vendor the
+   painter or its glue here:
    LMB on it drags through `xrWeaveSnapWindowRectDXR` (INV-1.3, runtime #1588),
    with minimize + close buttons; RMB-drag anywhere also moves the window (the
    `dxr::RmbWindowDrag` convention). **The bar is OUTSIDE the window the runtime
@@ -229,9 +242,12 @@ Ctrl+O, F11, P-then-X/Y/Z, ESC. Two divergences, both forced by X11:
    snap path with nobody at the mouse; `DXR_CSD_SCALE` / `DXR_CSD_FONT` override
    the bar's scale (default `Xft.dpi`/96) and title font (default fontconfig bold
    sans).
+   On native Wayland there is no client positioning, so the bar and the RMB
+   drag start the compositor's own move (`xdg_toplevel.move`) and the runtime
+   tracks the phase through the window-geometry service.
    **`XR_DXR_weave` is strictly optional here:** the entry point is resolved at
-   runtime and desktop Linux does not serve it yet (runtime#1588 / PR#1592 is
-   unmerged), in which case the app logs one line and drags unsnapped.
+   runtime (`DxrWeaveSnap`); when a runtime does not serve it the drag runs
+   unsnapped.
 2. **No HUD, no toasts, no button bar.** `HudRenderer` is a Direct2D +
    DirectWrite rasterizer; there is no Linux backend. Every state change that
    would have been a toast is a `LOG_INFO` line instead. TAB tracks a
@@ -242,13 +258,16 @@ is always created on a 32-bit ARGB visual and the session with
 `XR_DXR_xlib_window_binding`'s `transparentBackgroundEnabled = XR_TRUE`, exactly
 as `windows/xr_session.cpp` does unconditionally: the runtime fixes the
 swapchain's compositeAlpha at `xrCreateSession`, so Ctrl+T can only change what
-the app draws (alpha-0 clear + no skybox), never the session. Transparent mode
-sets an XShape **ShapeInput** region from the frame's own rendered alpha
+the app draws (alpha-0 clear + no skybox), never the session. On Wayland the
+same flag rides `XR_DXR_wayland_surface_binding`. Transparent mode sets an
+input region (applied by the window helper: an XShape **ShapeInput** region on
+X11, the surface's input region on Wayland) from the frame's own rendered alpha
 (`linux/clickthrough.{h,cpp}`: downscale-blit of the first+last view tiles out of
 the atlas, fence-pipelined HOST_CACHED readback, alpha > 8, 1-texel dilation,
 run/band-folded rects — the Windows `dxr::ClickThroughRegion` recipe with the
 avatar's X11 application code), so clicks land on the model and pass through
-elsewhere; it also sets `_NET_WM_STATE_ABOVE` (Windows' HWND_TOPMOST). Opaque
+elsewhere; it also sets keep-above (`_NET_WM_STATE_ABOVE` on X11, Windows'
+HWND_TOPMOST; Wayland has no protocol for it). Opaque
 mode drops the shape and the ABOVE state. It does NOT re-render the model into a
 scratch raster the way `displayxr-demo-avatar/linux/clickthrough.cpp` does: this
 repo's `renderEye` sizes its MSAA targets to `imageWidth/imageHeight`, so a

@@ -9,14 +9,15 @@
 #
 # linux/main.cpp is the Linux entry point (issue #40, M8 Linux epic
 # runtime#699): system Vulkan (native ICD, no MoltenVK) + OpenXR session +
-# ModelRenderer, as a HANDLE app — the app owns an X11 toplevel on the 3D panel
-# and passes it via XR_DXR_xlib_window_binding, so the runtime weaves
-# window-relative. Full mouse + keyboard parity with the Windows leg (LMB
-# orbit, wheel zoom, V/0-8 rendering mode, ...) and a client-owned, phase-
-# snapped window drag on RMB. Falls back to hosted-NULL when no X server is
-# available, which also keeps CI compiling (CI builds, it does not run — no
-# GPU/display). Validated on real hardware (Acer SpatialLabs DS1, Ubuntu 26.04
-# GNOME/XWayland). See ../PORTING.md and the runtime's
+# ModelRenderer, as a HANDLE app — ONE binary for X11 and native Wayland: the
+# window is displayxr-common's displayxr::linux_window, which picks the
+# platform by capability at startup (--platform=x11|wayland|auto) and passes
+# XR_DXR_xlib_window_binding or XR_DXR_wayland_surface_binding, so the runtime
+# weaves window-relative. Full mouse + keyboard parity with the Windows leg
+# (LMB orbit, wheel zoom, V/0-8 rendering mode, ...), a header bar, and a
+# phase-snapped window drag on RMB (X11). Falls back to hosted-NULL when no
+# window system answers, which also keeps CI compiling (CI builds, it does not
+# run — no GPU/display). See ../PORTING.md and the runtime's
 # docs/guides/displayxr-app-rules.md (INV-1.3).
 
 cmake_minimum_required(VERSION 3.21)
@@ -28,14 +29,14 @@ endif()
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
-# X11 + Xrandr — the handle app owns an X11 window (panel placement via RandR).
-# Requires libx11-dev + libxrandr-dev (CI installs both).
-find_package(X11 REQUIRED)
-if(NOT X11_Xrandr_LIB)
-    message(FATAL_ERROR "libxrandr-dev not found — required for panel-centered window placement")
-endif()
-if(NOT X11_Xext_LIB)
-    message(FATAL_ERROR "libXext not found — install libxext-dev (XShape click-through)")
+# The window — X11 (required: libx11-dev) and native Wayland (libwayland-dev +
+# libwayland-bin, libxkbcommon-dev) — comes from displayxr-common's
+# displayxr::linux_window, which detects and links its own window-system
+# libraries (Xrandr for the panel monitor, Xext for XShape click-through).
+# The top-level adds ../common first, which fetches displayxr-common.
+if(NOT TARGET displayxr::linux_window)
+    message(FATAL_ERROR "displayxr::linux_window is not available — install libx11-dev "
+                        "(and libwayland-dev libxkbcommon-dev for the native-Wayland leg)")
 endif()
 
 # OpenXR loader — CONFIG package first (a dev/CI loader built to
@@ -65,8 +66,7 @@ endif()
 
 add_executable(model_viewer_handle_vk_linux
     main.cpp
-    clickthrough.cpp    # XShape input-region punch-through (Ctrl+T transparent mode)
-    csd_titlebar_x11.cpp # X11 glue for the shared header bar (displayxr::csd)
+    clickthrough.cpp    # input-region punch-through (Ctrl+T transparent mode)
     # The single stb_image implementation TU (displayxr::common only ships it
     # for Win/macOS; the model_common loaders take declarations only).
     stb_image_impl_linux.cpp
@@ -80,13 +80,10 @@ target_include_directories(model_viewer_handle_vk_linux PRIVATE
 
 target_link_libraries(model_viewer_handle_vk_linux PRIVATE
     sr_common_base
-    displayxr::csd      # the ONE client-side header bar (displayxr-common#52)
+    displayxr::linux_window # the ONE Linux window: X11 or Wayland, header bar, drag, click-through
     model_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
-    ${X11_LIBRARIES}
-    ${X11_Xrandr_LIB}   # Xrandr — panel rect for window centering (needs libxrandr-dev)
-    ${X11_Xext_LIB}     # XShape — click-through input region (needs libxext-dev)
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a

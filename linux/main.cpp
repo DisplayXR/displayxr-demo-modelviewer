@@ -2,21 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  Linux Vulkan OpenXR glTF/PBR model viewer (handle app, X11 window).
+ * @brief  Linux Vulkan OpenXR glTF/PBR model viewer (handle app, X11 or Wayland).
  *
  * The Linux arm of displayxr-demo-modelviewer. Renders glTF/STL/OBJ/FBX/USD
  * models on tracked 3D displays via OpenXR + Vulkan, reusing the vendor-neutral
  * model_common/ModelRenderer PBR pipeline shared with the macOS (macos/main.mm)
  * and Windows (windows/main.cpp) entry points.
  *
- * WINDOWING — HANDLE app: the app owns an X11 toplevel on the 3D panel and
- * passes it via XR_DXR_xlib_window_binding, so the runtime weaves
- * window-relative (runtime#729/#730) and the app receives input. The window
- * defaults to 1920x1080 centred on the panel (XR_DXR_display_info desktop rect,
- * else Xrandr); MODEL_WINDOW="WxH+X+Y" overrides. Asking for exactly the
- * panel's size makes it genuinely fullscreen on that monitor (INV-1.3).
- * When no X server is available the app falls back to hosted-NULL, which also
- * keeps it compiling and startable on a headless CI runner.
+ * WINDOWING — HANDLE app, ONE binary for X11 and native Wayland: the window is
+ * displayxr-common's displayxr::linux_window (dxr_linux_window.h), the one
+ * Linux window implementation shared with the runtime's test apps and the
+ * other demos. It owns a toplevel on the 3D panel and passes it via
+ * XR_DXR_xlib_window_binding or XR_DXR_wayland_surface_binding, so the runtime
+ * weaves window-relative and the app receives input. The platform is chosen
+ * by capability at startup (--platform=x11|wayland|auto, default auto: X11
+ * whenever an X server answers — XWayland counts — else native Wayland; never
+ * by reading session environment variables). The window defaults to
+ * 1920x1080 centred on the panel (XR_DXR_display_info desktop rect);
+ * MODEL_WINDOW="WxH+X+Y" overrides (the position is X11-only — a Wayland
+ * client cannot place itself). Asking for exactly the panel's size makes it
+ * genuinely fullscreen on that monitor (INV-1.3). When no window system
+ * answers the app falls back to hosted-NULL, which also keeps it startable on
+ * a headless CI runner.
  *
  * INPUT — parity with windows/main.cpp + displayxr-common's input_handler.cpp,
  * sensitivities and clamps included:
@@ -33,18 +40,18 @@
  * DRAG PHASE SNAP — a windowed 3D app must keep the woven interlace phase
  * invariant while it moves or the 3D shimmers. X11 gives the client no hook
  * into a WM-owned drag (Windows proposes each step via WM_WINDOWPOSCHANGING;
- * X11 only reports the result afterwards), so the app owns the drag itself,
- * routing every step through xrWeaveSnapWindowRectDXR (XR_DXR_weave). That
- * rules out SERVER-side decorations, not decorations: the window carries a
- * CLIENT-side GNOME-style header bar (displayxr-common's displayxr::csd,
- * glued to X11 by linux/csd_titlebar_x11.{h,cpp}) — translucent with rounded
- * corners on the ARGB visual — LMB on the bar drags through the same snapped path, with close and minimize buttons —
- * and RMB-drag anywhere still moves it too (useful when mostly transparent). That
- * extension is OPTIONAL and currently unserved on desktop Linux
- * (runtime#1588 / PR#1592): the entry point is resolved at runtime and, when
- * absent, the app logs one line and drags unsnapped. DXR_X11_WM_DECORATIONS=1
- * restores a decorated, WM-dragged window; DXR_X11_TEST_DRAG="dx,dy,steps"
- * walks the window through the same snap path with nobody at the mouse.
+ * X11 only reports the result afterwards), so on X11 the window helper owns
+ * the drag itself, routing every step through xrWeaveSnapWindowRectDXR
+ * (XR_DXR_weave, via DxrWeaveSnap). That rules out SERVER-side decorations,
+ * not decorations: the window carries a CLIENT-side GNOME-style header bar
+ * (displayxr::csd — translucent with rounded corners on the ARGB visual);
+ * LMB on the bar drags through the same snapped path, with close and minimize
+ * buttons, and RMB-drag anywhere still moves it too (useful when mostly
+ * transparent). On native Wayland the same gestures start the compositor's
+ * own move. The snap extension is OPTIONAL: resolved at runtime and, when
+ * absent, the drag runs unsnapped. DXR_X11_WM_DECORATIONS=1 restores a
+ * decorated, WM-dragged window; DXR_X11_TEST_DRAG="dx,dy,steps" walks the
+ * window through the same snap path with nobody at the mouse.
  *
  * TRANSPARENT BACKGROUND (Ctrl+T) + CLICK-THROUGH — Windows parity. The window
  * is created on a 32-bit ARGB visual and the session is created with
@@ -55,9 +62,11 @@
  * changes what the app draws. Opaque mode writes alpha = 1 everywhere, which a
  * PRE_MULTIPLIED surface shows exactly as before. Transparent mode clears to
  * alpha 0, skips the skybox, and punches the window through to the desktop with
- * an XShape ShapeInput region built from the frame's own rendered alpha
- * (linux/clickthrough.cpp — the X11 analogue of the Windows SetWindowRgn
- * punch). A compositing WM must be running for the desktop to show through.
+ * an input region built from the frame's own rendered alpha
+ * (linux/clickthrough.cpp — the analogue of the Windows SetWindowRgn punch;
+ * the helper applies it as an XShape ShapeInput region on X11 and as the
+ * surface input region on Wayland). On X11 a compositing WM must be running
+ * for the desktop to show through.
  *   MODEL_TRANSPARENT=1 (or --transparent) starts transparent instead of opaque.
  *   MODEL_TRANSPARENT=0 opts out of the capability entirely — opaque root
  *   visual, transparentBackgroundEnabled = XR_FALSE, Ctrl+T reports and no-ops.
@@ -79,11 +88,13 @@
 
 // X11 window + input (handle app) — before the OpenXR platform header so the
 // xlib binding struct sees the real Display/Window types.
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/Xatom.h>
+// The Linux window (displayxr::linux_window). It pulls in Xlib (and, in a
+// build with libwayland, <wayland-client.h>) BEFORE the window-binding
+// extension headers, so those see the real Display / Window / wl_display /
+// wl_surface types. Keys arrive as X11 keysyms on both backends.
+#include "dxr_linux_window.h"
+#include "dxr_weave_snap.h"
 #include <X11/keysym.h>
-#include <X11/extensions/Xrandr.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
@@ -91,6 +102,7 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
+#include <openxr/XR_DXR_wayland_surface_binding.h>
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_weave.h>   // xrWeaveSnapWindowRectDXR — drag phase-snap (runtime#1588)
 
@@ -126,8 +138,7 @@
 #include "mode_switch.h"       // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (V / 0-8)
 #include "rig_mode.h"          // dxr::RigResetToInitial / RigToggleMode — SPACE + C
 #include "dxr_view_math.h"     // dxr_rig_max_ipd_factor — camera-rig IPD comfort ceiling
-#include "clickthrough.h"      // XShape input-region punch-through (Ctrl+T transparent mode)
-#include "csd_titlebar_x11.h" // shared client-side header bar (displayxr::csd) + its X11 glue
+#include "clickthrough.h"      // input-region punch-through (Ctrl+T transparent mode)
 
 // ============================================================================
 // Logging
@@ -163,25 +174,25 @@ static uint32_t g_windowW = 1280, g_windowH = 720;
 // paint an OS frame. This window is already undecorated and client-dragged in
 // every mode (the drag phase snap needs that — see the header block), so there
 // is no style to swap and no second flag: the only structural side effect of
-// Ctrl+T here is the XShape input region, plus _NET_WM_STATE_ABOVE to mirror
-// the Windows HWND_TOPMOST / HWND_NOTOPMOST behaviour.
+// Ctrl+T here is the click-through input region, plus keep-above
+// (_NET_WM_STATE_ABOVE on X11) to mirror the Windows HWND_TOPMOST /
+// HWND_NOTOPMOST behaviour.
 //
-// g_transparentCapable is fixed at startup: the ARGB visual is chosen at
-// XCreateWindow and transparentBackgroundEnabled at xrCreateSession, and
-// NEITHER can be changed live. Drawing a transparent frame into an opaque
+// g_transparentCapable is fixed at startup: the ARGB visual is chosen when
+// the window is created and transparentBackgroundEnabled at xrCreateSession,
+// and NEITHER can be changed live. Drawing a transparent frame into an opaque
 // session gives BLACK where the desktop should be, not see-through — so when
 // the capability is off, Ctrl+T must refuse rather than "work" and look broken.
 static bool g_transparentCapable = true;
 static bool g_transparentBg = false;
 static bool g_launchTransparent = false; //!< --transparent on the command line
-static Colormap g_argbColormap = 0;   //!< freed with the window; 0 = root visual
-static Visual* g_visual = nullptr;     //!< the top-level's visual (the header bar packs pixels for it)
 
-// Client-side decorations — see linux/csd_titlebar_x11.h and the window-pair
-// notes on AppXrSession::xContent.
-static dxr_csd::TitleBar g_titleBar;
-static bool g_csdEnabled = false;   // client-owned drag at create time (not WM-decorated, not fullscreen)
-static int g_contentOffsetApplied = -1; // the child's current y inside the top-level
+// The window — X11 or native Wayland, header bar, drag, click-through — is
+// displayxr-common's displayxr::linux_window. Destroyed LAST (the runtime's
+// VkSurfaceKHR borrows its connection).
+static DxrLinuxWindow g_window;
+//! Title last pushed to the window (the header bar shows the loaded file).
+static std::string g_windowTitle;
 
 // ----------------------------------------------------------------------------
 // Input state — the Linux transliteration of displayxr-common's InputState
@@ -222,7 +233,6 @@ struct InputState {
     bool cycleClipRequested = false;            // N
     bool playPauseRequested = false;            // K
     bool loadRequested = false;                 // Ctrl+O
-    bool fullscreenToggleRequested = false;     // F11
     bool transparentBgToggleRequested = false;  // Ctrl+T
     bool hudVisible = false;                    // TAB (no HUD on this leg yet — tracked only)
 
@@ -306,127 +316,13 @@ static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 //
 // The vendor display processor weaves at a phase that is a function of the
 // window's ABSOLUTE position in physical panel pixels. Drag the window and the
-// phase travels with it; drag it continuously and the 3D shimmers. The cure is
-// invariance, not correction: the window is only ever allowed to land on the
-// lens lattice, so the woven pattern is identical at every position the drag
-// visits. The lattice is the vendor's and never leaves the DP — the app only
-// asks "given I started here and want to go there, where may I land?".
-//
-// STRICTLY OPTIONAL. The entry point is resolved at runtime; the desktop-Linux
-// runtime does not serve it yet (runtime#1588 / PR#1592 is unmerged), in which
-// case this reports identity ONCE and every drag step goes to the raw
-// pointer-derived target. Nothing else about the drag changes when it lands.
-// Mirrors test_apps/common/dxr_weave_snap.h.
+// phase travels with it; drag it continuously and the 3D shimmers. The window
+// helper owns the drag on X11 and routes every step through this provider
+// (displayxr-common's DxrWeaveSnap). STRICTLY OPTIONAL: when the runtime does
+// not serve the entry point, it reports identity once and the drag lands on
+// the raw pointer position.
 // ---------------------------------------------------------------------------
-struct WeaveSnap {
-    PFN_xrWeaveSnapWindowRectDXR pfn = nullptr;
-    XrSession session = XR_NULL_HANDLE;
-    int32_t w = 0, h = 0;
-    bool failed = false;
-    bool reported = false;
-
-    void attach(XrInstance instance, XrSession s, uint32_t extentW, uint32_t extentH) {
-        session = s; w = (int32_t)extentW; h = (int32_t)extentH; pfn = nullptr;
-        if (instance == XR_NULL_HANDLE || s == XR_NULL_HANDLE) return;
-        PFN_xrVoidFunction fn = nullptr;
-        if (xrGetInstanceProcAddr(instance, "xrWeaveSnapWindowRectDXR", &fn) == XR_SUCCESS &&
-            fn != nullptr) {
-            pfn = reinterpret_cast<PFN_xrWeaveSnapWindowRectDXR>(fn);
-        }
-    }
-    void setExtent(uint32_t nw, uint32_t nh) { w = (int32_t)nw; h = (int32_t)nh; }
-    bool available() const { return pfn != nullptr; }
-
-    //! origin/target are ABSOLUTE root (desktop) pixels — the phase is absolute.
-    //! Only the offset is snapped; the extent passes through per the spec.
-    bool snap(int32_t originX, int32_t originY, int32_t targetX, int32_t targetY,
-              int32_t* outX, int32_t* outY) {
-        if (pfn == nullptr || session == XR_NULL_HANDLE) return false;
-        XrRect2Di origin = {};
-        origin.offset.x = originX; origin.offset.y = originY;
-        origin.extent.width = w; origin.extent.height = h;
-        XrRect2Di target = origin;
-        target.offset.x = targetX; target.offset.y = targetY;
-        XrRect2Di snapped = {};
-        const XrResult res = pfn(session, &origin, &target, &snapped);
-        if (res != XR_SUCCESS) {
-            if (!failed) {
-                failed = true;
-                LOG_WARN("xrWeaveSnapWindowRectDXR failed (%d) — the window drag falls back to "
-                         "an unsnapped position for the rest of this run", (int)res);
-            }
-            pfn = nullptr;
-            return false;
-        }
-        *outX = snapped.offset.x; *outY = snapped.offset.y;
-        return true;
-    }
-};
-
-static WeaveSnap g_weaveSnap;
-
-// Client-owned drag bookkeeping (RMB; LMB is the model orbit).
-static bool g_dragging = false;
-static unsigned int g_dragButton = 0;            // Button3 (anywhere) or Button1 (header bar)
-static int g_dragPtrX = 0, g_dragPtrY = 0;       // pointer root position at the grab
-static int g_dragOriginX = 0, g_dragOriginY = 0; // window root origin at the grab (snap origin)
-static int g_dragAtX = 0, g_dragAtY = 0;         // where the window was last moved to
-static uint64_t g_dragMoves = 0, g_dragSnapped = 0;
-
-// Headless drag test hook (DXR_X11_TEST_DRAG="dx,dy,steps") — walks the window
-// along a straight path through the very same snap -> XMoveWindow code the
-// pointer drag uses, so the mechanics are verifiable with nobody at the mouse.
-static bool g_testDragArmed = false, g_testDragDone = false;
-static int g_testDragDx = 0, g_testDragDy = 0, g_testDragSteps = 0, g_testDragStep = 0;
-static uint64_t g_pumpCount = 0;
-
-//! Run the snap provider, or identity when it is absent / declines. Reports
-//! once, the first time it is asked, what it resolved to.
-static void SnapDragOrigin(int originX, int originY, int targetX, int targetY,
-                           int* outX, int* outY) {
-    int32_t sx = (int32_t)targetX, sy = (int32_t)targetY;
-    const bool snapped = g_weaveSnap.snap((int32_t)originX, (int32_t)originY,
-                                          (int32_t)targetX, (int32_t)targetY, &sx, &sy);
-    if (!snapped) { sx = (int32_t)targetX; sy = (int32_t)targetY; }
-    if (!g_weaveSnap.reported) {
-        g_weaveSnap.reported = true;
-        LOG_INFO("drag: snap provider %s — %s",
-                 g_weaveSnap.available() ? "installed" : "ABSENT (identity)",
-                 snapped ? "the display processor IS snapping window origins"
-                         : "identity for now (no DP lattice snap on this runtime); "
-                           "the drag mechanics are unaffected");
-    }
-    *outX = (int)sx; *outY = (int)sy;
-}
-
-//! SnapDragOrigin() + XMoveWindow, skipping a move that would not change the
-//! window's position. Logs only when the snap actually moved the point.
-//! Drag geometry convention — ONE window's coordinates throughout, never mixed:
-//! origin, target, snapped result and g_dragAt* are all the CONTENT child's
-//! absolute origin (the bound window, whose rect the display processor
-//! weaves), and only the final XMoveWindow converts to the top-level by the
-//! constant offset captured at drag start. The vendor snap only uses the
-//! displacement origin -> target, so the top-level would also work; the
-//! content child was chosen so the rect handed to xrWeaveSnapWindowRectDXR
-//! (content origin + content extent) is exactly the woven rect.
-static int g_dragContentOffX = 0, g_dragContentOffY = 0;
-
-static void MoveWindowSnapped(Display* dpy, Window win, int targetX, int targetY) {
-    if (dpy == nullptr || win == 0) return;
-    int sx = targetX, sy = targetY;
-    SnapDragOrigin(g_dragOriginX, g_dragOriginY, targetX, targetY, &sx, &sy);
-    if (sx != targetX || sy != targetY) {
-        g_dragSnapped++;
-        LOG_INFO("drag: raw (%d, %d) -> snapped (%d, %d)", targetX, targetY, sx, sy);
-    }
-    if (sx == g_dragAtX && sy == g_dragAtY) return; // the lattice swallowed this step
-    // Snapped in CONTENT-child coordinates; the WM moves the TOP-LEVEL, which
-    // sits a constant offset up/left of it for the whole drag.
-    XMoveWindow(dpy, win, sx - g_dragContentOffX, sy - g_dragContentOffY);
-    XFlush(dpy);
-    g_dragAtX = sx; g_dragAtY = sy;
-    g_dragMoves++;
-}
+static DxrWeaveSnap g_weaveSnap;
 
 // ============================================================================
 // Inline math — column-major float[16] (mirrors macos/main.mm)
@@ -647,7 +543,11 @@ struct AppXrSession {
 
     bool hasDisplayInfoExt = false;
     bool hasViewRigExt = false;
-    bool hasXlibBindingExt = false;   //!< XR_DXR_xlib_window_binding (handle app)
+    bool hasXlibBindingExt = false;   //!< XR_DXR_xlib_window_binding (handle app, X11)
+    bool hasWaylandBindingExt = false;//!< XR_DXR_wayland_surface_binding (handle app, Wayland)
+    //! The window platform resolved before xrCreateInstance (only its binding
+    //! extension is enabled). Auto = no usable window system: hosted-NULL.
+    DxrWindowBackend windowBackend = DxrWindowBackend::Auto;
     bool hasAtlasCaptureExt = false;  //!< XR_DXR_atlas_capture ('I')
     bool hasWeaveExt = false;         //!< XR_DXR_weave (drag phase-snap)
     float displayWidthM = 0, displayHeightM = 0;
@@ -656,18 +556,10 @@ struct AppXrSession {
     int32_t displayScreenLeft = 0;     // 3D-panel top-left in virtual-desktop px (INV-1.3)
     int32_t displayScreenTop = 0;
 
-    // App-owned X11 window (handle app). Null display = hosted-NULL fallback.
-    Display* xDisplay = nullptr;
-    //! The TOP-LEVEL window: bar + content. Stacked, moved, iconified and
-    //! fullscreened by the WM, receives every input event, carries the XShape.
-    Window xWindow = 0;
-    unsigned int xWinW = 0, xWinH = 0;   //!< top-level size
-    //! The CONTENT child — exactly the 3D area below the header bar. This is
-    //! the XID bound via XR_DXR_xlib_window_binding, so the runtime's window
-    //! rect (Kooima, canvas, weave present origin) is the visible content and
-    //! nothing else. Equal to the top-level's full rect when no bar is shown.
-    Window xContent = 0;
-    unsigned int xContentW = 0, xContentH = 0;
+    //! An app-owned window exists (g_window); false = hosted-NULL fallback.
+    //! The window's CONTENT is what is bound to the runtime — the header bar
+    //! never enters the canvas, the swapchain or the weave.
+    bool hasAppWindow = false;
 
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
@@ -698,7 +590,7 @@ struct AppXrSession {
     uint32_t maxViewCount = 2;
 };
 
-static bool InitializeOpenXR(AppXrSession& xr) {
+static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend) {
     uint32_t extCount = 0;
     xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
     std::vector<XrExtensionProperties> exts(extCount, {XR_TYPE_EXTENSION_PROPERTIES});
@@ -710,6 +602,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
         if (strcmp(e.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasXlibBindingExt = true;
+        if (strcmp(e.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) xr.hasWaylandBindingExt = true;
         if (strcmp(e.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
         if (strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeaveExt = true;
     }
@@ -719,12 +612,25 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
-    // Handle app: the session chains XrXlibWindowBindingCreateInfoDXR, so the
-    // extension has to be ENABLED, not merely present. (It was chained without
-    // being enabled until this parity pass — an out-of-spec call the runtime
-    // happened to tolerate.) Absent, CreateAppWindow is skipped and the app
-    // degrades to hosted-NULL.
-    if (xr.hasXlibBindingExt) enabled.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
+    // Handle app: resolve the window platform BEFORE xrCreateInstance, so
+    // exactly the binding extension the session will chain gets ENABLED.
+    // Capability-probed (a connection attempt + what the server advertises),
+    // never read from the session environment; an explicit --platform wins.
+    // Nothing usable: hosted-NULL (no window binding).
+    {
+        std::string why;
+        xr.windowBackend = DxrLinuxWindow::select(requestedBackend, xr.hasXlibBindingExt,
+                                                  xr.hasWaylandBindingExt, &why);
+        if (xr.windowBackend == DxrWindowBackend::Auto) {
+            LOG_WARN("No usable window platform (%s) — hosted-NULL windowing", why.c_str());
+        } else {
+            LOG_INFO("Window platform: %s (requested %s) — %s", DxrLinuxWindow::backend_name(xr.windowBackend),
+                     DxrLinuxWindow::backend_name(requestedBackend), why.c_str());
+        }
+    }
+    if (xr.windowBackend == DxrWindowBackend::X11) enabled.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
+    if (xr.windowBackend == DxrWindowBackend::Wayland)
+        enabled.push_back(XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME);
     if (xr.hasAtlasCaptureExt) enabled.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     // XR_DXR_weave carries xrWeaveSnapWindowRectDXR, the drag phase-snap the
     // client-owned window move routes every step through. Purely optional:
@@ -733,6 +639,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasWeaveExt) enabled.push_back(XR_DXR_WEAVE_EXTENSION_NAME);
     LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_xlib_window_binding: %s", xr.hasXlibBindingExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_wayland_surface_binding: %s", xr.hasWaylandBindingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_weave (drag phase-snap): %s", xr.hasWeaveExt ? "AVAILABLE" : "NOT FOUND");
 
@@ -905,29 +812,27 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueFamilyIndex = qfi;
     vkBinding.queueIndex = 0;
 
-    // Handle app: pass the app-owned X11 window via XR_DXR_xlib_window_binding
-    // so the runtime weaves window-relative (runtime#729/#730). Falls back to
-    // hosted-NULL (no window binding) when CreateAppWindow didn't run.
-    XrXlibWindowBindingCreateInfoDXR xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
-    xlibBinding.next = &vkBinding;
-    xlibBinding.xDisplay = xr.xDisplay;
-    // The CONTENT child, not the top-level: the runtime reads this window's
-    // geometry for Kooima + the present origin, so it must exclude the bar.
-    xlibBinding.window = xr.xContent;
-    // Always-on transparent-window support when the window carries an ARGB
-    // visual, exactly as windows/xr_session.cpp sets it unconditionally: the
-    // runtime picks the swapchain's compositeAlpha here and cannot change it
-    // later, so Ctrl+T can only work if the session was created this way.
-    // Opaque mode then writes alpha = 1 throughout, which a PRE_MULTIPLIED
-    // surface composites identically to a non-transparent session.
-    xlibBinding.transparentBackgroundEnabled = g_transparentCapable ? XR_TRUE : XR_FALSE;
-    const bool useAppWindow = (xr.xDisplay != nullptr && xr.xContent != 0);
+    // Handle app: the window helper hands back the binding for whichever
+    // platform it is on (XR_DXR_xlib_window_binding, or
+    // XR_DXR_wayland_surface_binding + its surface-geometry struct), bound to
+    // the CONTENT (never the header bar), with transparentBackgroundEnabled
+    // set when the window is transparent-capable — exactly as
+    // windows/xr_session.cpp sets it unconditionally: the runtime picks the
+    // swapchain's compositeAlpha here and cannot change it later, so Ctrl+T
+    // can only work if the session was created this way. Opaque mode then
+    // writes alpha = 1 throughout, which a PRE_MULTIPLIED surface composites
+    // identically to a non-transparent session. hosted-NULL: Vulkan only.
+    const bool useAppWindow = xr.hasAppWindow;
 
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
-    si.next = useAppWindow ? (const void*)&xlibBinding : (const void*)&vkBinding;
+    si.next = useAppWindow ? g_window.session_binding_chain(&vkBinding) : (const void*)&vkBinding;
     si.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
-    LOG_INFO("Session created (%s%s)", useAppWindow ? "app-owned window, handle app" : "hosted-NULL",
+    if (useAppWindow) {
+        // Arms the per-frame geometry feed (Wayland); a no-op on X11.
+        g_window.attach_session(xr.instance, xr.session);
+    }
+    LOG_INFO("Session created (%s%s)", useAppWindow ? g_window.describe().c_str() : "hosted-NULL",
              (useAppWindow && g_transparentCapable)
                  ? (g_transparentBg ? ", transparent-capable — starting TRANSPARENT"
                                     : ", transparent-capable — starting opaque (Ctrl+T toggles)")
@@ -937,7 +842,10 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     // used by the client-owned RMB drag; identity when the runtime does not
     // serve it, which is the case on desktop Linux until PR#1592 lands.
     if (useAppWindow) {
-        g_weaveSnap.attach(xr.instance, xr.session, xr.xContentW, xr.xContentH);
+        uint32_t cw = 0, ch = 0;
+        g_window.current_size(&cw, &ch);
+        g_weaveSnap.attach(xr.instance, xr.session, cw, ch);
+        g_window.set_snap_provider(&DxrWeaveSnap::callback, &g_weaveSnap);
         LOG_INFO("xrWeaveSnapWindowRectDXR: %s — a window drag %s",
                  g_weaveSnap.available() ? "RESOLVED" : "unavailable on this runtime",
                  g_weaveSnap.available()
@@ -1111,522 +1019,101 @@ static void CleanupOpenXR(AppXrSession& xr) {
     xr.instance = XR_NULL_HANDLE;
 }
 
-//! Tear the app-owned X11 window down LAST — after the OpenXR instance AND
-//! the Vulkan instance are gone. The runtime's VkSurfaceKHR borrows this Xlib
-//! connection for its lifetime (it wraps it with XGetXCBConnection), so
-//! closing the Display before vkDestroyInstance is a use-after-free. Same
-//! ordering contract as the runtime's DxrLinuxWindow (destroy() LAST).
-static void DestroyAppWindow(AppXrSession& xr) {
-    dxr_csd_x11::Release(xr.xDisplay);
-    if (xr.xWindow != 0 && xr.xDisplay != nullptr) XDestroyWindow(xr.xDisplay, xr.xWindow);
-    if (g_argbColormap != 0 && xr.xDisplay != nullptr) { XFreeColormap(xr.xDisplay, g_argbColormap); g_argbColormap = 0; }
-    if (xr.xDisplay != nullptr) XCloseDisplay(xr.xDisplay);
-    xr.xWindow = 0;
-    xr.xContent = 0;   // destroyed with its parent
-    xr.xDisplay = nullptr;
-}
-
 // ============================================================================
-// App-owned X11 window (handle app)
+// App-owned window (handle app) — displayxr::linux_window, X11 or Wayland
 // ============================================================================
 
 static const unsigned int kDefaultWindowW = 1920;
 static const unsigned int kDefaultWindowH = 1080;
-static Atom g_wmDeleteAtom = None;
 
-//! Windowed + undecorated, so THIS app owns the drag and can phase-snap it
-//! (INV-1.3 "X11 windowed: own your drag", runtime#1588). False for a
-//! fullscreen window (a stray drag would slide the panel-sized weave off the
-//! panel) and for the DXR_X11_WM_DECORATIONS=1 escape hatch.
-static bool g_clientOwnedDrag = false;
-static bool g_windowIsFullscreen = false;
-
-// ---------------------------------------------------------------------------
-// X11 helpers — transliterated from the runtime's reference implementation,
-// test_apps/common/dxr_linux_window.cpp (DxrLinuxWindow::create_x11). Kept
-// here rather than vendoring the helper itself: that file also carries a
-// Wayland leg whose XR_DXR_wayland_surface_binding.h this repo does not vendor.
-// ---------------------------------------------------------------------------
-
-//! Rect of the RandR monitor a fullscreen request is targeted at.
-struct X11MonitorRect {
-    int index = -1;  //!< RandR monitor index, or -1 when unresolved
-    int x = 0, y = 0, width = 0, height = 0;
-    std::string name = "?";
-};
-
-static X11MonitorRect X11ResolveMonitor(Display* dpy, Window root, int32_t left, int32_t top) {
-    X11MonitorRect out;
-    int count = 0;
-    XRRMonitorInfo* mons = XRRGetMonitors(dpy, root, True /* active only */, &count);
-    if (mons == nullptr) return out;
-
-    int exact = -1, contains = -1;
-    for (int i = 0; i < count; i++) {
-        if (exact < 0 && mons[i].x == (int)left && mons[i].y == (int)top) exact = i;
-        if (contains < 0 && left >= mons[i].x && left < mons[i].x + mons[i].width &&
-            top >= mons[i].y && top < mons[i].y + mons[i].height) contains = i;
-    }
-    const int chosen = exact >= 0 ? exact : contains;
-    if (chosen >= 0) {
-        out.index = chosen;
-        out.x = mons[chosen].x; out.y = mons[chosen].y;
-        out.width = mons[chosen].width; out.height = mons[chosen].height;
-        if (mons[chosen].name != None) {
-            char* nm = XGetAtomName(dpy, mons[chosen].name);
-            if (nm != nullptr) { out.name = nm; XFree(nm); }
-        }
-    }
-    XRRFreeMonitors(mons);
-    return out;
-}
-
-//! Bounded event pump. NEVER an unbounded wait (INV-1.3 step 3).
-static void X11PumpFor(Display* dpy, int budgetMs, const std::function<bool()>& done) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
-    for (;;) {
-        XSync(dpy, False);
-        while (XPending(dpy) > 0) { XEvent ev; XNextEvent(dpy, &ev); }
-        if (done && done()) return;
-        if (std::chrono::steady_clock::now() >= deadline) return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-}
-
-//! Root-relative origin of @p win — what the WM actually did with it. NOT
-//! XGetWindowAttributes' x/y, which are PARENT-relative and so read as an
-//! offset inside the frame once a WM reparents the window. The weave phase is
-//! a function of this absolute origin, so it has to be the real one.
-static void X11RootOrigin(Display* dpy, Window win, int* outX, int* outY) {
-    Window child = 0;
-    int rx = 0, ry = 0;
-    if (XTranslateCoordinates(dpy, win, DefaultRootWindow(dpy), 0, 0, &rx, &ry, &child) == 0) {
-        rx = 0; ry = 0;
-    }
-    *outX = rx; *outY = ry;
-}
-
-//! Post an EWMH client message to the root window.
-static void X11SendRootMessage(Display* dpy, Window win, Atom type,
-                               long d0, long d1, long d2, long d3, long d4) {
-    XEvent ev = {};
-    ev.xclient.type = ClientMessage;
-    ev.xclient.send_event = True;
-    ev.xclient.display = dpy;
-    ev.xclient.window = win;
-    ev.xclient.message_type = type;
-    ev.xclient.format = 32;
-    ev.xclient.data.l[0] = d0; ev.xclient.data.l[1] = d1; ev.xclient.data.l[2] = d2;
-    ev.xclient.data.l[3] = d3; ev.xclient.data.l[4] = d4;
-    XSendEvent(dpy, DefaultRootWindow(dpy), False,
-               SubstructureRedirectMask | SubstructureNotifyMask, &ev);
-}
-
-//! Undecorated via the Motif hints, applied BEFORE the map so a frame is never
-//! created. For a panel-sized window a title bar eats pixels out of the weave
-//! (runtime#729); for a windowed one it also hands the drag to the WM, where
-//! the interlace phase cannot be snapped (runtime#1588).
-static void X11SetUndecorated(Display* dpy, Window win) {
-    Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
-    if (motif == None) return;
-    // flags=2 is MWM_HINTS_DECORATIONS, decorations=0 is "none".
-    unsigned long hints[5] = {2, 0, 0, 0, 0};
-    XChangeProperty(dpy, win, motif, motif, 32, PropModeReplace,
-                    (const unsigned char*)hints, 5);
-}
-
-//! _NET_WM_STATE_FULLSCREEN add(1) / remove(0) / toggle(2).
-static void X11SetFullscreenState(Display* dpy, Window win, long action, int monitorIndex) {
-    Atom netWmState = XInternAtom(dpy, "_NET_WM_STATE", False);
-    Atom netWmStateFullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
-    if (netWmState == None || netWmStateFullscreen == None) return;
-    X11SendRootMessage(dpy, win, netWmState, action, (long)netWmStateFullscreen, 0,
-                       1 /* source: application */, 0);
-    if (monitorIndex >= 0 && action != 0) {
-        Atom netFsMonitors = XInternAtom(dpy, "_NET_WM_FULLSCREEN_MONITORS", False);
-        if (netFsMonitors != None) {
-            X11SendRootMessage(dpy, win, netFsMonitors, monitorIndex, monitorIndex,
-                               monitorIndex, monitorIndex, 1 /* source: application */);
-        }
-    }
-    XFlush(dpy);
-}
-
-
-// Find the target panel rect (virtual-desktop px). Prefer the RandR PRIMARY
-// output; else the largest connected NON-eDP/LVDS output (the 3D display is an
-// external panel, not the laptop's built-in). Same helper as the avatar demo.
-static bool GetPanelRect(Display* dpy, Window root, int& x, int& y, int& w, int& h) {
-    XRRScreenResources* res = XRRGetScreenResources(dpy, root);
-    if (res == nullptr) return false;
-
-    auto tryOutput = [&](RROutput out) -> bool {
-        XRROutputInfo* oi = XRRGetOutputInfo(dpy, res, out);
-        if (oi == nullptr) return false;
-        bool ok = false;
-        if (oi->connection == RR_Connected && oi->crtc != 0) {
-            XRRCrtcInfo* ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
-            if (ci != nullptr && ci->width > 0 && ci->height > 0) {
-                x = ci->x; y = ci->y; w = (int)ci->width; h = (int)ci->height;
-                ok = true;
-            }
-            if (ci != nullptr) XRRFreeCrtcInfo(ci);
-        }
-        XRRFreeOutputInfo(oi);
-        return ok;
-    };
-
-    bool found = false;
-    RROutput primary = XRRGetOutputPrimary(dpy, root);
-    if (primary != 0 && tryOutput(primary)) {
-        found = true;
-    }
-    if (!found) {
-        long bestArea = 0;
-        for (int i = 0; i < res->noutput; i++) {
-            XRROutputInfo* oi = XRRGetOutputInfo(dpy, res, res->outputs[i]);
-            if (oi == nullptr) continue;
-            const bool isBuiltin = oi->name != nullptr &&
-                (strncasecmp(oi->name, "eDP", 3) == 0 || strncasecmp(oi->name, "LVDS", 4) == 0);
-            if (oi->connection == RR_Connected && oi->crtc != 0 && !isBuiltin) {
-                XRRCrtcInfo* ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
-                if (ci != nullptr && ci->width > 0 && ci->height > 0) {
-                    const long area = (long)ci->width * (long)ci->height;
-                    if (area > bestArea) {
-                        bestArea = area;
-                        x = ci->x; y = ci->y; w = (int)ci->width; h = (int)ci->height;
-                        found = true;
-                    }
-                }
-                if (ci != nullptr) XRRFreeCrtcInfo(ci);
-            }
-            XRRFreeOutputInfo(oi);
-        }
-    }
-    XRRFreeScreenResources(res);
-    return found;
-}
-
-// Create the app-owned X11 window for the viewer (opaque, default visual).
+// Create the app-owned window for the viewer.
 //
 // Two shapes, per INV-1.3:
 //   * PANEL-SIZED (MODEL_WINDOW asks for exactly the panel's pixel size) —
-//     genuinely FULLSCREEN on the panel's monitor. mutter discards every
-//     client geometry signal for a toplevel that size and decorates it, which
-//     ate 74 px of title bar out of the weave (runtime#729); fullscreen is the
-//     one WM-cooperative primitive that makes window origin == panel origin,
-//     which the weave phase depends on. Recipe: undecorate -> map -> move ->
-//     pump briefly -> _NET_WM_STATE_FULLSCREEN + _NET_WM_FULLSCREEN_MONITORS.
-//   * WINDOWED (the default: 1920x1080 centred on the panel) — undecorated and
-//     CLIENT-DRAGGED. A WM-owned drag cannot be intercepted, so the interlace
-//     phase would re-land on an arbitrary pixel every frame and the 3D would
-//     shimmer; owning the drag is what lets every move go through
+//     genuinely FULLSCREEN on the panel's monitor/output (the helper's X11
+//     EWMH recipe; on Wayland set_fullscreen on the panel's wl_output once the
+//     surface is mapped).
+//   * WINDOWED (the default: 1920x1080 centred on the panel) — a client-side
+//     header bar, and a drag the app owns on X11 so every move goes through
 //     xrWeaveSnapWindowRectDXR first (runtime#1588). Right-button drag moves
-//     the window (the dxr::RmbWindowDrag convention the Windows borderless
-//     overlay uses) — the LEFT button stays the model orbit, as on Windows and
-//     macOS. DXR_X11_WM_DECORATIONS=1 restores a decorated, WM-dragged window
-//     (and gives up the phase snap).
+//     the window anywhere (the dxr::RmbWindowDrag convention the Windows
+//     borderless overlay uses) — the LEFT button stays the model orbit, as on
+//     Windows and macOS. DXR_X11_WM_DECORATIONS=1 restores a decorated,
+//     WM-dragged X11 window (and gives up the phase snap).
 //
-// Override the size/position with MODEL_WINDOW="WxH+X+Y" (X,Y absolute
-// virtual-desktop px; WxH alone re-centres on the panel).
-// Returns false (xDisplay left null) when no X server is available, so the
-// caller falls back to hosted-NULL (also the CI-safe path).
+// MODEL_WINDOW="WxH+X+Y" overrides the size/position (X,Y absolute
+// virtual-desktop px, X11 only; WxH alone re-centres on the panel).
+// Returns false when no window could be made; the caller then falls back to
+// hosted-NULL (also the CI-safe path).
 static bool CreateAppWindow(AppXrSession& xr) {
-    Display* dpy = XOpenDisplay(nullptr);
-    if (dpy == nullptr) {
-        LOG_INFO("XOpenDisplay failed (no X server) — using hosted-NULL windowing");
-        return false;
-    }
-    int screen = DefaultScreen(dpy);
-    Window root = RootWindow(dpy, screen);
-
-    // Transparent-background capability (Ctrl+T). The visual is fixed for the
-    // window's whole life, so it has to be decided HERE, before the session
-    // exists — a depth-32 TrueColor visual is what lets the runtime's
-    // swapchain advertise a non-opaque compositeAlpha and a compositing WM
-    // blend us over the desktop. A window whose depth differs from its
-    // parent's must carry its own colormap AND an explicit border pixel or X
-    // raises BadMatch, so both go in the attribute mask.
-    //
-    // Diverges from the avatar deliberately: the avatar abandons the
-    // app-owned window entirely (falls back to hosted-NULL) when there is no
-    // ARGB visual. This leg keeps the handle-app path — which is what weaves
-    // window-relative, and what was hardware-validated — and just loses
-    // transparency.
-    XVisualInfo vinfo = {};
-    bool haveArgb = false;
-    if (g_transparentCapable) {
-        haveArgb = XMatchVisualInfo(dpy, screen, 32, TrueColor, &vinfo) != 0;
-        if (!haveArgb) {
-            LOG_WARN("No 32-bit ARGB visual on this screen — transparent background "
-                     "(Ctrl+T) is unavailable; continuing opaque on the root visual");
-            g_transparentCapable = false;
-            g_transparentBg = false;
-        }
-    }
-
-    XSetWindowAttributes attrs = {};
-    attrs.background_pixel = haveArgb ? 0UL : BlackPixel(dpy, screen);
-    attrs.border_pixel = 0;
-    // Button + motion events are what the LMB orbit, the wheel and the
-    // client-owned RMB window drag all run on. Selecting only
-    // StructureNotify|KeyPress is why nothing was clickable before this pass.
-    attrs.event_mask = StructureNotifyMask | KeyPressMask | KeyReleaseMask |
-                       ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                       Button1MotionMask | Button2MotionMask | Button3MotionMask |
-                       EnterWindowMask | LeaveWindowMask |   // header-bar button hover
-                       FocusChangeMask |                     // header-bar backdrop state
-                       ExposureMask;                         // repaint the header bar
+    if (xr.windowBackend == DxrWindowBackend::Auto) return false;
 
     unsigned int w = kDefaultWindowW, h = kDefaultWindowH;
+    const bool panelKnown = xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0;
+    const int prx = xr.displayScreenLeft, pry = xr.displayScreenTop;
+    const int prw = (int)xr.displayPixelWidth, prh = (int)xr.displayPixelHeight;
+    bool explicitPos = false;
     int px = 0, py = 0;
-    int prx = 0, pry = 0, prw = 0, prh = 0;
-    if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
-        // Authoritative: XR_DXR_display_info reports the 3D panel's desktop
-        // rect. Prefer it — on a multi-monitor box the RandR PRIMARY is often
-        // NOT the 3D panel.
-        prx = xr.displayScreenLeft;
-        pry = xr.displayScreenTop;
-        prw = (int)xr.displayPixelWidth;
-        prh = (int)xr.displayPixelHeight;
-        px = prx + (prw - (int)w) / 2;
-        py = pry + (prh - (int)h) / 2;
-        LOG_INFO("3D panel (display_info) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
-                 prw, prh, prx, pry, w, h, px, py);
-    } else if (GetPanelRect(dpy, root, prx, pry, prw, prh)) {
-        px = prx + (prw - (int)w) / 2;
-        py = pry + (prh - (int)h) / 2;
-        LOG_INFO("Panel rect (Xrandr) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
-                 prw, prh, prx, pry, w, h, px, py);
-    } else {
-        const int sw = DisplayWidth(dpy, screen), sh = DisplayHeight(dpy, screen);
-        px = (sw - (int)w) / 2;
-        py = (sh - (int)h) / 2;
-        LOG_INFO("Xrandr panel query failed — centering %ux%u on default screen %dx%d at (%d,%d)",
-                 w, h, sw, sh, px, py);
-    }
 
     // MODEL_WINDOW="WxH+X+Y" override (X,Y absolute virtual-desktop px); WxH
-    // alone re-centers on the same panel/screen origin.
+    // alone re-centres on the panel.
     if (const char* wenv = getenv("MODEL_WINDOW")) {
         unsigned int ow = 0, oh = 0; int ox = 0, oy = 0;
         int n = sscanf(wenv, "%ux%u+%d+%d", &ow, &oh, &ox, &oy);
         if (n >= 2 && ow > 0 && oh > 0) {
             w = ow; h = oh;
-            if (n >= 4) {
-                px = ox; py = oy;
-                LOG_INFO("MODEL_WINDOW override: %ux%u at absolute (%d,%d)", w, h, px, py);
-            } else {
-                if (prw > 0 && prh > 0) { px = prx + (prw - (int)w) / 2; py = pry + (prh - (int)h) / 2; }
-                LOG_INFO("MODEL_WINDOW override: %ux%u (re-centered at %d,%d)", w, h, px, py);
-            }
+            if (n >= 4) { explicitPos = true; px = ox; py = oy; }
+            LOG_INFO("MODEL_WINDOW override: %ux%u%s", w, h, n >= 4 ? " at an absolute position" : "");
         }
     }
-
-    // INV-1.3: a window asking for exactly the panel's size IS the fullscreen
-    // shape and must be genuinely fullscreen on the panel — exact 1:1, no
-    // decoration, no offset. DXR_X11_NO_FULLSCREEN=1 forces the plain
-    // create-at-position path for A/B testing.
-    const char* noFs = getenv("DXR_X11_NO_FULLSCREEN");
-    const bool fsOptOut = noFs != nullptr && noFs[0] != '\0' && strcmp(noFs, "0") != 0;
-    const bool panelKnown = prw > 0 && prh > 0;
-    const bool wantFullscreen = panelKnown && !fsOptOut &&
-                                (int)w == prw && (int)h == prh;
-
-    // A windowed toplevel is undecorated + client-dragged, so every move can be
-    // routed through the weave's lattice snap (runtime#1588). Opt out for the
-    // old decorated, WM-dragged behaviour.
-    const char* wmDec = getenv("DXR_X11_WM_DECORATIONS");
-    const bool wmDrag = !wantFullscreen && wmDec != nullptr && wmDec[0] != '\0' && strcmp(wmDec, "0") != 0;
-    g_clientOwnedDrag = !wantFullscreen && !wmDrag;
-    g_windowIsFullscreen = wantFullscreen;
-
-    // Client-side decorations (csd_titlebar_x11.h): only on a windowed,
-    // client-dragged window. The bar's height depends on the desktop scale, so
-    // it is known before anything is created. w x h and (px, py) above are the
-    // CONTENT rect — what the runtime will see — and the top-level grows UP by
-    // the bar: MODEL_WINDOW="WxH+X+Y" therefore names the 3D area exactly,
-    // which is the rect that matters for weave phase.
-    g_csdEnabled = g_clientOwnedDrag;
-    uint32_t barH = 0;
-    if (g_csdEnabled) {
-        g_titleBar.configure(dxr_csd_x11::DesktopScale(dpy));
-        // Translucent + rounded only where the alpha is real (32-bit ARGB
-        // visual, composited); an opaque visual gets an opaque, square bar.
-        g_titleBar.setSurfaceHasAlpha(haveArgb);
-        // X11 resize stays the WM's (Super+middle-drag); the bar is a drag
-        // handle and two buttons, as before.
-        g_titleBar.setResizable(false);
-        barH = g_titleBar.height();
-        LOG_INFO("csd: header bar %u px (scale %.2f), %s, title font %s", barH, g_titleBar.scale(),
-                 haveArgb ? "translucent with rounded corners (ARGB visual)" : "opaque, square (no ARGB visual)",
-                 g_titleBar.fontPath().empty() ? "NONE (set DXR_CSD_FONT)" : g_titleBar.fontPath().c_str());
-    }
-    const unsigned int contentW = w, contentH = h;
-    h = contentH + barH;
-    py -= (int)barH;
-
-    int depth = CopyFromParent;
-    Visual* visual = CopyFromParent;
-    unsigned long attrMask = CWBackPixel | CWBorderPixel | CWEventMask;
-    if (haveArgb) {
-        g_argbColormap = XCreateColormap(dpy, root, vinfo.visual, AllocNone);
-        attrs.colormap = g_argbColormap;
-        attrMask |= CWColormap;
-        depth = 32;
-        visual = vinfo.visual;
+    if (!explicitPos && panelKnown) {
+        px = prx + (prw - (int)w) / 2;
+        py = pry + (prh - (int)h) / 2;
+        LOG_INFO("3D panel (display_info) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
+                 prw, prh, prx, pry, w, h, px, py);
     }
 
-    Window win = XCreateWindow(dpy, root, px, py, w, h, 0, depth, InputOutput,
-                               visual, attrMask, &attrs);
-    if (win == 0) {
-        LOG_ERROR("XCreateWindow failed — using hosted-NULL windowing");
-        if (g_argbColormap != 0) { XFreeColormap(dpy, g_argbColormap); g_argbColormap = 0; }
-        XCloseDisplay(dpy);
+    DxrLinuxWindowDesc desc;
+    desc.width = w;
+    desc.height = h;
+    desc.panel_left = prx;
+    desc.panel_top = pry;
+    desc.panel_width = (uint32_t)prw;
+    desc.panel_height = (uint32_t)prh;
+    desc.title = "DisplayXR 3D Model Viewer";
+    desc.app_id = "com.displayxr.modelviewer";
+    desc.transparent = g_transparentCapable;
+    desc.x11_header_bar = true;      // the snapped drag needs a client-side bar on X11
+    desc.x11_drag_button = 3;        // RMB drags; LMB stays the model orbit
+    desc.wayland_drag_button = 3;    // ...the same gesture on Wayland (compositor move)
+    desc.keep_above = g_transparentCapable && g_transparentBg;
+    desc.has_position = explicitPos || panelKnown;
+    desc.x = px;
+    desc.y = py;
+    // Panel-sized = fullscreen on the panel, on Wayland as on X11 (INV-1.3).
+    desc.fullscreen_on_wayland = panelKnown && (int)w == prw && (int)h == prh;
+
+    if (!g_window.create(xr.windowBackend, desc)) {
+        LOG_WARN("%s window creation failed — using hosted-NULL windowing",
+                 DxrLinuxWindow::backend_name(xr.windowBackend));
         return false;
     }
-    XStoreName(dpy, win, "DisplayXR 3D Model Viewer");
-
-    // The CONTENT child: same depth / visual / colormap as the top-level (so
-    // XWayland composites it straight into the top-level's buffer with its
-    // alpha intact — a depth mismatch would force a redirect), background
-    // None so the server never paints over what Vulkan presents, and NO event
-    // mask: pointer and key events then propagate to the top-level, which
-    // handles everything, in top-level coordinates.
-    Window content = 0;
-    {
-        XSetWindowAttributes ca = {};
-        ca.background_pixmap = None;
-        ca.border_pixel = 0;
-        unsigned long cmask = CWBackPixmap | CWBorderPixel;
-        if (haveArgb) { ca.colormap = g_argbColormap; cmask |= CWColormap; }
-        content = XCreateWindow(dpy, win, 0, (int)barH, contentW, contentH, 0, depth, InputOutput,
-                                visual, cmask, &ca);
-        if (content == 0) {
-            LOG_ERROR("XCreateWindow (content child) failed — using hosted-NULL windowing");
-            XDestroyWindow(dpy, win);
-            if (g_argbColormap != 0) { XFreeColormap(dpy, g_argbColormap); g_argbColormap = 0; }
-            XCloseDisplay(dpy);
-            return false;
-        }
-        XMapWindow(dpy, content);  // mapped with the parent below
+    xr.hasAppWindow = true;
+    g_windowTitle = desc.title;
+    if (g_transparentCapable && !g_window.is_transparent()) {
+        // X11 screen without an ARGB visual: the handle path stays (it is what
+        // weaves window-relative); only transparency is lost.
+        g_transparentCapable = false;
+        g_transparentBg = false;
     }
-    // The top-level's own background shows only under the bar, which we
-    // paint; None avoids a transparent (ARGB) clear flashing there on Expose.
-    XSetWindowBackgroundPixmap(dpy, win, None);
-
-    // Close button → clean exit (ClientMessage in the event pump).
-    g_wmDeleteAtom = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    if (g_wmDeleteAtom != None) XSetWMProtocols(dpy, win, &g_wmDeleteAtom, 1);
-
-    // WM_NORMAL_HINTS with USPosition|PPosition so the WM honors the
-    // create-time position instead of auto-placing (GNOME/Mutter).
-    {
-        XSizeHints hints = {};
-        hints.flags = USPosition | PPosition;
-        hints.x = px; hints.y = py;
-        XSetWMNormalHints(dpy, win, &hints);
-    }
-
-    // Decorations off BEFORE the map, so a frame is never created in the first
-    // place (INV-1.3 step 1). For a panel-sized window a title bar eats pixels
-    // out of the weave; for a windowed one it also hands the drag to the WM.
-    if (wantFullscreen || g_clientOwnedDrag) X11SetUndecorated(dpy, win);
-
-    XMapWindow(dpy, win);
-    XFlush(dpy);
-    // Re-assert the position after mapping — Mutter ignores the create-time
-    // x/y of a freshly-mapped toplevel but honors a post-map move.
-    XMoveWindow(dpy, win, px, py);
-    XFlush(dpy);
-
-    if (wantFullscreen) {
-        const X11MonitorRect mon = X11ResolveMonitor(dpy, root, px, py);
-        // Let the move land before asking for fullscreen: mutter fullscreens
-        // onto whichever output the window CURRENTLY occupies, and a position
-        // request issued before the window settles is discarded. Bounded at
-        // 400 ms so a WM that never moves us cannot hang startup.
-        const int mx = mon.index >= 0 ? mon.x : px;
-        const int my = mon.index >= 0 ? mon.y : py;
-        const int mw = mon.index >= 0 ? mon.width : 1;
-        const int mh = mon.index >= 0 ? mon.height : 1;
-        X11PumpFor(dpy, 400, [dpy, win, mx, my, mw, mh]() {
-            int rx = 0, ry = 0;
-            X11RootOrigin(dpy, win, &rx, &ry);
-            return rx >= mx && rx < mx + mw && ry >= my && ry < my + mh;
-        });
-        X11SetFullscreenState(dpy, win, 1 /* _NET_WM_STATE_ADD */, mon.index);
-        const unsigned int wantW = w, wantH = h;
-        X11PumpFor(dpy, 400, [dpy, win, wantW, wantH]() {
-            XWindowAttributes wa = {};
-            return XGetWindowAttributes(dpy, win, &wa) != 0 &&
-                   (unsigned int)wa.width == wantW && (unsigned int)wa.height == wantH;
-        });
-        LOG_INFO("INV-1.3: panel-sized window -> fullscreen on RandR monitor %d (%s)",
-                 mon.index, mon.name.c_str());
-    } else {
-        // Windowed: no fullscreen handshake, but still give the WM a moment to
-        // apply the post-map move before anything reads the origin back.
-        X11PumpFor(dpy, 250, {});
-    }
-
-    xr.xDisplay = dpy;
-    xr.xWindow = win;
-    xr.xWinW = w;
-    xr.xWinH = h;
-    xr.xContent = content;
-    xr.xContentW = contentW;
-    xr.xContentH = contentH;
-    g_visual = haveArgb ? vinfo.visual : DefaultVisual(dpy, screen);
-
-    // Seed the drag position cache with where the WM actually put us. The
-    // weave phase is a function of this ABSOLUTE root origin, so read it with
-    // XTranslateCoordinates, never XGetWindowAttributes (parent-relative).
-    // Drag coordinates are the CONTENT child's (see MoveWindowSnapped).
-    X11RootOrigin(dpy, content, &g_dragAtX, &g_dragAtY);
-
-    // Headless drag test hook: walk the window along a straight path through
-    // the very same snap -> XMoveWindow code the pointer drag uses, so the
-    // mechanics are verifiable with nobody at the mouse.
-    if (g_clientOwnedDrag) {
-        if (const char* tenv = getenv("DXR_X11_TEST_DRAG")) {
-            int dx = 0, dy = 0, steps = 0;
-            if (sscanf(tenv, "%d,%d,%d", &dx, &dy, &steps) == 3 && steps > 0) {
-                g_testDragArmed = true;
-                g_testDragDx = dx; g_testDragDy = dy; g_testDragSteps = steps;
-                LOG_WARN("DXR_X11_TEST_DRAG=%d,%d,%d — TEST HOOK armed; the window walks "
-                         "itself in %d steps after a 60-frame warm-up (RMB drag disabled)",
-                         dx, dy, steps, steps);
-            } else {
-                LOG_WARN("DXR_X11_TEST_DRAG=\"%s\" is not dx,dy,steps — ignored", tenv);
-            }
-        }
-    }
-
-    LOG_INFO("Created %ux%u %s content window (0x%lx, bound) at root (%d,%d) in a %ux%u top-level "
-             "(%u px header bar) — XR_DXR_xlib_window_binding, %s",
-             contentW, contentH, haveArgb ? "32-bit ARGB" : "opaque", (unsigned long)content,
-             g_dragAtX, g_dragAtY, w, h, barH,
-             wantFullscreen ? "fullscreen on the panel (no drag)"
-                            : (g_clientOwnedDrag ? "undecorated + client-owned RMB drag (phase-snapped)"
-                                                 : "decorated, WM-dragged (DXR_X11_WM_DECORATIONS — no phase snap)"));
+    uint32_t cw = 0, ch = 0;
+    g_window.current_size(&cw, &ch);
+    LOG_INFO("Created %ux%u %s window on %s — %s", cw, ch,
+             g_window.is_transparent() ? "transparent-capable" : "opaque",
+             g_window.connection_description().c_str(),
+             (g_window.is_fullscreen() || desc.fullscreen_on_wayland && xr.windowBackend == DxrWindowBackend::Wayland)
+                 ? "fullscreen on the panel" : "windowed, header bar + RMB drag");
     return true;
-}
-
-//! _NET_WM_STATE_ABOVE, the X11 analogue of the Windows leg's
-//! HWND_TOPMOST/HWND_NOTOPMOST flip on Ctrl+T: a transparent overlay floats
-//! over other apps so a click punched through to a window behind activates it
-//! without burying the model. Best-effort — a WM that ignores the hint just
-//! leaves the window in its normal z-band.
-static void X11SetAboveState(Display* dpy, Window win, bool above) {
-    if (dpy == nullptr || win == 0) return;
-    Atom wmState = XInternAtom(dpy, "_NET_WM_STATE", False);
-    Atom aboveAtom = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
-    if (wmState == None || aboveAtom == None) return;
-    X11SendRootMessage(dpy, win, wmState,
-                       above ? 1 /* _NET_WM_STATE_ADD */ : 0 /* _NET_WM_STATE_REMOVE */,
-                       (long)aboveAtom, 0, 1 /* source: normal application */, 0);
-    XFlush(dpy);
 }
 
 // ============================================================================
@@ -1797,13 +1284,15 @@ static void PollFilePicker() {
 }
 
 // ============================================================================
-// X11 event pump — the Linux transliteration of the Win32 WndProc +
-// displayxr-common's UpdateInputState. Sensitivities, signs and clamps are
-// copied from input_handler.cpp verbatim so all three legs feel identical.
+// Input — the Linux transliteration of the Win32 WndProc + displayxr-common's
+// UpdateInputState, fed by displayxr::linux_window's event stream (the same on
+// X11 and Wayland: X11 keysyms at level 0, content-relative buffer pixels).
+// Sensitivities, signs and clamps are copied from input_handler.cpp verbatim
+// so all three legs feel identical.
 //
 //   LMB drag      orbit the model   (yaw -= dx*0.005, pitch -= dy*0.005, |pitch| <= 1.4)
 //   LMB dbl-click focus/teleport on the surface under the cursor
-//   RMB drag      MOVE THE WINDOW, phase-snapped (Linux-specific; see below)
+//   RMB drag      MOVE THE WINDOW (the helper's; phase-snapped on X11)
 //   wheel         zoom / IPD (Shift) / parallax (Ctrl) / perspective (Alt)
 //   keys          see the table in the startup banner
 //
@@ -1811,32 +1300,22 @@ static void PollFilePicker() {
 // move loop gives the display processor a WM_WINDOWPOSCHANGING hook, so a
 // normal title-bar drag is phase-snapped for free and the app needs no gesture
 // at all. X11 has no such hook and a mutter _NET_WM_MOVERESIZE grab cannot be
-// intercepted, so the app must own the drag — which means it must also be
-// undecorated, which means there is no title bar to aim at. Right-button drag
-// is the DisplayXR convention for exactly this case (dxr::RmbWindowDrag, the
-// Windows borderless overlay + the Unity desktop-avatar sample), and it leaves
-// the LEFT button free for the model orbit, which is the behaviour that has to
-// match Windows. The runtime's cube test apps use button 1 instead; that is a
-// test-app affordance, not a product one.
+// intercepted, so the app must own the drag. Right-button drag is the
+// DisplayXR convention for exactly this case (dxr::RmbWindowDrag, the Windows
+// borderless overlay + the Unity desktop-avatar sample), and it leaves the
+// LEFT button free for the model orbit, which is the behaviour that has to
+// match Windows. The header bar's LMB drag, close and minimize, the RMB drag
+// itself and F11 are handled INSIDE the window helper; the app only sees the
+// RMB press/release (flagged window_drag) for its button state.
 // ============================================================================
 
-//! Suppress the KeyRelease half of X11 auto-repeat, which would otherwise make
-//! a held W stutter (release/press pairs at the same timestamp).
-static bool IsAutoRepeatRelease(Display* dpy, const XEvent& ev) {
-    if (ev.type != KeyRelease || XEventsQueued(dpy, QueuedAfterReading) == 0) return false;
-    XEvent next;
-    XPeekEvent(dpy, &next);
-    return next.type == KeyPress && next.xkey.time == ev.xkey.time &&
-           next.xkey.keycode == ev.xkey.keycode;
-}
-
 //! Multiplicative wheel step, matching WM_MOUSEWHEEL's 1.1 / (1/1.1).
-static void ApplyWheel(InputState& st, bool up, unsigned int mods) {
+static void ApplyWheel(InputState& st, bool up, uint32_t mods) {
     MarkUserInput(st);
     const float factor = up ? 1.1f : (1.0f / 1.1f);
-    const bool shift = (mods & ShiftMask) != 0;
-    const bool ctrl  = (mods & ControlMask) != 0;
-    const bool alt   = (mods & Mod1Mask) != 0;
+    const bool shift = (mods & DxrModShift) != 0;
+    const bool ctrl  = (mods & DxrModCtrl) != 0;
+    const bool alt   = (mods & DxrModAlt) != 0;
     if (shift) {
         float v = st.viewParams.steadyIpdFactor * factor;
         if (v < 0.0f) v = 0.0f;
@@ -1871,179 +1350,27 @@ static void ApplyWheel(InputState& st, bool up, unsigned int mods) {
     }
 }
 
-//! F11 — toggle fullscreen on the monitor the window currently occupies.
-//! Never changes whether the window is mapped (the runtime may have hidden it).
-// ============================================================================
-// Client-side decorations + the app-owned window drag
-// ============================================================================
-// The header bar (displayxr::csd + linux/csd_titlebar_x11.{h,cpp}) exists so a visible, ordinary
-// title bar can drive the SAME phase-snapped drag the RMB gesture uses. Read
-// csd_titlebar_x11.h before touching this: X11 gives a client no hook into a
-// WM-owned move (Windows has WM_WINDOWPOSCHANGING; X11 only reports the result
-// afterwards via ConfigureNotify), which is why the decorations are ours.
+static void HandleWindowEvent(const DxrWindowEvent& ev) {
+    switch (ev.type) {
 
-//! The bar is shown on a windowed, client-dragged window only: never when the
-//! WM draws the frame (DXR_X11_WM_DECORATIONS=1) and never fullscreen (F11 /
-//! panel-sized), where a fullscreen app has no title bar anywhere on GNOME.
-static bool CsdVisible(const AppXrSession& xr) {
-    return g_csdEnabled && !g_windowIsFullscreen && xr.xDisplay != nullptr && xr.xWindow != 0;
-}
+    case DxrWindowEvent::Type::KeyDown: {
+        const KeySym sym = (KeySym)ev.keysym;
+        const bool ctrl = (ev.mods & DxrModCtrl) != 0;
+        MarkUserInput(g_input);
 
-//! Where the content child sits inside the top-level: below the bar, or at
-//! (0,0) filling it when no bar is shown (fullscreen, WM decorations).
-static int ContentOffsetY(const AppXrSession& xr) {
-    return CsdVisible(xr) ? (int)g_titleBar.height() : 0;
-}
-
-//! Re-fit the content child to the top-level: (0, bar) .. (W, H). Called on
-//! every top-level ConfigureNotify and on a fullscreen toggle. The runtime
-//! follows the BOUND (child) window's size by polling it, so resizing the
-//! child is all a resize needs; in fullscreen the child becomes exactly the
-//! panel-sized top-level at the panel origin (INV-1.3), with no bar.
-static void LayoutContent(AppXrSession& xr) {
-    if (xr.xDisplay == nullptr || xr.xContent == 0 || xr.xWinW == 0 || xr.xWinH == 0) return;
-    const int off = ContentOffsetY(xr);
-    const unsigned int cw = xr.xWinW;
-    const unsigned int ch = xr.xWinH > (unsigned int)off ? xr.xWinH - (unsigned int)off : 1u;
-    if (cw != xr.xContentW || ch != xr.xContentH || off != g_contentOffsetApplied) {
-        XMoveResizeWindow(xr.xDisplay, xr.xContent, 0, off, cw, ch);
-        XFlush(xr.xDisplay);
-        xr.xContentW = cw;
-        xr.xContentH = ch;
-        g_contentOffsetApplied = off;
-        g_titleBar.invalidate();
-    }
-    // The tile basis and the snap extent are the CONTENT, never the top-level.
-    g_windowW = xr.xContentW;
-    g_windowH = xr.xContentH;
-    g_weaveSnap.setExtent(xr.xContentW, xr.xContentH);
-}
-
-//! Capture the drag origin (content child) and the constant content->top-level
-//! offset. See the convention on MoveWindowSnapped.
-static void DragCaptureOrigin(AppXrSession& xr) {
-    int topX = 0, topY = 0;
-    X11RootOrigin(xr.xDisplay, xr.xWindow, &topX, &topY);
-    const Window w = xr.xContent != 0 ? xr.xContent : xr.xWindow;
-    X11RootOrigin(xr.xDisplay, w, &g_dragOriginX, &g_dragOriginY);
-    g_dragContentOffX = g_dragOriginX - topX;
-    g_dragContentOffY = g_dragOriginY - topY;
-}
-
-//! Start the client-owned window drag. Factored out of the RMB handler
-//! unchanged so the header bar can share it; every step still lands in
-//! MoveWindowSnapped via the coalesced MotionNotify path — the snap path
-//! itself is untouched.
-static void BeginWindowDrag(AppXrSession& xr, int rootX, int rootY, unsigned int button) {
-    g_dragging = true;
-    g_dragButton = button;
-    g_dragPtrX = rootX;
-    g_dragPtrY = rootY;
-    DragCaptureOrigin(xr);
-    g_dragAtX = g_dragOriginX; g_dragAtY = g_dragOriginY;
-    g_dragMoves = 0; g_dragSnapped = 0;
-    // Grab so motion OUTSIDE the window keeps arriving: the pointer routinely
-    // leaves a window being dragged fast (and, in transparent mode, leaves its
-    // input shape on the very first pixel).
-    XGrabPointer(xr.xDisplay, xr.xWindow, False,
-                 ButtonReleaseMask | PointerMotionMask |
-                     (button == Button1 ? Button1MotionMask : Button3MotionMask),
-                 GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
-    LOG_INFO("drag: start (%s) — grab origin (%d, %d), pointer (%d, %d)",
-             button == Button1 ? "header bar" : "RMB",
-             g_dragOriginX, g_dragOriginY, g_dragPtrX, g_dragPtrY);
-}
-
-static void EndWindowDrag(AppXrSession& xr) {
-    if (!g_dragging) return;
-    g_dragging = false;
-    g_dragButton = 0;
-    XUngrabPointer(xr.xDisplay, CurrentTime);
-    XFlush(xr.xDisplay);
-    LOG_INFO("drag: end — %llu move(s), %llu snapped away from the raw target, "
-             "origin (%d, %d) -> (%d, %d)",
-             (unsigned long long)g_dragMoves, (unsigned long long)g_dragSnapped,
-             g_dragOriginX, g_dragOriginY, g_dragAtX, g_dragAtY);
-}
-
-static void ToggleFullscreen(AppXrSession& xr) {
-    if (xr.xDisplay == nullptr || xr.xWindow == 0) return;
-    int rx = 0, ry = 0;
-    X11RootOrigin(xr.xDisplay, xr.xWindow, &rx, &ry);
-    const X11MonitorRect mon = X11ResolveMonitor(xr.xDisplay, DefaultRootWindow(xr.xDisplay), rx, ry);
-    g_windowIsFullscreen = !g_windowIsFullscreen;
-    X11SetFullscreenState(xr.xDisplay, xr.xWindow, g_windowIsFullscreen ? 1 : 0, mon.index);
-    // Bar hides/returns now; the sizes settle on the ConfigureNotify that
-    // follows, which runs LayoutContent again.
-    LayoutContent(xr);
-    // A fullscreen window must not be draggable at all — a stray gesture would
-    // slide the panel-sized weave off the panel.
-    if (g_windowIsFullscreen && g_dragging) {
-        EndWindowDrag(xr);
-    }
-    LOG_INFO("Fullscreen: %s (monitor %d)", g_windowIsFullscreen ? "ON" : "OFF", mon.index);
-}
-
-//! One step of DXR_X11_TEST_DRAG, called once per pump.
-static void DriveTestDrag(AppXrSession& xr) {
-    const uint64_t kWarmupFrames = 60;
-    if (!g_testDragArmed || g_testDragDone || g_pumpCount < kWarmupFrames) return;
-    if (g_testDragStep == 0) {
-        DragCaptureOrigin(xr);
-        g_dragAtX = g_dragOriginX; g_dragAtY = g_dragOriginY;
-        g_dragMoves = 0; g_dragSnapped = 0;
-        LOG_INFO("drag: start (TEST HOOK) — grab origin (%d, %d), walking %+d,%+d in %d steps",
-                 g_dragOriginX, g_dragOriginY, g_testDragDx, g_testDragDy, g_testDragSteps);
-    }
-    g_testDragStep++;
-    const int i = g_testDragStep, n = g_testDragSteps;
-    MoveWindowSnapped(xr.xDisplay, xr.xWindow,
-                      g_dragOriginX + (int)((int64_t)g_testDragDx * i / n),
-                      g_dragOriginY + (int)((int64_t)g_testDragDy * i / n));
-    if (i >= n) {
-        g_testDragDone = true;
-        LOG_INFO("drag: end (TEST HOOK) — %llu move(s), %llu snapped away from the raw target, "
-                 "origin (%d, %d) -> (%d, %d)",
-                 (unsigned long long)g_dragMoves, (unsigned long long)g_dragSnapped,
-                 g_dragOriginX, g_dragOriginY, g_dragAtX, g_dragAtY);
-    }
-}
-
-static void PumpXEvents(AppXrSession& xr) {
-    if (xr.xDisplay == nullptr) return;
-    g_pumpCount++;
-
-    // Motion coalescing: the X server can queue dozens of MotionNotify per
-    // frame. For the window drag only the LAST one matters (the target is
-    // derived from the absolute pointer position, not a delta chain), so the
-    // whole queue is drained first and one move is issued below. The orbit is
-    // a delta chain and IS applied per event — same as WM_MOUSEMOVE.
-    bool haveDragMotion = false;
-    int dragMotionRootX = 0, dragMotionRootY = 0;
-
-    while (XPending(xr.xDisplay) > 0) {
-        XEvent ev;
-        XNextEvent(xr.xDisplay, &ev);
-        switch (ev.type) {
-
-        case KeyPress: {
-            const KeySym sym = XLookupKeysym(&ev.xkey, 0);
-            const bool ctrl = (ev.xkey.state & ControlMask) != 0;
-            MarkUserInput(g_input);
-
-            // --- chords first (they shadow the bare key below) --------------
-            // Ctrl+O = open a model (uniform across demos + platforms, incl.
-            // the mediaplayer). Strict: Ctrl must be held.
-            if ((sym == XK_o || sym == XK_O) && ctrl) { StartFilePicker(); break; }
-            // Ctrl+T = transparent background. Must be checked BEFORE the bare
-            // switch below or plain-T (eye-tracking mode) swallows it — the
-            // same ordering displayxr-common's input_handler.cpp uses on
-            // Windows. A request flag, not a direct flip: the render loop stays
-            // the single owner of the transition, as on Windows.
-            if ((sym == XK_t || sym == XK_T) && ctrl) {
-                g_input.transparentBgToggleRequested = true;
-                break;
-            }
+        // --- chords first (they shadow the bare key below) ------------------
+        // Ctrl+O = open a model (uniform across demos + platforms, incl. the
+        // mediaplayer). Strict: Ctrl must be held.
+        if ((sym == XK_o || sym == XK_O) && ctrl) { StartFilePicker(); break; }
+        // Ctrl+T = transparent background. Must be checked BEFORE the bare
+        // switch below or plain-T (eye-tracking mode) swallows it — the same
+        // ordering displayxr-common's input_handler.cpp uses on Windows. A
+        // request flag, not a direct flip: the render loop stays the single
+        // owner of the transition, as on Windows.
+        if ((sym == XK_t || sym == XK_T) && ctrl) {
+            g_input.transparentBgToggleRequested = true;
+            break;
+        }
 
             switch (sym) {
             // Movement (held)
@@ -2055,7 +1382,7 @@ static void PumpXEvents(AppXrSession& xr) {
             case XK_q: case XK_Q: g_input.keyQ = true; break;
 
             case XK_Escape: LOG_INFO("ESC — exiting"); g_running = false; break;
-            case XK_F11:    g_input.fullscreenToggleRequested = true; break;
+            case XK_F11:    break; // toggled inside the window helper's pump
             case XK_space:  g_input.resetViewRequested = true; break;
             case XK_Tab:    g_input.hudVisible = !g_input.hudVisible; break;
 
@@ -2137,210 +1464,118 @@ static void PumpXEvents(AppXrSession& xr) {
             }
             default: break;
             }
-            break;
-        }
+        break;
+    }
 
-        case KeyRelease: {
-            if (IsAutoRepeatRelease(xr.xDisplay, ev)) break;
-            const KeySym sym = XLookupKeysym(&ev.xkey, 0);
-            switch (sym) {
-            case XK_w: case XK_W: g_input.keyW = false; break;
-            case XK_a: case XK_A: g_input.keyA = false; break;
-            case XK_s: case XK_S: g_input.keyS = false; break;
-            case XK_d: case XK_D: g_input.keyD = false; break;
-            case XK_e: case XK_E: g_input.keyE = false; break;
-            case XK_q: case XK_Q: g_input.keyQ = false; break;
-            default: break;
-            }
-            break;
-        }
-
-        case ButtonPress: {
-            // X11 delivers the wheel as buttons 4 (up) and 5 (down).
-            if (ev.xbutton.button == Button4 || ev.xbutton.button == Button5) {
-                ApplyWheel(g_input, ev.xbutton.button == Button4, ev.xbutton.state);
-                break;
-            }
-            MarkUserInput(g_input);
-            // Pointer events arrive on the TOP-LEVEL (the content child
-            // selects none, so they propagate up) in top-level coordinates.
-            // The scene lives in the content child: shift by the bar.
-            g_input.mouseX = ev.xbutton.x;
-            g_input.mouseY = ev.xbutton.y - ContentOffsetY(xr);
-            // Header bar first: an LMB there is window chrome, never an orbit
-            // or a double-click focus into the scene underneath it.
-            if (ev.xbutton.button == Button1 && CsdVisible(xr)) {
-                const dxr_csd::Hit hit = g_titleBar.hitTest(ev.xbutton.x, ev.xbutton.y, xr.xWinW);
-                if (hit == dxr_csd::Hit::Drag) {
-                    // Same snapped path as the RMB drag — this is the reason
-                    // the bar is client-side at all (csd_titlebar_x11.h).
-                    if (!g_testDragArmed && !g_dragging) {
-                        BeginWindowDrag(xr, ev.xbutton.x_root, ev.xbutton.y_root, Button1);
-                    }
-                    break;
-                }
-                if (hit != dxr_csd::Hit::Outside) {
-                    g_titleBar.setPressed(hit);
-                    break;
-                }
-            }
-            if (ev.xbutton.button == Button1) {
-                // Double-click = focus/teleport. X11 has no WM_LBUTTONDBLCLK,
-                // so detect it: same button within 400 ms and 5 px (Win32's
-                // default GetDoubleClickTime is 500 ms / SM_CXDOUBLECLK 4 px).
-                static Time s_lastClickTime = 0;
-                static int s_lastClickX = 0, s_lastClickY = 0;
-                const bool dbl = (ev.xbutton.time - s_lastClickTime) < 400 &&
-                                 abs(ev.xbutton.x - s_lastClickX) <= 5 &&
-                                 abs(ev.xbutton.y - s_lastClickY) <= 5;
-                s_lastClickTime = ev.xbutton.time;
-                s_lastClickX = ev.xbutton.x; s_lastClickY = ev.xbutton.y;
-                if (dbl) {
-                    g_input.teleportRequested = true;
-                    g_input.teleportMouseX = (float)ev.xbutton.x;
-                    g_input.teleportMouseY = (float)(ev.xbutton.y - ContentOffsetY(xr));
-                    s_lastClickTime = 0; // a triple click is not two doubles
-                    break;
-                }
-                g_input.leftButton = true;
-                g_input.dragging = true;
-                g_input.dragStartX = g_input.mouseX;   // content coords, like MotionNotify
-                g_input.dragStartY = g_input.mouseY;
-            } else if (ev.xbutton.button == Button3) {
-                g_input.rightButton = true;
-                // Client-owned window drag (see the header block above).
-                if (g_clientOwnedDrag && !g_testDragArmed && !g_dragging) {
-                    BeginWindowDrag(xr, ev.xbutton.x_root, ev.xbutton.y_root, Button3);
-                }
-            } else if (ev.xbutton.button == Button2) {
-                g_input.middleButton = true;   // tracked only, as on Windows
-            }
-            break;
-        }
-
-        case ButtonRelease: {
-            if (ev.xbutton.button == Button4 || ev.xbutton.button == Button5) break;
-            // A window drag ends on the release of the button that started it
-            // (RMB anywhere, or LMB on the header bar) — never on the other one.
-            if (g_dragging && ev.xbutton.button == g_dragButton) {
-                EndWindowDrag(xr);
-                if (ev.xbutton.button == Button1) break; // the bar consumed this LMB
-            }
-            // Header-bar button: fires on release over the SAME button, like
-            // GTK — press, slide off, release cancels.
-            if (ev.xbutton.button == Button1 && g_titleBar.pressed() != dxr_csd::Hit::Outside) {
-                const dxr_csd::Hit down = g_titleBar.pressed();
-                g_titleBar.setPressed(dxr_csd::Hit::Outside);
-                if (CsdVisible(xr) && g_titleBar.hitTest(ev.xbutton.x, ev.xbutton.y, xr.xWinW) == down) {
-                    if (down == dxr_csd::Hit::Close) {
-                        LOG_INFO("Header bar close — exiting");
-                        g_running = false;
-                    } else if (down == dxr_csd::Hit::Minimize) {
-                        LOG_INFO("Header bar minimize");
-                        XIconifyWindow(xr.xDisplay, xr.xWindow, DefaultScreen(xr.xDisplay));
-                        XFlush(xr.xDisplay);
-                    }
-                }
-                break;
-            }
-            if (ev.xbutton.button == Button1) {
-                g_input.leftButton = false;
-                g_input.dragging = false;
-            } else if (ev.xbutton.button == Button3) {
-                g_input.rightButton = false;
-            } else if (ev.xbutton.button == Button2) {
-                g_input.middleButton = false;
-            }
-            break;
-        }
-
-        case MotionNotify: {
-            if (g_dragging) {
-                // Coalesced; applied once after the drain (absolute target).
-                haveDragMotion = true;
-                dragMotionRootX = ev.xmotion.x_root;
-                dragMotionRootY = ev.xmotion.y_root;
-                break;
-            }
-            g_input.mouseX = ev.xmotion.x;
-            g_input.mouseY = ev.xmotion.y - ContentOffsetY(xr);
-            if (CsdVisible(xr)) {
-                g_titleBar.setHover(g_titleBar.hitTest(ev.xmotion.x, ev.xmotion.y, xr.xWinW));
-            }
-            if (g_input.dragging) {
-                MarkUserInput(g_input);
-                const int dx = g_input.mouseX - g_input.dragStartX;
-                const int dy = g_input.mouseY - g_input.dragStartY;
-                g_input.yaw   -= dx * 0.005f;
-                g_input.pitch -= dy * 0.005f;
-                if (g_input.pitch >  1.4f) g_input.pitch =  1.4f;   // gimbal-lock clamp
-                if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
-                g_input.dragStartX = g_input.mouseX;
-                g_input.dragStartY = g_input.mouseY;
-            }
-            break;
-        }
-
-        case ConfigureNotify:
-            if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
-                xr.xWinW = (unsigned int)ev.xconfigure.width;
-                xr.xWinH = (unsigned int)ev.xconfigure.height;
-                LayoutContent(xr);   // child + g_windowW/H + snap extent
-                // Only the rect OFFSET is snapped, but hand the DP the real
-                // size so a future size-aware snap is not fed a lie.
-            }
-            break;
-
-        case LeaveNotify:
-            g_titleBar.setHover(dxr_csd::Hit::Outside);
-            break;
-        case Expose:
-            g_titleBar.invalidate();
-            break;
-        case FocusIn:
-        case FocusOut:
-            // Grab/ungrab focus churn (our own drag grab) is not a real
-            // activation change — ignore it, or the bar flickers per drag.
-            if (ev.xfocus.mode == NotifyNormal || ev.xfocus.mode == NotifyWhileGrabbed) {
-                g_titleBar.setFocused(ev.type == FocusIn);
-            }
-            break;
-
-        case ClientMessage:
-            if (g_wmDeleteAtom != None && (Atom)ev.xclient.data.l[0] == g_wmDeleteAtom) {
-                LOG_INFO("Window closed — exiting");
-                g_running = false;
-            }
-            break;
-
+    case DxrWindowEvent::Type::KeyUp: {
+        switch ((KeySym)ev.keysym) {
+        case XK_w: case XK_W: g_input.keyW = false; break;
+        case XK_a: case XK_A: g_input.keyA = false; break;
+        case XK_s: case XK_S: g_input.keyS = false; break;
+        case XK_d: case XK_D: g_input.keyD = false; break;
+        case XK_e: case XK_E: g_input.keyE = false; break;
+        case XK_q: case XK_Q: g_input.keyQ = false; break;
         default: break;
         }
+        break;
     }
 
-    if (haveDragMotion && g_dragging) {
-        // Absolute, not incremental: origin + (pointer now - pointer at grab).
-        // A snap that holds the window back for a few pixels therefore never
-        // makes the window lag the pointer permanently.
-        MoveWindowSnapped(xr.xDisplay, xr.xWindow,
-                          g_dragOriginX + (dragMotionRootX - g_dragPtrX),
-                          g_dragOriginY + (dragMotionRootY - g_dragPtrY));
+    case DxrWindowEvent::Type::Scroll: {
+        // One multiplicative step per notch (X11 buttons 4/5, Wayland clicks).
+        const int n = ev.scroll_steps;
+        for (int i = 0; i < (n > 0 ? n : -n); i++) ApplyWheel(g_input, n > 0, ev.mods);
+        break;
     }
 
-    DriveTestDrag(xr);
-
-    // Header bar: plain 2D in the top-level, repainted only when it changed
-    // (hover/press/focus/title/width) or the server discarded it (Expose).
-    if (CsdVisible(xr)) {
-        std::string title = "3D Model Viewer";
-        if (!g_loadedFileName.empty()) title += " \u2014 " + g_loadedFileName;
-        g_titleBar.setTitle(title);
-        if (g_titleBar.dirty() || g_titleBar.renderedWidth() != xr.xWinW)
-            dxr_csd_x11::Paint(g_titleBar, xr.xDisplay, xr.xWindow, g_visual, xr.xWinW);
+    case DxrWindowEvent::Type::ButtonDown: {
+        MarkUserInput(g_input);
+        g_input.mouseX = ev.x;
+        g_input.mouseY = ev.y;
+        if (ev.button == 1) {
+            // Double-click = focus/teleport. No WM_LBUTTONDBLCLK here, so
+            // detect it: same button within 400 ms and 5 px (Win32's default
+            // GetDoubleClickTime is 500 ms / SM_CXDOUBLECLK 4 px).
+            static uint32_t s_lastClickTime = 0;
+            static int s_lastClickX = 0, s_lastClickY = 0;
+            const bool dbl = s_lastClickTime != 0 && (ev.time_ms - s_lastClickTime) < 400 &&
+                             abs(ev.x - s_lastClickX) <= 5 && abs(ev.y - s_lastClickY) <= 5;
+            s_lastClickTime = ev.time_ms;
+            s_lastClickX = ev.x; s_lastClickY = ev.y;
+            if (dbl) {
+                g_input.teleportRequested = true;
+                g_input.teleportMouseX = (float)ev.x;
+                g_input.teleportMouseY = (float)ev.y;
+                s_lastClickTime = 0; // a triple click is not two doubles
+                break;
+            }
+            g_input.leftButton = true;
+            g_input.dragging = true;
+            g_input.dragStartX = g_input.mouseX;
+            g_input.dragStartY = g_input.mouseY;
+        } else if (ev.button == 3) {
+            g_input.rightButton = true;   // the helper starts the window drag (ev.window_drag)
+        } else if (ev.button == 2) {
+            g_input.middleButton = true;  // tracked only, as on Windows
+        }
+        break;
     }
 
-    if (g_input.fullscreenToggleRequested) {
-        g_input.fullscreenToggleRequested = false;
-        ToggleFullscreen(xr);
+    case DxrWindowEvent::Type::ButtonUp:
+        if (ev.button == 1) {
+            g_input.leftButton = false;
+            g_input.dragging = false;
+        } else if (ev.button == 3) {
+            g_input.rightButton = false;
+        } else if (ev.button == 2) {
+            g_input.middleButton = false;
+        }
+        break;
+
+    case DxrWindowEvent::Type::Motion:
+        g_input.mouseX = ev.x;
+        g_input.mouseY = ev.y;
+        if (g_input.dragging) {
+            MarkUserInput(g_input);
+            const int dx = g_input.mouseX - g_input.dragStartX;
+            const int dy = g_input.mouseY - g_input.dragStartY;
+            g_input.yaw   -= dx * 0.005f;
+            g_input.pitch -= dy * 0.005f;
+            if (g_input.pitch >  1.4f) g_input.pitch =  1.4f;   // gimbal-lock clamp
+            if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
+            g_input.dragStartX = g_input.mouseX;
+            g_input.dragStartY = g_input.mouseY;
+        }
+        break;
+
+    case DxrWindowEvent::Type::Resize:
+        // The CONTENT size (the bound window/surface, bar excluded): the tile
+        // basis, and the snap extent handed to the display processor.
+        g_windowW = ev.width;
+        g_windowH = ev.height;
+        g_weaveSnap.set_extent(ev.width, ev.height);
+        break;
+
+    default: break;
+    }
+}
+
+//! Drain the window once per frame: input, the helper-owned drag / header
+//! bar / F11, and the Ctrl+T side effects.
+static void PumpWindow(AppXrSession& xr) {
+    if (!xr.hasAppWindow) return;
+    bool running = true;
+    g_window.pump_events(HandleWindowEvent, &running);
+    if (!running) {
+        LOG_INFO("Window closed — exiting");
+        g_running = false;
+    }
+
+    // Header bar title: the loaded file, like the other legs.
+    std::string title = "3D Model Viewer";
+    if (!g_loadedFileName.empty()) title += " \u2014 " + g_loadedFileName;
+    if (title != g_windowTitle) {
+        g_windowTitle = title;
+        g_window.set_title(title.c_str());
     }
 
     if (g_input.transparentBgToggleRequested) {
@@ -2360,12 +1595,12 @@ static void PumpXEvents(AppXrSession& xr) {
             // returns to the normal z-band (kBorderlessMsg's HWND_TOPMOST /
             // HWND_NOTOPMOST). Skipped while fullscreen, where the WM already
             // owns the stacking.
-            if (!g_windowIsFullscreen) {
-                X11SetAboveState(xr.xDisplay, xr.xWindow, g_transparentBg);
+            if (!g_window.is_fullscreen()) {
+                g_window.set_keep_above(g_transparentBg);
             }
-            // The input shape itself is re-applied (or dropped) by
+            // The input region itself is re-applied (or dropped) by
             // ClickthroughUpdate on the next frame, which is also the only
-            // place that calls XShape — one owner, as on Windows.
+            // place that sets it — one owner, as on Windows.
         }
     }
 }
@@ -2533,7 +1768,7 @@ int main(int argc, char** argv) {
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan, Linux / X11 handle app) ===");
+    LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan, Linux handle app — X11 or Wayland) ===");
     LOG_INFO("  [LMB-drag] Rotate  [Dbl-click] Focus  [Scroll] Zoom  "
              "(+Shift depth, +Ctrl parallax, +Alt perspective)");
     LOG_INFO("  [RMB-drag] Move the window (phase-snapped)  [WASDEQ] Move  [Space] Reset");
@@ -2547,8 +1782,20 @@ int main(int argc, char** argv) {
     // --rect, --pose, --margin) are Windows-only today; they are parsed and
     // reported so a launcher gets a clear message instead of silence.
     std::string cliModelPath;
-    if (argc > 1) {
-        std::vector<std::string> args(argv + 1, argv + argc);
+    // Window platform: --platform=x11|wayland|auto (default auto, a capability
+    // probe). Taken out of the argument list first, so the launch-contract
+    // parser never sees it (and never mistakes `--platform x11`'s value for a
+    // model path).
+    DxrWindowBackend requestedBackend = DxrWindowBackend::Auto;
+    std::vector<std::string> args(argv + 1, argv + argc);
+    {
+        std::string err;
+        if (!DxrLinuxWindow::take_platform_args(&args, &requestedBackend, &err)) {
+            LOG_ERROR("%s", err.c_str());
+            return 1;
+        }
+    }
+    if (!args.empty()) {
         const dxr::LaunchArgs la = dxr::ParseLaunchArgs(args);
         for (const std::string& w : la.warnings) LOG_WARN("launch: %s", w.c_str());
         if (!la.ok()) {
@@ -2583,11 +1830,12 @@ int main(int argc, char** argv) {
       } }
 
     AppXrSession xr = {};
-    if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
+    if (!InitializeOpenXR(xr, requestedBackend)) { LOG_ERROR("OpenXR init failed"); return 1; }
 
-    // Handle app: own an X11 window on the 3D panel (display_info queried in
-    // InitializeOpenXR gives the panel rect). Falls back to hosted-NULL when
-    // no X server is available (also the CI-safe path — CI never runs this).
+    // Handle app: own a window on the 3D panel (display_info queried in
+    // InitializeOpenXR gives the panel rect) — X11 or Wayland, whichever the
+    // probe chose. Falls back to hosted-NULL when no window system answers
+    // (also the CI-safe path — CI never runs this).
     // MODEL_TRANSPARENT — the analogue of the avatar's AVATAR_TRANSPARENT,
     // named after this leg's MODEL_WINDOW. Unlike the avatar (an overlay by
     // nature, transparent by default) the model viewer starts OPAQUE, as the
@@ -2606,37 +1854,34 @@ int main(int argc, char** argv) {
             g_transparentBg = true;
         }
     }
-    CreateAppWindow(xr);
-    if (xr.xDisplay == nullptr) {
+    if (!CreateAppWindow(xr)) {
         // hosted-NULL: the runtime owns the window; no ARGB visual, no shape.
         g_transparentCapable = false;
         g_transparentBg = false;
-    } else if (g_transparentBg && !g_windowIsFullscreen) {
-        X11SetAboveState(xr.xDisplay, xr.xWindow, true);
     }
 
-    if (!GetVulkanGraphicsRequirements(xr)) { CleanupOpenXR(xr); DestroyAppWindow(xr); return 1; }
+    if (!GetVulkanGraphicsRequirements(xr)) { CleanupOpenXR(xr); g_window.destroy(); return 1; }
 
     VkInstance vkInstance = VK_NULL_HANDLE;
-    if (!CreateVulkanInstance(xr, vkInstance)) { CleanupOpenXR(xr); DestroyAppWindow(xr); return 1; }
+    if (!CreateVulkanInstance(xr, vkInstance)) { CleanupOpenXR(xr); g_window.destroy(); return 1; }
     VkPhysicalDevice physDevice = VK_NULL_HANDLE;
     if (!GetVulkanPhysicalDevice(xr, vkInstance, physDevice)) {
-        CleanupOpenXR(xr); vkDestroyInstance(vkInstance, nullptr); DestroyAppWindow(xr); return 1; }
+        CleanupOpenXR(xr); vkDestroyInstance(vkInstance, nullptr); g_window.destroy(); return 1; }
     std::vector<const char*> devExts; std::vector<std::string> extStorage;
     if (!GetVulkanDeviceExtensions(xr, devExts, extStorage)) {
-        CleanupOpenXR(xr); vkDestroyInstance(vkInstance, nullptr); DestroyAppWindow(xr); return 1; }
+        CleanupOpenXR(xr); vkDestroyInstance(vkInstance, nullptr); g_window.destroy(); return 1; }
     uint32_t queueFamilyIndex = 0;
     if (!FindGraphicsQueueFamily(physDevice, queueFamilyIndex)) {
-        CleanupOpenXR(xr); vkDestroyInstance(vkInstance, nullptr); DestroyAppWindow(xr); return 1; }
+        CleanupOpenXR(xr); vkDestroyInstance(vkInstance, nullptr); g_window.destroy(); return 1; }
     VkDevice vkDevice = VK_NULL_HANDLE; VkQueue graphicsQueue = VK_NULL_HANDLE;
     if (!CreateVulkanDevice(physDevice, queueFamilyIndex, devExts, vkDevice, graphicsQueue)) {
-        CleanupOpenXR(xr); vkDestroyInstance(vkInstance, nullptr); DestroyAppWindow(xr); return 1; }
+        CleanupOpenXR(xr); vkDestroyInstance(vkInstance, nullptr); g_window.destroy(); return 1; }
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
         CleanupOpenXR(xr); vkDestroyDevice(vkDevice, nullptr);
-        vkDestroyInstance(vkInstance, nullptr); DestroyAppWindow(xr); return 1; }
+        vkDestroyInstance(vkInstance, nullptr); g_window.destroy(); return 1; }
     if (!CreateSpaces(xr) || !CreateSwapchains(xr)) {
         CleanupOpenXR(xr); vkDestroyDevice(vkDevice, nullptr);
-        vkDestroyInstance(vkInstance, nullptr); DestroyAppWindow(xr); return 1; }
+        vkDestroyInstance(vkInstance, nullptr); g_window.destroy(); return 1; }
 
     std::vector<XrSwapchainImageVulkanKHR> swapchainImages(
         xr.swapchain.imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
@@ -2651,9 +1896,10 @@ int main(int argc, char** argv) {
 
     // Tile basis: the app window when we own one (window×scaleXY, #729-style);
     // else the full panel (hosted-NULL renders display-sized).
-    if (xr.xContentW > 0 && xr.xContentH > 0) {
-        g_windowW = xr.xContentW;   // the CONTENT child, i.e. the bound window
-        g_windowH = xr.xContentH;
+    uint32_t contentW = 0, contentH = 0;
+    if (xr.hasAppWindow && g_window.current_size(&contentW, &contentH)) {
+        g_windowW = contentW;   // the CONTENT (the bound window/surface, bar excluded)
+        g_windowH = contentH;
     } else {
         if (xr.displayPixelWidth > 0) g_windowW = xr.displayPixelWidth;
         if (xr.displayPixelHeight > 0) g_windowH = xr.displayPixelHeight;
@@ -2709,7 +1955,7 @@ int main(int argc, char** argv) {
         g_input.nominalViewerZ = xr.nominalViewerZ;
 
         PollEvents(xr);
-        PumpXEvents(xr);   // mouse + keys + the client-owned, phase-snapped drag
+        PumpWindow(xr);    // mouse + keys; the helper runs the bar, the drag and F11
         PollFilePicker();  // async zenity result → loadModel + auto-fit
 
         if (!xr.sessionRunning) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); continue; }
@@ -3036,22 +2282,13 @@ int main(int argc, char** argv) {
                     // hands it back in COLOR_ATTACHMENT_OPTIMAL, which is the
                     // layout the runtime expects at xrReleaseSwapchainImage.
                     // Same placement as windows/main.cpp:3439.
-                    if (xr.xDisplay != nullptr && xr.xWindow != 0) {
-                        // LIVE content rect, queried once a frame from the BOUND
-                        // child — the rect the runtime renders and the view
-                        // tiles map onto. xr.xContentW/H track our own layout,
-                        // but a stale rect puts the input region in the wrong
-                        // place, so ask the server.
-                        unsigned int winPxW = xr.xContentW, winPxH = xr.xContentH;
-                        int contentOffY = ContentOffsetY(xr);
-                        if (xr.xContent != 0) {
-                            Window gRoot; int gx, gy; unsigned int gw, gh, gbw, gd;
-                            if (XGetGeometry(xr.xDisplay, xr.xContent, &gRoot, &gx, &gy,
-                                             &gw, &gh, &gbw, &gd) && gw > 0 && gh > 0) {
-                                winPxW = gw; winPxH = gh;
-                                contentOffY = gy;   // parent-relative: exactly the offset we want
-                            }
-                        }
+                    if (xr.hasAppWindow) {
+                        // LIVE content size, from the window helper — the
+                        // rect the runtime renders and the view tiles map
+                        // onto (bar excluded; the helper offsets and unions
+                        // the bar itself).
+                        uint32_t winPxW = 0, winPxH = 0;
+                        g_window.current_size(&winPxW, &winPxH);
                         const uint32_t lastEye = (uint32_t)(eyeCount - 1);
                         ClickthroughParams cp;
                         cp.dev = vkDevice;
@@ -3067,22 +2304,23 @@ int main(int argc, char** argv) {
                         cp.lastTileX = tileOffsets[lastEye].first;
                         cp.lastTileY = tileOffsets[lastEye].second;
                         cp.twoViews = eyeCount > 1;
-                        cp.dpy = xr.xDisplay;
-                        cp.win = xr.xWindow;          // shape the TOP-LEVEL (see clickthrough.h)
+                        cp.window = &g_window;
                         cp.winW = winPxW;
                         cp.winH = winPxH;
-                        cp.contentOffsetY = contentOffY;
                         cp.transparentBg = g_transparentBg;
-                        // A WM-decorated window (DXR_X11_WM_DECORATIONS=1) or
-                        // a fullscreen one is never shaped: the frame needs the
-                        // whole window for move/resize, and a fullscreen
+                        // A WM-decorated X11 window (DXR_X11_WM_DECORATIONS=1)
+                        // or a fullscreen one is never shaped: the frame needs
+                        // the whole window for move/resize, and a fullscreen
                         // overlay has no desktop beside it to click through to.
-                        cp.decorated = !g_clientOwnedDrag || g_windowIsFullscreen;
-                        // The header bar is UNIONED into the input shape — it
-                        // must stay clickable over a punched-through background
-                        // (the avatar's un-unioned speech bubble was dead).
-                        XRectangle barRect = dxr_csd_x11::BarRect(g_titleBar, xr.xWinW);
-                        if (CsdVisible(xr)) { cp.chrome = &barRect; cp.chromeCount = 1; }
+                        static const bool s_wmDecorated = [] {
+                            const char* e = getenv("DXR_X11_WM_DECORATIONS");
+                            return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+                        }();
+                        cp.decorated = g_window.is_fullscreen() ||
+                                       (s_wmDecorated && g_window.backend() == DxrWindowBackend::X11);
+                        // The header bar is always kept clickable by the
+                        // helper; it also counts as "reachable" below.
+                        cp.chromeVisible = g_window.header_bar_visible();
                         ClickthroughUpdate(cp);
                     }
 
@@ -3112,7 +2350,7 @@ int main(int argc, char** argv) {
     CleanupOpenXR(xr);
     if (vkDevice) vkDestroyDevice(vkDevice, nullptr);
     if (vkInstance) vkDestroyInstance(vkInstance, nullptr);
-    DestroyAppWindow(xr);   // LAST: the runtime's VkSurfaceKHR borrowed this Display
+    g_window.destroy();   // LAST: the runtime's VkSurfaceKHR borrowed this connection
     LOG_INFO("Clean exit");
     return 0;
 }

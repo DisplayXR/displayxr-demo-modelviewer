@@ -30,11 +30,14 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    # v2.18.0 ships displayxr::csd — the shared header bar the Linux leg draws
-    # with (displayxr-common#52/#53) — at the 1.5x title metrics (#55), so the
-    # demo's bar matches the runtime's test apps.
-    GIT_TAG v2.18.0
-    GIT_SHALLOW TRUE
+    # v2.20.0 ships displayxr::linux_window — the one Linux window (X11 or
+    # native Wayland in one binary, chosen by capability; the header bar,
+    # input events, click-through and the phase-snapped drag), shared with the
+    # runtime's test apps.
+    # TEMPORARY: the displayxr-common PR commit (displayxr-common#58); switch to
+    # `GIT_TAG v2.20.0` + `GIT_SHALLOW TRUE` once that tag is cut.
+    GIT_TAG aa52599d7001da56c87b52b62389c5a4494c4bfb
+    GIT_SHALLOW FALSE
 )
 FetchContent_MakeAvailable(displayxr_common)
 

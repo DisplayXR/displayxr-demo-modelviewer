@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  X11 XShape click-through from the frame's own rendered alpha.
+ * @brief  Click-through from the frame's own rendered alpha (X11 + Wayland).
  *
  * See clickthrough.h for the design and for why the coverage comes from a
  * downscale blit of the swapchain atlas rather than a second scene pass.
@@ -12,7 +12,7 @@
 
 #include "model_vulkan_utils.h"
 
-#include <X11/extensions/shape.h>
+#include "dxr_linux_window.h" // DxrLinuxWindow::set_input_region / clear_input_region
 
 #include <cstdio>
 #include <cstdlib>
@@ -205,24 +205,6 @@ EnsureDevice(const ClickthroughParams &p)
 	return true;
 }
 
-//! Is XShape present on this server? Queried once; a server without it gets a
-//! single WARN rather than a silent no-op.
-static bool
-HaveShapeExtension(Display *dpy)
-{
-	static int s_state = -1; // -1 unknown, 0 absent, 1 present
-	if (s_state < 0) {
-		int eventBase = 0, errorBase = 0;
-		s_state = XShapeQueryExtension(dpy, &eventBase, &errorBase) ? 1 : 0;
-		if (s_state == 0) {
-			fprintf(stderr, "[WARN]  clickthrough: the X server has no SHAPE extension — "
-			                "the transparent window will swallow clicks over its whole "
-			                "rect instead of passing them through to the desktop.\n");
-		}
-	}
-	return s_state == 1;
-}
-
 //! Fold the previous call's readback into the published coverage: union both
 //! planes' alpha, threshold, dilate.
 static void
@@ -312,22 +294,21 @@ ConsumePendingReadback(VkDevice dev, uint32_t dilate, uint8_t alphaMin)
 
 //! Drop the shape: the whole window becomes interactive again.
 static void
-ClearShape(Display *dpy, Window win)
+ClearShape(DxrLinuxWindow *window)
 {
-	XShapeCombineMask(dpy, win, ShapeInput, 0, 0, None, ShapeSet);
-	XFlush(dpy);
+	window->clear_input_region();
 	g_shaped = false;
 }
 
-//! Turn the published coverage (+ the chrome rects) into the window's XShape
-//! input region.
+//! Turn the published coverage into the window's input region (the helper
+//! adds the header bar).
 static void
 ApplyRegion(const ClickthroughParams &p)
 {
 	if (!g_covReady || g_covW == 0 || g_covH == 0 || p.winW == 0 || p.winH == 0) {
 		return;
 	}
-	std::vector<XRectangle> rects;
+	std::vector<DxrWindowRect> rects;
 
 	// Scale against the LIVE window, not the size the coverage was captured
 	// at. The coverage is a normalised silhouette, so mapping it onto the
@@ -365,7 +346,7 @@ ApplyRegion(const ClickthroughParams &p)
 		}
 		if (bandFirst != (size_t)-1 && runs == prevRuns) {
 			for (size_t i = bandFirst; i < rects.size(); ++i) {
-				rects[i].height = (unsigned short)(bottom + p.contentOffsetY - (int64_t)rects[i].y);
+				rects[i].height = (uint32_t)(bottom - (int64_t)rects[i].y);
 			}
 			continue;
 		}
@@ -374,11 +355,11 @@ ApplyRegion(const ClickthroughParams &p)
 		for (size_t i = 0; i + 1 < runs.size(); i += 2) {
 			const int64_t left = (int64_t)runs[i] * winW / cw;
 			const int64_t right = (int64_t)runs[i + 1] * winW / cw;
-			XRectangle r;
-			r.x = (short)(left + p.contentOffsetX);
-			r.y = (short)(top + p.contentOffsetY);
-			r.width = (unsigned short)(right > left ? right - left : 1);
-			r.height = (unsigned short)(bottom > top ? bottom - top : 1);
+			DxrWindowRect r;
+			r.x = (int32_t)left;
+			r.y = (int32_t)top;
+			r.width = (uint32_t)(right > left ? right - left : 1);
+			r.height = (uint32_t)(bottom > top ? bottom - top : 1);
 			rects.push_back(r);
 		}
 		prevRuns = runs;
@@ -393,7 +374,7 @@ ApplyRegion(const ClickthroughParams &p)
 	// the chrome below is by definition reachable, but it is also optional
 	// (DXR_X11_WM_DECORATIONS, a future chrome-less mode), so the silhouette
 	// has to stand on its own.
-	const bool reachable = covered >= kMinCoveredPx || p.chromeCount > 0;
+	const bool reachable = covered >= kMinCoveredPx || p.chromeVisible;
 	if (!reachable) {
 		if (g_lastReachableState != 0) {
 			g_lastReachableState = 0;
@@ -404,22 +385,12 @@ ApplyRegion(const ClickthroughParams &p)
 			        covered, (long long)winW, (long long)winH);
 		}
 		if (g_shaped) {
-			ClearShape(p.dpy, p.win);
+			ClearShape(p.window);
 		}
 		return;
 	}
 	if (g_lastReachableState != 1) {
 		g_lastReachableState = 1;
-	}
-
-	// Chrome (the client-side title bar) is already in top-level px — append
-	// unscaled. UNIONED IN, never punched out: a shaped window delivers no
-	// pointer event outside its input region, so an un-unioned band would be
-	// visible and dead.
-	for (uint32_t i = 0; i < p.chromeCount; ++i) {
-		if (p.chrome[i].width > 0 && p.chrome[i].height > 0) {
-			rects.push_back(p.chrome[i]);
-		}
 	}
 
 	// Diagnostic: the rect count disambiguates "region empty" (no alpha →
@@ -429,29 +400,26 @@ ApplyRegion(const ClickthroughParams &p)
 	static int s_diag = 0;
 	if ((s_diag++ % 300) == 0) {
 		fprintf(stderr,
-		        "[INFO]  clickthrough: %zu input-rects (+%u chrome), ~%u px covered, "
+		        "[INFO]  clickthrough: %zu input-rects (%s), ~%u px covered, "
 		        "win %lldx%lld, coverage %ux%u\n",
-		        rects.size(), p.chromeCount, covered, (long long)winW, (long long)winH, g_covW, g_covH);
+		        rects.size(), p.chromeVisible ? "+ header bar" : "no header bar", covered, (long long)winW,
+		        (long long)winH, g_covW, g_covH);
 	}
 
-	// Set the window's INPUT shape to the model (+ chrome): clicks land on it,
-	// and the transparent rest passes through to the desktop. ShapeInput, not
-	// ShapeBounding — the window keeps rendering everywhere, only hit-testing
-	// is restricted, which is what lets the compositor blend our alpha.
-	XShapeCombineRectangles(p.dpy, p.win, ShapeInput, 0, 0, rects.empty() ? nullptr : rects.data(),
-	                        (int)rects.size(), ShapeSet, Unsorted);
-	XFlush(p.dpy);
-	g_shaped = true;
+	// Set the window's INPUT region to the model (+ the header bar, which the
+	// helper adds): clicks land on it, and the transparent rest passes through
+	// to the desktop. Input only — the window keeps rendering everywhere, only
+	// hit-testing is restricted, which is what lets the compositor blend our
+	// alpha. False = the window system cannot express it (reported once by
+	// the helper); nothing to undo then.
+	g_shaped = p.window->set_input_region(rects.empty() ? nullptr : rects.data(), rects.size());
 }
 
 void
 ClickthroughUpdate(const ClickthroughParams &p)
 {
-	if (p.dpy == nullptr || p.win == 0 || p.winW == 0 || p.winH == 0 || p.viewImage == VK_NULL_HANDLE ||
-	    p.tileW == 0 || p.tileH == 0) {
-		return;
-	}
-	if (!HaveShapeExtension(p.dpy)) {
+	if (p.window == nullptr || p.winW == 0 || p.winH == 0 || p.viewImage == VK_NULL_HANDLE || p.tileW == 0 ||
+	    p.tileH == 0) {
 		return;
 	}
 
@@ -461,7 +429,7 @@ ClickthroughUpdate(const ClickthroughParams &p)
 	// make the background it just drew unclickable.
 	if (p.decorated || !p.transparentBg) {
 		if (!g_shapeCleared) {
-			ClearShape(p.dpy, p.win);
+			ClearShape(p.window);
 			g_shapeCleared = true;
 		}
 		return;
