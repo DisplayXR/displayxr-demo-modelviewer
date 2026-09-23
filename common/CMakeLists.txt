@@ -36,7 +36,7 @@ FetchContent_Declare(
     # runtime's test apps.
     # TEMPORARY: the displayxr-common PR commit (displayxr-common#58); switch to
     # `GIT_TAG v2.20.0` + `GIT_SHALLOW TRUE` once that tag is cut.
-    GIT_TAG aa8b58577ee18c51a4371f6cfb4ed8f10b70a228
+    GIT_TAG 5f5043f246204f8f4e31a290589999003b8ee5cc
     GIT_SHALLOW FALSE
 )
 FetchContent_MakeAvailable(displayxr_common)
