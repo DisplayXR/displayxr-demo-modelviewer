@@ -1088,6 +1088,7 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.x11_drag_button = 3;        // RMB drags; LMB stays the model orbit
     desc.wayland_drag_button = 3;    // ...the same gesture on Wayland (compositor move)
     desc.keep_above = g_transparentCapable && g_transparentBg;
+    desc.transparent_background = g_transparentCapable && g_transparentBg;   // no header bar while transparent
     desc.has_position = explicitPos || panelKnown;
     desc.x = px;
     desc.y = py;
@@ -1592,6 +1593,9 @@ static void PumpWindow(AppXrSession& xr) {
         } else {
             g_transparentBg = !g_transparentBg;
             LOG_INFO("Transparent background: %s (Ctrl+T)", g_transparentBg ? "ON" : "OFF");
+            // The header bar hides while transparent (Windows parity); the
+            // content rect is unchanged, so the runtime sees no move.
+            g_window.set_transparent_background(g_transparentBg);
             // Windows parity: transparent floats above other apps, opaque
             // returns to the normal z-band (kBorderlessMsg's HWND_TOPMOST /
             // HWND_NOTOPMOST). Skipped while fullscreen, where the WM already
