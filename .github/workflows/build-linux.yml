@@ -118,7 +118,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev
 
       - name: Assert required dev libraries are present
@@ -194,7 +194,7 @@ jobs:
             libvulkan-dev glslang-tools \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev \
             dpkg-dev fakeroot
           cmake --version | head -1

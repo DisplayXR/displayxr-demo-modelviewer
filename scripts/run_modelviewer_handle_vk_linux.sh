@@ -8,10 +8,11 @@
 # without 3D hardware. Committed so the runtime's run_linux_demo.sh harness can
 # find it (issue #40).
 #
-# NOTE: on-screen operation is gated on the runtime's Linux Phase 1b/3b hardware
-# bring-up. Needs X11/XWayland.
+# Needs an X server (XWayland counts) or a Wayland compositor. The app picks the
+# window platform by capability: --platform=x11|wayland|auto (default auto =
+# native Wayland when the compositor is ready, else X11).
 #
-# Usage: scripts/run_modelviewer_handle_vk_linux.sh [extra args...]
+# Usage: scripts/run_modelviewer_handle_vk_linux.sh [--platform=x11|wayland|auto] [extra args...]
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

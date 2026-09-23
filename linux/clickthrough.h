@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  X11 XShape click-through for the transparent model overlay.
+ * @brief  Click-through for the transparent model overlay (X11 and Wayland).
  *
  * The Linux analogue of the Windows leg's `dxr::ClickThroughRegion`
  * (displayxr-common/common/vk_clickthrough_region.h, runtime#833/#837), which
- * punches the window through to the desktop with SetWindowRgn. X11's
- * equivalent is an XShape **ShapeInput** region: clicks land on the model and
- * pass through the transparent surround to whatever is underneath.
+ * punches the window through to the desktop with SetWindowRgn. Here the region
+ * goes through displayxr::linux_window's set_input_region(): an XShape
+ * **ShapeInput** region on X11, the surface's input region on Wayland. Clicks
+ * land on the model and pass through the transparent surround to whatever is
+ * underneath. This file owns only the COVERAGE (the Vulkan readback and the
+ * runs); the window system is the helper's.
  *
  * WHERE THE COVERAGE COMES FROM, AND WHY IT IS NOT A SECOND SCENE PASS.
  * The Windows leg derives the region from the frame's OWN rendered view — a
@@ -29,8 +32,8 @@
  * layout from the viewport origin) — there is no scratch render target here,
  * only transfer-only coverage images.
  *
- * Everything downstream of the coverage IS the avatar's design, because that
- * part is X11 and it is hardware-verified:
+ * Everything downstream of the coverage IS the avatar's design, and it is
+ * hardware-verified on X11:
  *
  *   - the raster SCALES with the window (kTexelPxDefault window px per texel,
  *     capped), so precision does not degrade as the window grows;
@@ -49,11 +52,11 @@
  *     into a band, so a 4K window does not hand the X server thousands of
  *     rectangles per frame.
  *
- * CHROME RECTS ARE UNIONED IN, NOT PUNCHED OUT. Anything the app draws that
- * is not the model — the client-side title bar — must be added to the region
- * or the shaped window makes it unclickable. (That is the avatar's
- * speech-bubble bug: an un-unioned band is invisible to the pointer.) Chrome
- * rects are already in client px and are appended unscaled.
+ * CHROME IS UNIONED IN, NOT PUNCHED OUT. Anything drawn that is not the
+ * model — the client-side title bar — must be part of the region or the
+ * shaped window makes it unclickable. (That is the avatar's speech-bubble bug:
+ * an un-unioned band is invisible to the pointer.) The window helper unions
+ * its own header bar in, on both backends.
  *
  * REACHABILITY SAFETY NET. With the title bar unioned in the window is always
  * grabbable, but the shape is also applied when decorations are off, and a
@@ -63,16 +66,16 @@
  * window area the shape is therefore DROPPED rather than applied, and the
  * fall back is logged once per transition.
  *
- * No-op when the window / Display is null (hosted-NULL fallback), and reports
- * once when the server has no XShape extension instead of silently doing
- * nothing. Requires libXext.
+ * No-op when there is no window (hosted-NULL fallback); the helper reports
+ * once when the window system cannot express an input region.
  */
 
 #pragma once
 
 #include <vulkan/vulkan.h>
-#include <X11/Xlib.h>
 #include <cstdint>
+
+class DxrLinuxWindow;
 
 //! Everything one click-through update needs.
 struct ClickthroughParams {
@@ -94,34 +97,26 @@ struct ClickthroughParams {
 	uint32_t lastTileX = 0, lastTileY = 0;
 	bool twoViews = false;
 
-	Display *dpy = nullptr;
-	//! The TOP-LEVEL window: the one the WM and XWayland hit-test, so the one
-	//! that carries the input shape. When the content is a child window (the
-	//! client-side-decorations layout) its own input region is left at the
-	//! default full rect — the server never descends into a child at a point
-	//! outside the PARENT's input shape, so shaping the parent alone gates both.
-	Window win = 0;
-	//! Live CONTENT size in px — the area the view tiles map onto (the bound
-	//! content child's XGetGeometry, not a cached create size).
+	//! The window (displayxr::linux_window). It applies the region to the
+	//! surface that is hit-tested (the X11 top-level, offsetting past the
+	//! header bar and unioning it in; the Wayland content surface).
+	DxrLinuxWindow *window = nullptr;
+	//! Live CONTENT size in px — the area the view tiles map onto
+	//! (DxrLinuxWindow::current_size, not a cached create size).
 	uint32_t winW = 0;
 	uint32_t winH = 0;
-	//! Where the content sits inside @ref win (the header bar's height when
-	//! one is shown, else 0). Silhouette rects are offset by it; chrome rects
-	//! are already in top-level px.
-	int32_t contentOffsetX = 0;
-	int32_t contentOffsetY = 0;
 
 	//! Ctrl+T state. An opaque frame covers every pixel of the window, so the
 	//! whole window must stay interactive.
 	bool transparentBg = false;
-	//! Decorated windows (DXR_X11_WM_DECORATIONS=1) drop the shape entirely:
-	//! the WM frame needs the whole window for move/resize.
+	//! Decorated windows (DXR_X11_WM_DECORATIONS=1) and fullscreen ones drop
+	//! the shape entirely: a WM frame needs the whole window for move/resize.
 	bool decorated = false;
 
-	//! App-drawn chrome in TOP-LEVEL px (the client-side title bar), unioned into
-	//! the region so it stays clickable over a punched-through background.
-	const XRectangle *chrome = nullptr;
-	uint32_t chromeCount = 0;
+	//! A header bar is shown (DxrLinuxWindow::header_bar_visible). The helper
+	//! keeps it clickable; here it only means the window stays reachable even
+	//! when the silhouette is tiny.
+	bool chromeVisible = false;
 };
 
 //! Read back the frame's silhouette and set the window's XShape input region
