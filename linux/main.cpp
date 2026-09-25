@@ -22,7 +22,10 @@
  * 1920x1080 centred on the panel (XR_DXR_display_info desktop rect);
  * MODEL_WINDOW="WxH+X+Y" overrides (the position is X11-only — a Wayland
  * client cannot place itself). Asking for exactly the panel's size makes it
- * genuinely fullscreen on that monitor (INV-1.3). When no window system
+ * genuinely fullscreen on that monitor (INV-1.3). --rect=X,Y,W,H (the undock
+ * contract, desktop device px) opens the CONTENT at exactly that rect on both
+ * backends — on Wayland through the window-geometry extension, via
+ * displayxr-common's DxrLinuxWindow::request_initial_rect. When no window system
  * answers the app falls back to hosted-NULL, which also keeps it startable on
  * a headless CI runner.
  *
@@ -299,6 +302,19 @@ static bool g_contentMaskChaining = false;  // one-time log on start/stop, never
 //! --vh=<metres>: pins the virtual display height over the auto-fit result.
 static float g_vhOverride = 0.0f;
 
+//! --rect=X,Y,W,H: the window's CONTENT rect in desktop device px (the Windows
+//! leg's convention — the browser's undock() measures the page element in it).
+static bool g_launchHasRect = false;
+static int32_t g_launchRectX = 0, g_launchRectY = 0, g_launchRectW = 0, g_launchRectH = 0;
+//! --pose=YAW,PITCH[,ZOOM]: the orbit the sender showed the asset at, page
+//! convention (see ApplyLaunchPose). Folded into every load-time framing.
+static bool  g_hasLaunchPose = false;
+static float g_launchPoseYawDeg = 0.0f, g_launchPosePitchDeg = 0.0f, g_launchPoseZoom = 1.0f;
+//! --margin=<0..1>: the fraction of the window the framed asset may fill (the
+//! sender's fit margin); the shared rule's default otherwise.
+static float g_fitFill = dxr::kAutoFitDefaultFill;
+static bool  g_marginPinned = false;
+
 // Dynamic-recenter pins. Default X Y Z matches the Windows modelviewer's hard
 // pin; P arms and X/Y/Z toggle an axis, or DXR_RECENTER_PIN sets it up front.
 static dxr::RecenterControl g_recenter;
@@ -521,7 +537,12 @@ static void UpdateCameraMovement(InputState& state, float deltaTime, float displ
     // clip plays — the asset already carries its own motion. Holding the idle
     // clock at "now" restarts the countdown when playback pauses, so the
     // turntable doesn't snap the instant the user hits K (macOS parity).
-    if (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) {
+    // Also held while the background is TRANSPARENT (the Windows leg's
+    // AutoOrbitSuppressed): the model is a floating object on the desktop, and
+    // one that spins by itself reads as a glitch — and an undocked view
+    // (--transparent --pose) must hold the page's opening pose until the user
+    // drags. Linux has no workspace shell, so every session is standalone.
+    if ((g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) || g_transparentBg) {
         state.animationActive = false;
         state.lastInputTimeSec = NowSec();
     } else if (state.animateEnabled && state.lastInputTimeSec > 0.0) {
@@ -586,6 +607,10 @@ struct AppXrSession {
     float nominalViewerZ = 0.5f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
     int32_t displayScreenLeft = 0;     // 3D-panel top-left in virtual-desktop px (INV-1.3)
+    // XR_DXR_display_info v18: the panel monitor's full desktop rect and whether
+    // the runtime really located the panel (the --rect clamp's gate).
+    XrRect2Di displayDesktopRect = {};
+    bool displayPanelConfirmed = false;
     int32_t displayScreenTop = 0;
 
     //! An app-owned window exists (g_window); false = hosted-NULL fallback.
@@ -722,9 +747,20 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        // display_info v18: the full panel rect, for --rect clamping. Additive
+        // and separately chained — an older runtime just leaves it zero.
+        XrDisplayDesktopInfoDXR desktopInfo = {};
+        desktopInfo.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+        desktopPos.next = &desktopInfo;
         di.next = &desktopPos;
         sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
+            xr.displayDesktopRect = desktopInfo.desktopRect;
+            xr.displayPanelConfirmed = desktopInfo.isPanelConfirmed == XR_TRUE;
+            LOG_INFO("Display desktop rect: (%d, %d) %dx%d panelConfirmed=%s device='%s'",
+                     xr.displayDesktopRect.offset.x, xr.displayDesktopRect.offset.y,
+                     xr.displayDesktopRect.extent.width, xr.displayDesktopRect.extent.height,
+                     xr.displayPanelConfirmed ? "yes" : "no", desktopInfo.deviceName);
             xr.displayWidthM = di.displaySizeMeters.width;
             xr.displayHeightM = di.displaySizeMeters.height;
             xr.nominalViewerZ = di.nominalViewerPositionInDisplaySpace.z;
@@ -1150,6 +1186,8 @@ static const unsigned int kDefaultWindowH = 1080;
 //
 // MODEL_WINDOW="WxH+X+Y" overrides the size/position (X,Y absolute
 // virtual-desktop px, X11 only; WxH alone re-centres on the panel).
+// --rect=X,Y,W,H overrides both, on X11 AND Wayland: the content lands at
+// exactly that desktop device-px rect (request_initial_rect), windowed.
 // Returns false when no window could be made; the caller then falls back to
 // hosted-NULL (also the CI-safe path).
 static bool CreateAppWindow(AppXrSession& xr) {
@@ -1172,6 +1210,29 @@ static bool CreateAppWindow(AppXrSession& xr) {
             if (n >= 4) { explicitPos = true; px = ox; py = oy; }
             LOG_INFO("MODEL_WINDOW override: %ux%u%s", w, h, n >= 4 ? " at an absolute position" : "");
         }
+    }
+    // --rect wins over MODEL_WINDOW and the default: it is this launch's
+    // explicit statement of where the content goes (the undock contract).
+    // Same policy as the Windows leg: exactly the rect the caller measured,
+    // nudged INTO the panel only when the runtime confirmed the panel.
+    int32_t rectX = 0, rectY = 0;
+    if (g_launchHasRect) {
+        rectX = g_launchRectX;
+        rectY = g_launchRectY;
+        LOG_INFO("Undock rect requested: (%d,%d %dx%d)", rectX, rectY, g_launchRectW, g_launchRectH);
+        dxr::ClampRectIntoPanel(rectX, rectY, g_launchRectW, g_launchRectH, xr.displayDesktopRect.offset.x,
+                                xr.displayDesktopRect.offset.y, xr.displayDesktopRect.extent.width,
+                                xr.displayDesktopRect.extent.height, xr.displayPanelConfirmed);
+        LOG_INFO("Undock rect final: (%d,%d %dx%d) panel-confirmed=%d panel-rect=(%d,%d %dx%d)", rectX, rectY,
+                 g_launchRectW, g_launchRectH, (int)xr.displayPanelConfirmed, xr.displayDesktopRect.offset.x,
+                 xr.displayDesktopRect.offset.y, xr.displayDesktopRect.extent.width,
+                 xr.displayDesktopRect.extent.height);
+        w = (unsigned int)g_launchRectW;
+        h = (unsigned int)g_launchRectH;
+        explicitPos = true;
+        px = rectX;
+        py = rectY;
+        g_window.request_initial_rect(rectX, rectY, (uint32_t)g_launchRectW, (uint32_t)g_launchRectH);
     }
     if (!explicitPos && panelKnown) {
         px = prx + (prw - (int)w) / 2;
@@ -1199,7 +1260,8 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.x = px;
     desc.y = py;
     // Panel-sized = fullscreen on the panel, on Wayland as on X11 (INV-1.3).
-    desc.fullscreen_on_wayland = panelKnown && (int)w == prw && (int)h == prh;
+    // (A --rect window is always windowed: request_initial_rect overrides.)
+    desc.fullscreen_on_wayland = !g_launchHasRect && panelKnown && (int)w == prw && (int)h == prh;
 
     if (!g_window.create(xr.windowBackend, desc)) {
         LOG_WARN("%s window creation failed — using hosted-NULL windowing",
@@ -1239,6 +1301,35 @@ static bool FileExists(const std::string& p) {
     struct stat st; return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+// --pose SIGN CONVENTION — identical to the Windows leg (windows/main.cpp,
+// kPoseYawSign / kPosePitchSign, where the derivation and the measurement
+// against the page's own thumbnail are recorded). The page rotates the
+// SUBJECT under a fixed camera; this viewer orbits the display rig around a
+// fixed subject, so both axes invert: rig yaw = -page yaw, rig pitch =
+// -page pitch. `--pose=0,0` is bit-for-bit the unposed framing. Zoom needs no
+// sign: the rig divides the fit vHeight by scaleFactor.
+static constexpr float kPoseYawSign = -1.0f;
+static constexpr float kPosePitchSign = -1.0f;
+
+//! Fold a --pose launch hint into the just-computed framed pose (g_fit*).
+//! The rig's own pitch clamp (+/-1.4 rad, as on Windows) is the authority on
+//! what the camera may reach. Auto-orbit is not touched here: while the
+//! window is transparent (an undock) the turntable is held anyway — see the
+//! auto-orbit gate — so the view holds the opening pose until the user drags.
+static void ApplyLaunchPose() {
+    if (!g_hasLaunchPose) return;
+    float pitchRad = kPosePitchSign * g_launchPosePitchDeg * 0.0174532925f;
+    if (pitchRad > 1.4f) pitchRad = 1.4f;
+    if (pitchRad < -1.4f) pitchRad = -1.4f;
+    g_fitYaw = kPoseYawSign * g_launchPoseYawDeg * 0.0174532925f;
+    g_fitPitch = pitchRad;
+    g_fitZoom = (g_launchPoseZoom > 0.0f) ? g_launchPoseZoom : 1.0f;
+    LOG_INFO("Launch pose applied: page yaw=%.1fdeg pitch=%.1fdeg zoom=%.2f -> "
+             "rig yaw=%.1fdeg pitch=%.1fdeg scaleFactor=%.2f",
+             g_launchPoseYawDeg, g_launchPosePitchDeg, g_launchPoseZoom,
+             g_fitYaw * 57.2957795f, g_fitPitch * 57.2957795f, g_fitZoom);
+}
+
 static void ApplyAutoFitForLoadedScene() {
     float center[3], extent[3];
     const bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
@@ -1250,7 +1341,7 @@ static void ApplyAutoFitForLoadedScene() {
         // presentation surface (the panel). Only its aspect matters.
         const float viewportW = (float)g_windowW, viewportH = (float)g_windowH;
         float sweptW = 0.0f;
-        float vh = modelviewer::FitVHeight(extent, viewportW, viewportH, &sweptW);
+        float vh = modelviewer::FitVHeight(extent, viewportW, viewportH, &sweptW, g_fitFill);
         g_fitExtentW = sweptW;
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM;
         // --vh wins over the fit: the caller is asserting the scale the asset
@@ -1262,15 +1353,17 @@ static void ApplyAutoFitForLoadedScene() {
         }
         g_fitVHeight = vh;
         g_fitYaw = 0.0f; g_fitPitch = 0.0f; g_fitZoom = 1.0f;
+        ApplyLaunchPose();
         const bool haveViewport = (viewportW > 0.0f && viewportH > 0.0f);
         const float aspect = haveViewport ? (viewportW / viewportH) : 0.0f;
         const char* boundBy = !haveViewport
                             ? "height (no viewport)"
-                            : modelviewer::FitBoundBy(sweptW, extent[1], extent[2], aspect);
+                            : modelviewer::FitBoundBy(sweptW, extent[1], extent[2], aspect, g_fitFill);
         LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extent W=%.3f H=%.3f D=%.3f swept-W=%.3f "
-                 "viewport=%.0fx%.0f (aspect %.3f) bound-by=%s vHeight=%.3f",
+                 "viewport=%.0fx%.0f (aspect %.3f) bound-by=%s fill=%.2f%s vHeight=%.3f",
                  center[0], center[1], center[2], extent[0], extent[1], extent[2], sweptW,
-                 viewportW, viewportH, aspect, boundBy, vh);
+                 viewportW, viewportH, aspect, boundBy, g_fitFill, g_marginPinned ? " (--margin)" : "",
+                 vh);
     } else {
         g_fitCenter[0] = g_fitCenter[1] = g_fitCenter[2] = 0.0f;
         g_fitExtentW = g_fitExtentH = g_fitExtentD = 0.0f;
@@ -1892,10 +1985,10 @@ int main(int argc, char** argv) {
     LOG_INFO("  [Ctrl+O] Load  [F11] Fullscreen  [P then X/Y/Z] Pin recenter axis  [ESC] Quit");
 
     // Launch contract (shared with Windows/macOS): the first positional
-    // argument is a model path, --vh=<metres> pins the virtual display height.
-    // The remaining flags of the contract (--src URL download, --transparent,
-    // --rect, --pose, --margin) are Windows-only today; they are parsed and
-    // reported so a launcher gets a clear message instead of silence.
+    // argument is a model path, --vh=<metres> pins the virtual display height,
+    // --transparent / --rect / --pose / --margin follow the Windows leg (the
+    // undock contract). --src URL download is Windows-only today; it is parsed
+    // and reported so a launcher gets a clear message instead of silence.
     std::string cliModelPath;
     // Window platform: --platform=x11|wayland|auto (default auto, a capability
     // probe). Taken out of the argument list first, so the launch-contract
@@ -1930,8 +2023,31 @@ int main(int argc, char** argv) {
         // from frame 0; this window is borderless in every mode already, and
         // _NET_WM_STATE_ABOVE is applied once the window exists (below).
         if (la.transparent) { g_launchTransparent = true; LOG_INFO("launch: --transparent"); }
-        if (la.hasRect) LOG_WARN("launch: --rect has no Linux path yet — use MODEL_WINDOW=\"WxH+X+Y\"");
-        if (la.hasPose) LOG_WARN("launch: --pose has no Linux path yet — ignored");
+        // --rect: the CONTENT rect in desktop device px, placed in
+        // CreateAppWindow (clamped into a confirmed panel, as on Windows).
+        if (la.hasRect) {
+            g_launchHasRect = true;
+            g_launchRectX = la.rectX;
+            g_launchRectY = la.rectY;
+            g_launchRectW = la.rectW;
+            g_launchRectH = la.rectH;
+        }
+        // --pose / --margin: load-time framing inputs, folded into every fit
+        // (ApplyAutoFitForLoadedScene), exactly as the Windows leg stages them.
+        if (la.hasPose) {
+            g_hasLaunchPose = true;
+            g_launchPoseYawDeg = la.poseYawDeg;
+            g_launchPosePitchDeg = la.posePitchDeg;
+            g_launchPoseZoom = la.poseZoom;
+            LOG_INFO("launch: opening pose yaw=%.1fdeg pitch=%.1fdeg zoom=%.2f (page convention)",
+                     la.poseYawDeg, la.posePitchDeg, la.poseZoom);
+        }
+        if (la.hasMargin) {
+            g_fitFill = la.margin;
+            g_marginPinned = true;
+            LOG_INFO("launch: fit margin %.0f%% of the window (default %.0f%%)", la.margin * 100.0f,
+                     dxr::kAutoFitDefaultFill * 100.0f);
+        }
     }
 
     // Dynamic-recenter pins: default hard-pin X+Y+Z (modelviewer parity).
