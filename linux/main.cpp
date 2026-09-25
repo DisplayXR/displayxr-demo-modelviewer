@@ -22,7 +22,10 @@
  * 1920x1080 centred on the panel (XR_DXR_display_info desktop rect);
  * MODEL_WINDOW="WxH+X+Y" overrides (the position is X11-only — a Wayland
  * client cannot place itself). Asking for exactly the panel's size makes it
- * genuinely fullscreen on that monitor (INV-1.3). When no window system
+ * genuinely fullscreen on that monitor (INV-1.3). --rect=X,Y,W,H (the undock
+ * contract, desktop device px) opens the CONTENT at exactly that rect on both
+ * backends — on Wayland through the window-geometry extension, via
+ * displayxr-common's DxrLinuxWindow::request_initial_rect. When no window system
  * answers the app falls back to hosted-NULL, which also keeps it startable on
  * a headless CI runner.
  *
@@ -86,6 +89,8 @@
 // which would mangle dxr::LaunchSrcKind::None. (Same trap the runtime's
 // DxrKey enum documents for its `Unknown` enumerator.)
 #include "launch_args.h"
+#include "url_fetch.h"           // dxr::FetchUrlToCache — --src=<url> (libcurl on Linux)
+#include "gltf_siblings.h"       // .gltf external buffer/image fetch policy (#114)
 
 // X11 window + input (handle app) — before the OpenXR platform header so the
 // xlib binding struct sees the real Display/Window types.
@@ -113,6 +118,9 @@
 #include <chrono>
 #include <functional>
 #include <thread>
+#include <atomic>
+#include <mutex>
+#include <cerrno>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -298,6 +306,28 @@ static bool g_contentMaskChaining = false;  // one-time log on start/stop, never
 
 //! --vh=<metres>: pins the virtual display height over the auto-fit result.
 static float g_vhOverride = 0.0f;
+
+//! --src=<url>: fetched after the window exists (StartSrcFetch); the policy
+//! and cap come from the same parse.
+static std::string g_launchSrcUrl;
+static bool g_launchFromProtocol = false;
+static uint64_t g_launchMaxBytes = 256ull << 20;
+static bool g_launchNoCache = false;
+//! --title=<suffix>: appended to the window title (" - suffix").
+static std::string g_launchTitle;
+
+//! --rect=X,Y,W,H: the window's CONTENT rect in desktop device px (the Windows
+//! leg's convention — the browser's undock() measures the page element in it).
+static bool g_launchHasRect = false;
+static int32_t g_launchRectX = 0, g_launchRectY = 0, g_launchRectW = 0, g_launchRectH = 0;
+//! --pose=YAW,PITCH[,ZOOM]: the orbit the sender showed the asset at, page
+//! convention (see ApplyLaunchPose). Folded into every load-time framing.
+static bool  g_hasLaunchPose = false;
+static float g_launchPoseYawDeg = 0.0f, g_launchPosePitchDeg = 0.0f, g_launchPoseZoom = 1.0f;
+//! --margin=<0..1>: the fraction of the window the framed asset may fill (the
+//! sender's fit margin); the shared rule's default otherwise.
+static float g_fitFill = dxr::kAutoFitDefaultFill;
+static bool  g_marginPinned = false;
 
 // Dynamic-recenter pins. Default X Y Z matches the Windows modelviewer's hard
 // pin; P arms and X/Y/Z toggle an axis, or DXR_RECENTER_PIN sets it up front.
@@ -521,7 +551,12 @@ static void UpdateCameraMovement(InputState& state, float deltaTime, float displ
     // clip plays — the asset already carries its own motion. Holding the idle
     // clock at "now" restarts the countdown when playback pauses, so the
     // turntable doesn't snap the instant the user hits K (macOS parity).
-    if (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) {
+    // Also held while the background is TRANSPARENT (the Windows leg's
+    // AutoOrbitSuppressed): the model is a floating object on the desktop, and
+    // one that spins by itself reads as a glitch — and an undocked view
+    // (--transparent --pose) must hold the page's opening pose until the user
+    // drags. Linux has no workspace shell, so every session is standalone.
+    if ((g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) || g_transparentBg) {
         state.animationActive = false;
         state.lastInputTimeSec = NowSec();
     } else if (state.animateEnabled && state.lastInputTimeSec > 0.0) {
@@ -586,6 +621,10 @@ struct AppXrSession {
     float nominalViewerZ = 0.5f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
     int32_t displayScreenLeft = 0;     // 3D-panel top-left in virtual-desktop px (INV-1.3)
+    // XR_DXR_display_info v18: the panel monitor's full desktop rect and whether
+    // the runtime really located the panel (the --rect clamp's gate).
+    XrRect2Di displayDesktopRect = {};
+    bool displayPanelConfirmed = false;
     int32_t displayScreenTop = 0;
 
     //! An app-owned window exists (g_window); false = hosted-NULL fallback.
@@ -722,9 +761,20 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        // display_info v18: the full panel rect, for --rect clamping. Additive
+        // and separately chained — an older runtime just leaves it zero.
+        XrDisplayDesktopInfoDXR desktopInfo = {};
+        desktopInfo.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+        desktopPos.next = &desktopInfo;
         di.next = &desktopPos;
         sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
+            xr.displayDesktopRect = desktopInfo.desktopRect;
+            xr.displayPanelConfirmed = desktopInfo.isPanelConfirmed == XR_TRUE;
+            LOG_INFO("Display desktop rect: (%d, %d) %dx%d panelConfirmed=%s device='%s'",
+                     xr.displayDesktopRect.offset.x, xr.displayDesktopRect.offset.y,
+                     xr.displayDesktopRect.extent.width, xr.displayDesktopRect.extent.height,
+                     xr.displayPanelConfirmed ? "yes" : "no", desktopInfo.deviceName);
             xr.displayWidthM = di.displaySizeMeters.width;
             xr.displayHeightM = di.displaySizeMeters.height;
             xr.nominalViewerZ = di.nominalViewerPositionInDisplaySpace.z;
@@ -1150,6 +1200,8 @@ static const unsigned int kDefaultWindowH = 1080;
 //
 // MODEL_WINDOW="WxH+X+Y" overrides the size/position (X,Y absolute
 // virtual-desktop px, X11 only; WxH alone re-centres on the panel).
+// --rect=X,Y,W,H overrides both, on X11 AND Wayland: the content lands at
+// exactly that desktop device-px rect (request_initial_rect), windowed.
 // Returns false when no window could be made; the caller then falls back to
 // hosted-NULL (also the CI-safe path).
 static bool CreateAppWindow(AppXrSession& xr) {
@@ -1173,6 +1225,29 @@ static bool CreateAppWindow(AppXrSession& xr) {
             LOG_INFO("MODEL_WINDOW override: %ux%u%s", w, h, n >= 4 ? " at an absolute position" : "");
         }
     }
+    // --rect wins over MODEL_WINDOW and the default: it is this launch's
+    // explicit statement of where the content goes (the undock contract).
+    // Same policy as the Windows leg: exactly the rect the caller measured,
+    // nudged INTO the panel only when the runtime confirmed the panel.
+    int32_t rectX = 0, rectY = 0;
+    if (g_launchHasRect) {
+        rectX = g_launchRectX;
+        rectY = g_launchRectY;
+        LOG_INFO("Undock rect requested: (%d,%d %dx%d)", rectX, rectY, g_launchRectW, g_launchRectH);
+        dxr::ClampRectIntoPanel(rectX, rectY, g_launchRectW, g_launchRectH, xr.displayDesktopRect.offset.x,
+                                xr.displayDesktopRect.offset.y, xr.displayDesktopRect.extent.width,
+                                xr.displayDesktopRect.extent.height, xr.displayPanelConfirmed);
+        LOG_INFO("Undock rect final: (%d,%d %dx%d) panel-confirmed=%d panel-rect=(%d,%d %dx%d)", rectX, rectY,
+                 g_launchRectW, g_launchRectH, (int)xr.displayPanelConfirmed, xr.displayDesktopRect.offset.x,
+                 xr.displayDesktopRect.offset.y, xr.displayDesktopRect.extent.width,
+                 xr.displayDesktopRect.extent.height);
+        w = (unsigned int)g_launchRectW;
+        h = (unsigned int)g_launchRectH;
+        explicitPos = true;
+        px = rectX;
+        py = rectY;
+        g_window.request_initial_rect(rectX, rectY, (uint32_t)g_launchRectW, (uint32_t)g_launchRectH);
+    }
     if (!explicitPos && panelKnown) {
         px = prx + (prw - (int)w) / 2;
         py = pry + (prh - (int)h) / 2;
@@ -1187,7 +1262,10 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.panel_top = pry;
     desc.panel_width = (uint32_t)prw;
     desc.panel_height = (uint32_t)prh;
-    desc.title = "DisplayXR 3D Model Viewer";
+    static std::string s_createTitle;
+    s_createTitle = "DisplayXR 3D Model Viewer";
+    if (!g_launchTitle.empty()) s_createTitle += " - " + g_launchTitle;
+    desc.title = s_createTitle.c_str();
     desc.app_id = "com.displayxr.modelviewer";
     desc.transparent = g_transparentCapable;
     desc.x11_header_bar = true;      // the snapped drag needs a client-side bar on X11
@@ -1199,7 +1277,8 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.x = px;
     desc.y = py;
     // Panel-sized = fullscreen on the panel, on Wayland as on X11 (INV-1.3).
-    desc.fullscreen_on_wayland = panelKnown && (int)w == prw && (int)h == prh;
+    // (A --rect window is always windowed: request_initial_rect overrides.)
+    desc.fullscreen_on_wayland = !g_launchHasRect && panelKnown && (int)w == prw && (int)h == prh;
 
     if (!g_window.create(xr.windowBackend, desc)) {
         LOG_WARN("%s window creation failed — using hosted-NULL windowing",
@@ -1239,6 +1318,35 @@ static bool FileExists(const std::string& p) {
     struct stat st; return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+// --pose SIGN CONVENTION — identical to the Windows leg (windows/main.cpp,
+// kPoseYawSign / kPosePitchSign, where the derivation and the measurement
+// against the page's own thumbnail are recorded). The page rotates the
+// SUBJECT under a fixed camera; this viewer orbits the display rig around a
+// fixed subject, so both axes invert: rig yaw = -page yaw, rig pitch =
+// -page pitch. `--pose=0,0` is bit-for-bit the unposed framing. Zoom needs no
+// sign: the rig divides the fit vHeight by scaleFactor.
+static constexpr float kPoseYawSign = -1.0f;
+static constexpr float kPosePitchSign = -1.0f;
+
+//! Fold a --pose launch hint into the just-computed framed pose (g_fit*).
+//! The rig's own pitch clamp (+/-1.4 rad, as on Windows) is the authority on
+//! what the camera may reach. Auto-orbit is not touched here: while the
+//! window is transparent (an undock) the turntable is held anyway — see the
+//! auto-orbit gate — so the view holds the opening pose until the user drags.
+static void ApplyLaunchPose() {
+    if (!g_hasLaunchPose) return;
+    float pitchRad = kPosePitchSign * g_launchPosePitchDeg * 0.0174532925f;
+    if (pitchRad > 1.4f) pitchRad = 1.4f;
+    if (pitchRad < -1.4f) pitchRad = -1.4f;
+    g_fitYaw = kPoseYawSign * g_launchPoseYawDeg * 0.0174532925f;
+    g_fitPitch = pitchRad;
+    g_fitZoom = (g_launchPoseZoom > 0.0f) ? g_launchPoseZoom : 1.0f;
+    LOG_INFO("Launch pose applied: page yaw=%.1fdeg pitch=%.1fdeg zoom=%.2f -> "
+             "rig yaw=%.1fdeg pitch=%.1fdeg scaleFactor=%.2f",
+             g_launchPoseYawDeg, g_launchPosePitchDeg, g_launchPoseZoom,
+             g_fitYaw * 57.2957795f, g_fitPitch * 57.2957795f, g_fitZoom);
+}
+
 static void ApplyAutoFitForLoadedScene() {
     float center[3], extent[3];
     const bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
@@ -1250,7 +1358,7 @@ static void ApplyAutoFitForLoadedScene() {
         // presentation surface (the panel). Only its aspect matters.
         const float viewportW = (float)g_windowW, viewportH = (float)g_windowH;
         float sweptW = 0.0f;
-        float vh = modelviewer::FitVHeight(extent, viewportW, viewportH, &sweptW);
+        float vh = modelviewer::FitVHeight(extent, viewportW, viewportH, &sweptW, g_fitFill);
         g_fitExtentW = sweptW;
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM;
         // --vh wins over the fit: the caller is asserting the scale the asset
@@ -1262,15 +1370,17 @@ static void ApplyAutoFitForLoadedScene() {
         }
         g_fitVHeight = vh;
         g_fitYaw = 0.0f; g_fitPitch = 0.0f; g_fitZoom = 1.0f;
+        ApplyLaunchPose();
         const bool haveViewport = (viewportW > 0.0f && viewportH > 0.0f);
         const float aspect = haveViewport ? (viewportW / viewportH) : 0.0f;
         const char* boundBy = !haveViewport
                             ? "height (no viewport)"
-                            : modelviewer::FitBoundBy(sweptW, extent[1], extent[2], aspect);
+                            : modelviewer::FitBoundBy(sweptW, extent[1], extent[2], aspect, g_fitFill);
         LOG_INFO("Auto-fit: center=(%.3f,%.3f,%.3f) extent W=%.3f H=%.3f D=%.3f swept-W=%.3f "
-                 "viewport=%.0fx%.0f (aspect %.3f) bound-by=%s vHeight=%.3f",
+                 "viewport=%.0fx%.0f (aspect %.3f) bound-by=%s fill=%.2f%s vHeight=%.3f",
                  center[0], center[1], center[2], extent[0], extent[1], extent[2], sweptW,
-                 viewportW, viewportH, aspect, boundBy, vh);
+                 viewportW, viewportH, aspect, boundBy, g_fitFill, g_marginPinned ? " (--margin)" : "",
+                 vh);
     } else {
         g_fitCenter[0] = g_fitCenter[1] = g_fitCenter[2] = 0.0f;
         g_fitExtentW = g_fitExtentH = g_fitExtentD = 0.0f;
@@ -1392,6 +1502,267 @@ static void PollFilePicker() {
         LOG_INFO("Loaded %s", g_loadedFileName.c_str());
     } else {
         LOG_WARN("file picker: load failed for %s", g_pickerBuf.c_str());
+    }
+}
+
+// ============================================================================
+// --src=<url> — download to the per-user cache, then load (Windows StartSrcFetch)
+// ============================================================================
+//
+// The Windows leg's flow, on displayxr-common's desktop-Linux fetcher (the
+// same dxr::FetchUrlToCache: SHA-1-named cache files, final-URL policy
+// re-check, byte cap, timeouts; libcurl loaded at run time). The cache is
+// $XDG_CACHE_HOME/displayxr/modelviewer. A detached worker downloads; the
+// finished path crosses back to the main thread through g_srcFetchDone and is
+// loaded there, like a Ctrl+O pick. This leg has no toast layer, so what the
+// Windows leg toasts is logged (progress throttled to ~1 Hz).
+
+static std::atomic<bool> g_srcFetchInFlight{false};
+static std::mutex g_srcFetchMutex;
+static bool g_srcFetchDone = false;     //!< under g_srcFetchMutex
+static std::string g_srcFetchPath;     //!< under g_srcFetchMutex; loaded by PollSrcFetch
+static std::string g_srcFetchName;     //!< under g_srcFetchMutex; the URL's file name, for the title
+
+//! What --src may name (Windows SrcAllowedExtensions).
+static const std::vector<std::string>& SrcAllowedExtensions() {
+    static const std::vector<std::string> kExts = {
+        ".glb", ".gltf", ".stl", ".obj", ".fbx", ".usdz", ".usd", ".usda", ".usdc"};
+    return kExts;
+}
+
+//! What a .gltf may legally reference (Windows GltfSiblingAllowedExtensions):
+//! payload, never another model.
+static const std::vector<std::string>& GltfSiblingAllowedExtensions() {
+    static const std::vector<std::string> kExts = {".bin",   ".png",  ".jpg", ".jpeg",
+                                                   ".webp", ".ktx2", ".basis"};
+    return kExts;
+}
+
+static uint64_t FileSizeOf(const std::string& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
+}
+
+static void EnsureDirectories(const std::string& dir) {
+    std::string p;
+    for (size_t i = 0; i < dir.size(); ++i) {
+        p.push_back(dir[i]);
+        if ((dir[i] == '/' || i + 1 == dir.size()) && p.size() > 1) mkdir(p.c_str(), 0700);
+    }
+}
+
+static bool ReadWholeFile(const std::string& path, std::string* out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    const uint64_t size = FileSizeOf(path);
+    if (size > (64ull << 20)) { fclose(f); return false; }  // a .gltf JSON is never 64 MiB
+    std::string data((size_t)size, '\0');
+    const bool ok = data.empty() || fread(&data[0], 1, data.size(), f) == data.size();
+    fclose(f);
+    if (ok && out) *out = std::move(data);
+    return ok;
+}
+
+static bool CopyWholeFile(const std::string& from, const std::string& to) {
+    std::string data;
+    if (!ReadWholeFile(from, &data)) return false;
+    FILE* f = fopen(to.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    return (fclose(f) == 0) && ok;
+}
+
+//! Last path segment of a URL, if it is a plain, safe file name (Windows
+//! UrlFileName: the sibling validator decides).
+static std::string UrlFileName(const std::string& url) {
+    std::string path = url.substr(0, url.find_first_of("?#"));
+    const size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return {};
+    std::string decoded;
+    if (!gltf_siblings::percent_decode(path.substr(slash + 1), &decoded)) return {};
+    std::string reason;
+    if (!gltf_siblings::uri_is_safe_relative(decoded, &reason)) return {};
+    if (decoded.find('/') != std::string::npos) return {};
+    return decoded;
+}
+
+/*!
+ * A downloaded `.gltf` is the manifest, not the asset: fetch the buffers and
+ * images it points at (#114) into `<cache>/<sha1(url)>/` at the relative paths
+ * the JSON spells, and return the .gltf inside that directory. Same policy as
+ * the Windows PrepareGltfAsset: same-origin siblings only, payload extensions
+ * only, the cap is the SUM, a complete directory is a cache hit.
+ */
+static bool PrepareGltfAsset(const std::string& finalUrl, const std::string& gltfCachePath, bool fromProtocol,
+                             uint64_t maxBytes, bool noCache, uint64_t primaryBytes, std::string* loadPath) {
+    const std::string assetDir = gltfCachePath.substr(0, gltfCachePath.size() - 5);  // ".gltf"
+    std::string json;
+    if (!ReadWholeFile(gltfCachePath, &json)) {
+        LOG_ERROR("--src: could not read the downloaded .gltf back");
+        return false;
+    }
+    std::vector<gltf_siblings::SiblingRef> refs;
+    std::string err;
+    if (!gltf_siblings::collect_external_refs(json, finalUrl, &refs, &err)) {
+        LOG_ERROR("--src: .gltf references cannot be fetched: %s (Unsupported asset)", err.c_str());
+        return false;
+    }
+    std::string fileName = UrlFileName(finalUrl);
+    if (fileName.size() < 6 || gltf_siblings::path_extension(fileName) != ".gltf") fileName = "model.gltf";
+    const std::string gltfInDir = assetDir + "/" + fileName;
+
+    std::vector<std::string> targets;
+    for (const gltf_siblings::SiblingRef& ref : refs) {
+        const std::string ext = gltf_siblings::path_extension(ref.relativePath);
+        const std::vector<std::string>& allowed = GltfSiblingAllowedExtensions();
+        if (std::find(allowed.begin(), allowed.end(), ext) == allowed.end()) {
+            LOG_ERROR("--src: .gltf references '%s' — extension '%s' is not fetchable (Unsupported asset)",
+                      ref.relativePath.c_str(), ext.c_str());
+            return false;
+        }
+        const std::string target = assetDir + "/" + ref.relativePath;
+        if (target == gltfInDir) {
+            LOG_ERROR("--src: .gltf references its own file name ('%s')", ref.relativePath.c_str());
+            return false;
+        }
+        targets.push_back(target);
+    }
+
+    bool complete = !noCache && FileExists(gltfInDir);
+    for (size_t i = 0; complete && i < targets.size(); ++i) complete = FileExists(targets[i]);
+    if (complete) {
+        LOG_INFO("--src: glTF asset dir complete (%zu sibling(s), cache hit): %s", refs.size(), assetDir.c_str());
+        *loadPath = gltfInDir;
+        return true;
+    }
+
+    EnsureDirectories(assetDir);
+    if (!CopyWholeFile(gltfCachePath, gltfInDir)) {
+        LOG_ERROR("--src: could not place the .gltf in its asset dir (%s)", strerror(errno));
+        return false;
+    }
+    uint64_t consumed = primaryBytes ? primaryBytes : FileSizeOf(gltfCachePath);
+    const size_t total = refs.size();
+    LOG_INFO("--src: .gltf references %zu external file(s); fetching relative to %s", total, finalUrl.c_str());
+    for (size_t i = 0; i < total; ++i) {
+        const gltf_siblings::SiblingRef& ref = refs[i];
+        const std::string& target = targets[i];
+        if (!noCache && FileExists(target)) {
+            consumed += FileSizeOf(target);
+            LOG_INFO("--src:   [%zu/%zu] %s (cache hit)", i + 1, total, ref.relativePath.c_str());
+            continue;
+        }
+        if (consumed >= maxBytes) {
+            LOG_ERROR("--src: asset larger than the download cap (%llu bytes)", (unsigned long long)maxBytes);
+            return false;
+        }
+        dxr::UrlFetchOptions opt;
+        opt.cacheDir = assetDir;
+        opt.allowedExtensions = GltfSiblingAllowedExtensions();
+        opt.maxBytes = maxBytes - consumed;  // the CAP IS THE SUM, not per file
+        opt.noCache = noCache;
+        const std::string origin = finalUrl;
+        opt.urlAllowed = [fromProtocol, origin](const std::string& u) {
+            return dxr::LaunchPolicyAllowsUrl(u, fromProtocol) && gltf_siblings::same_origin(u, origin);
+        };
+        const dxr::UrlFetchResult sr = dxr::FetchUrlToCache(ref.url, opt);
+        if (!sr.ok) {
+            LOG_ERROR("--src: sibling %s failed: %s (Download failed - %s)", ref.url.c_str(), sr.error.c_str(),
+                      ref.relativePath.c_str());
+            return false;
+        }
+        const size_t sep = target.find_last_of('/');
+        if (sep != std::string::npos) EnsureDirectories(target.substr(0, sep));
+        if (sr.path != target && rename(sr.path.c_str(), target.c_str()) != 0) {
+            LOG_ERROR("--src: could not place '%s' (%s)", ref.relativePath.c_str(), strerror(errno));
+            return false;
+        }
+        consumed += sr.bytes ? sr.bytes : FileSizeOf(target);
+        LOG_INFO("--src:   [%zu/%zu] %s <- %s (%llu bytes, %s)", i + 1, total, ref.relativePath.c_str(),
+                 ref.url.c_str(), (unsigned long long)sr.bytes, sr.fromCache ? "cache hit" : "downloaded");
+    }
+    LOG_INFO("--src: glTF asset complete: %s (%zu sibling(s), %llu bytes total)", gltfInDir.c_str(), total,
+             (unsigned long long)consumed);
+    *loadPath = gltfInDir;
+    return true;
+}
+
+static void StartSrcFetch(const std::string& url, bool fromProtocol, uint64_t maxBytes, bool noCache) {
+    if (g_srcFetchInFlight.exchange(true)) {
+        LOG_WARN("--src: a download is already in flight — ignoring %s", url.c_str());
+        return;
+    }
+    std::thread([url, fromProtocol, maxBytes, noCache]() {
+        dxr::UrlFetchOptions opt;
+        opt.cacheDir = dxr::DefaultCacheDir("modelviewer");
+        opt.allowedExtensions = SrcAllowedExtensions();
+        opt.maxBytes = maxBytes;
+        opt.noCache = noCache;
+        opt.urlAllowed = [fromProtocol](const std::string& finalUrl) {
+            return dxr::LaunchPolicyAllowsUrl(finalUrl, fromProtocol);
+        };
+        auto lastLog = std::chrono::steady_clock::now();
+        opt.progress = [&lastLog](uint64_t done, uint64_t total) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastLog < std::chrono::seconds(1)) return;
+            lastLog = now;
+            if (total > 0) LOG_INFO("--src: Downloading... %d%%", (int)((done * 100ull) / total));
+            else LOG_INFO("--src: Downloading... %llu KB", (unsigned long long)(done / 1024));
+        };
+        LOG_INFO("--src: fetching %s (max %llu bytes%s%s) into %s", url.c_str(), (unsigned long long)maxBytes,
+                 noCache ? ", no-cache" : "", fromProtocol ? ", protocol policy" : "", opt.cacheDir.c_str());
+        const dxr::UrlFetchResult r = dxr::FetchUrlToCache(url, opt);
+        if (!r.ok) {
+            LOG_ERROR("--src: download failed: %s", r.error.c_str());
+            g_srcFetchInFlight.store(false);
+            return;
+        }
+        std::string assetPath = r.path;
+        LOG_INFO("--src: %s -> %s (%llu bytes, %s)", url.c_str(), r.path.c_str(), (unsigned long long)r.bytes,
+                 r.fromCache ? "cache hit" : "downloaded");
+        if (gltf_siblings::path_extension(r.path) == ".gltf") {
+            const std::string finalUrl = r.finalUrl.empty() ? url : r.finalUrl;
+            if (!PrepareGltfAsset(finalUrl, r.path, fromProtocol, maxBytes, noCache, r.bytes, &assetPath)) {
+                g_srcFetchInFlight.store(false);
+                return;
+            }
+        }
+        if (!model_validate_file(assetPath)) {
+            LOG_ERROR("--src: cached file is not a loadable model: %s", assetPath.c_str());
+            g_srcFetchInFlight.store(false);
+            return;
+        }
+        // The title names the asset by its URL's file name, not by the
+        // SHA-1 the cache stores it under.
+        std::string name = UrlFileName(r.finalUrl.empty() ? url : r.finalUrl);
+        if (name.empty()) name = model_basename(assetPath);
+        {
+            std::lock_guard<std::mutex> lock(g_srcFetchMutex);
+            g_srcFetchPath = assetPath;
+            g_srcFetchName = name;
+            g_srcFetchDone = true;
+        }
+        g_srcFetchInFlight.store(false);
+    }).detach();
+}
+
+//! Main thread: load what the fetch worker delivered (the Windows load queue).
+static void PollSrcFetch() {
+    std::string path, name;
+    {
+        std::lock_guard<std::mutex> lock(g_srcFetchMutex);
+        if (!g_srcFetchDone) return;
+        g_srcFetchDone = false;
+        path.swap(g_srcFetchPath);
+        name.swap(g_srcFetchName);
+    }
+    LOG_INFO("Loading model: %s", path.c_str());
+    if (g_modelRenderer.loadModel(path.c_str())) {
+        g_loadedFileName = name.empty() ? model_basename(path) : name;
+        ApplyAutoFitForLoadedScene();
+        LOG_INFO("Downloaded %s — loaded", g_loadedFileName.c_str());
+    } else {
+        LOG_ERROR("--src: load failed for %s", path.c_str());
     }
 }
 
@@ -1685,6 +2056,7 @@ static void PumpWindow(AppXrSession& xr) {
     // Header bar title: the loaded file, like the other legs.
     std::string title = "3D Model Viewer";
     if (!g_loadedFileName.empty()) title += " \u2014 " + g_loadedFileName;
+    if (!g_launchTitle.empty()) title += " - " + g_launchTitle;  // --title: a suffix
     if (title != g_windowTitle) {
         g_windowTitle = title;
         g_window.set_title(title.c_str());
@@ -1892,10 +2264,9 @@ int main(int argc, char** argv) {
     LOG_INFO("  [Ctrl+O] Load  [F11] Fullscreen  [P then X/Y/Z] Pin recenter axis  [ESC] Quit");
 
     // Launch contract (shared with Windows/macOS): the first positional
-    // argument is a model path, --vh=<metres> pins the virtual display height.
-    // The remaining flags of the contract (--src URL download, --transparent,
-    // --rect, --pose, --margin) are Windows-only today; they are parsed and
-    // reported so a launcher gets a clear message instead of silence.
+    // argument is a model path, --vh=<metres> pins the virtual display height,
+    // --transparent / --rect / --pose / --margin / --src URL / --title follow
+    // the Windows leg (the undock contract).
     std::string cliModelPath;
     // Window platform: --platform=x11|wayland|auto (default auto, a capability
     // probe). Taken out of the argument list first, so the launch-contract
@@ -1920,18 +2291,52 @@ int main(int argc, char** argv) {
         if (la.hasVh && la.vh > 0.0f) { g_vhOverride = la.vh; LOG_INFO("launch: --vh=%.4f m", la.vh); }
         if (!la.positionalPath.empty()) cliModelPath = la.positionalPath;
         if (!la.src.empty()) {
-            if (la.srcKind == dxr::LaunchSrcKind::Url)
-                LOG_WARN("launch: --src URL download is not implemented on Linux — ignored");
-            else
+            if (la.srcKind == dxr::LaunchSrcKind::Url) {
+                // Downloaded once the window exists (StartSrcFetch below); the
+                // bundled sample is NOT auto-loaded meanwhile — it would flash
+                // a model the caller never asked for (Windows parity).
+                g_launchSrcUrl = la.src;
+                g_launchFromProtocol = la.fromProtocol;
+                g_launchMaxBytes = la.maxBytes;
+                g_launchNoCache = la.noCache;
+                cliModelPath.clear();
+            } else {
                 cliModelPath = la.src;
+            }
         }
+        // --title: a SUFFIX to the window title, never a replacement (the
+        // Windows leg's rule: the base title is what tooling matches on).
+        g_launchTitle = la.title;
         // --transparent: start in transparent mode (the undock contract's
         // flag). On Windows it also creates the window borderless + topmost
         // from frame 0; this window is borderless in every mode already, and
         // _NET_WM_STATE_ABOVE is applied once the window exists (below).
         if (la.transparent) { g_launchTransparent = true; LOG_INFO("launch: --transparent"); }
-        if (la.hasRect) LOG_WARN("launch: --rect has no Linux path yet — use MODEL_WINDOW=\"WxH+X+Y\"");
-        if (la.hasPose) LOG_WARN("launch: --pose has no Linux path yet — ignored");
+        // --rect: the CONTENT rect in desktop device px, placed in
+        // CreateAppWindow (clamped into a confirmed panel, as on Windows).
+        if (la.hasRect) {
+            g_launchHasRect = true;
+            g_launchRectX = la.rectX;
+            g_launchRectY = la.rectY;
+            g_launchRectW = la.rectW;
+            g_launchRectH = la.rectH;
+        }
+        // --pose / --margin: load-time framing inputs, folded into every fit
+        // (ApplyAutoFitForLoadedScene), exactly as the Windows leg stages them.
+        if (la.hasPose) {
+            g_hasLaunchPose = true;
+            g_launchPoseYawDeg = la.poseYawDeg;
+            g_launchPosePitchDeg = la.posePitchDeg;
+            g_launchPoseZoom = la.poseZoom;
+            LOG_INFO("launch: opening pose yaw=%.1fdeg pitch=%.1fdeg zoom=%.2f (page convention)",
+                     la.poseYawDeg, la.posePitchDeg, la.poseZoom);
+        }
+        if (la.hasMargin) {
+            g_fitFill = la.margin;
+            g_marginPinned = true;
+            LOG_INFO("launch: fit margin %.0f%% of the window (default %.0f%%)", la.margin * 100.0f,
+                     dxr::kAutoFitDefaultFill * 100.0f);
+        }
     }
 
     // Dynamic-recenter pins: default hard-pin X+Y+Z (modelviewer parity).
@@ -2044,7 +2449,12 @@ int main(int argc, char** argv) {
             LOG_ERROR("Failed to load %s", cliModelPath.c_str());
         }
     }
-    if (!g_modelRenderer.hasModel()) TryAutoLoadBundledScene();
+    if (!g_launchSrcUrl.empty()) {
+        LOG_INFO("Bundled auto-load skipped: the launch named its own asset (--src URL)");
+        StartSrcFetch(g_launchSrcUrl, g_launchFromProtocol, g_launchMaxBytes, g_launchNoCache);
+    } else if (!g_modelRenderer.hasModel()) {
+        TryAutoLoadBundledScene();
+    }
 
     LOG_INFO("=== Entering main loop ===");
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -2072,6 +2482,7 @@ int main(int argc, char** argv) {
         PollEvents(xr);
         PumpWindow(xr);    // mouse + keys; the helper runs the bar, the drag and F11
         PollFilePicker();  // async zenity result → loadModel + auto-fit
+        PollSrcFetch();    // a finished --src download → loadModel + auto-fit
 
         if (!xr.sessionRunning) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); continue; }
 

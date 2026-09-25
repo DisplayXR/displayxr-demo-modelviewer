@@ -496,7 +496,8 @@ calibration, brightness, gamut and 3D cross-talk are separate concerns.
 
 The viewer can be started by a web page, by a CAD app, or from a shell tile as
 a floating 3D window over the desktop showing a given asset at a given screen
-rect. Windows only, and shared with the sibling splat viewer through
+rect. Windows and Linux (see "On Linux" below);
+shared with the sibling splat viewer through
 [`displayxr-common`](https://github.com/DisplayXR/displayxr-common) so both
 speak one grammar and apply one security policy.
 
@@ -536,6 +537,25 @@ Applying a launch pose does **not** re-arm auto-orbit — the pose is staged as
 the *framed* pose (the same slot the auto-fit yaw has always used), not as a
 user input, so it neither restarts the idle countdown nor flips the `M` state.
 `Space` returns to it, exactly as it returns to the framed yaw.
+
+**On Linux** (`model_viewer_handle_vk_linux`) `--transparent`, `--rect`, `--pose`, `--margin`, `--src` and `--title` follow
+the same rules. `--rect` is the CONTENT rect in desktop device pixels: X root
+coordinates on X11; on native Wayland the runtime's device convention (a
+monitor's logical origin times its scale, plus the monitor-relative logical
+offset times the same scale — what the window-geometry feed reports). It is
+placed by displayxr-common's `DxrLinuxWindow::request_initial_rect`: on X11 the
+window is created there; on Wayland, where a client cannot place itself, the
+surface is sized at the target monitor's scale and moved through the
+`window-geometry@displayxr.org` GNOME extension once its first frame is
+presented. Expect up to 1 px of rounding at a fractional scale, or under
+XWayland at a scaled desktop. A `--rect` window is always windowed, even at the
+panel's size. `--src=<url>` downloads exactly as on Windows (same policy,
+redirect re-check, cap, timeouts and SHA-1-named cache files) into
+`$XDG_CACHE_HOME/displayxr/<viewer>` (`~/.cache/...` by default), through
+libcurl loaded at run time — the `.deb` Recommends `curl`, which provides it;
+without it a URL reports "no HTTP library" and local paths work as before.
+`--title` is appended to the window title. With no toast layer on Linux, the
+download progress and any error go to the log.
 
 A refused or forwarded launch also raises a message box, because a protocol
 launch has no console and without one a rejected link is indistinguishable
