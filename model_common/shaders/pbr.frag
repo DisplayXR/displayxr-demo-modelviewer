@@ -3,7 +3,8 @@
 //
 // Metallic-roughness PBR fragment shader (Cook-Torrance GGX) with the full
 // glTF material texture set (base-color, metallic-roughness, normal, occlusion,
-// emissive), sRGB-correct sampling, tangent-free normal mapping (Schüler's
+// emissive), sRGB-correct sampling (hardware-decoded _SRGB colour textures,
+// see ModelRenderer::uploadTexture), tangent-free normal mapping (Schüler's
 // cotangent frame from screen-space derivatives), one directional light,
 // image-based lighting (irradiance + prefiltered specular + BRDF LUT, baked
 // from the active environment), the tier-1 KHR_materials_* layers, and an
@@ -95,15 +96,15 @@ layout(set = 1, binding = 4) uniform sampler2D emissiveTex;
 // factor-only path costs one extra tap and behaves identically.
 layout(set = 1, binding = 5)  uniform sampler2D clearcoatTex;        // R
 layout(set = 1, binding = 6)  uniform sampler2D clearcoatRoughTex;   // G
-layout(set = 1, binding = 7)  uniform sampler2D sheenColorTex;       // RGB, sRGB
+layout(set = 1, binding = 7)  uniform sampler2D sheenColorTex;       // RGB, sRGB (_SRGB view)
 layout(set = 1, binding = 8)  uniform sampler2D sheenRoughTex;       // A
 layout(set = 1, binding = 9)  uniform sampler2D specularTex;         // A
-layout(set = 1, binding = 10) uniform sampler2D specularColorTex;    // RGB, sRGB
+layout(set = 1, binding = 10) uniform sampler2D specularColorTex;    // RGB, sRGB (_SRGB view)
 layout(set = 1, binding = 11) uniform sampler2D transmissionTex;     // R
 layout(set = 1, binding = 12) uniform sampler2D thicknessTex;        // G
 layout(set = 1, binding = 13) uniform sampler2D scatterStrengthTex;  // A
-layout(set = 1, binding = 14) uniform sampler2D multiscatterColorTex;// RGB, sRGB
-layout(set = 1, binding = 15) uniform sampler2D coatColorTex;        // RGB, sRGB
+layout(set = 1, binding = 14) uniform sampler2D multiscatterColorTex;// RGB, sRGB (_SRGB view)
+layout(set = 1, binding = 15) uniform sampler2D coatColorTex;        // RGB, sRGB (_SRGB view)
 layout(set = 1, binding = 16) uniform sampler2D coatAnisotropyTex;   // B = strength, RG = rotation
 layout(set = 1, binding = 17) uniform sampler2D diffuseRoughTex;     // R
 layout(set = 1, binding = 18) uniform sampler2D fuzzTex;             // R
@@ -187,18 +188,16 @@ float diffuseOrenNayar(float ndotl, float ndotv, float ldotv, float sigma) {
 vec3 F_Schlick(float cosT, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
-// sRGB EOTF (accurate piecewise). MUST be the exact inverse of linearToSrgb()
-// below, or the pipeline is not transfer-function-neutral: a texel that should
-// survive a round trip unchanged comes back shifted. The old pow(c, 2.2)
-// approximation crushed shadows badly while leaving midtones alone — 0.05
-// returned as 0.018 (-64%), 0.10 as 0.073 (-27%), 0.35 as 0.348 (-0.6%) — which
-// reads as "the scene is a bit dark" and would have been silently charged to
-// the material rather than to the decode (issue #70).
-vec3 srgbToLinear(vec3 c) {
-    vec3 lo = c / 12.92;
-    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
-    return mix(hi, lo, vec3(lessThanEqual(c, vec3(0.04045))));
-}
+// The sRGB DECODE of the colour textures is not done here. They are bound
+// through VK_FORMAT_R8G8B8A8_SRGB views (ModelRenderer::uploadTexture), so the
+// sampler decodes each texel BEFORE filtering, as glTF 2.0 3.9.2 asks ("To
+// achieve correct filtering, the transfer function SHOULD be decoded before
+// performing linear interpolation"). A shader-side decode after a UNORM fetch
+// filtered the ENCODED values: TextureLinearInterpolationTest's 0|255 texel
+// pair read back as encoded 128 (linear 0.216) instead of linear 0.5, and every
+// minified mip darkened the same way. (The decode that lived here was the
+// exact piecewise EOTF, not pow 2.2 - that part was right; only its position
+// relative to the filter was not.)
 // Inverse sRGB EOTF (accurate piecewise), for encoding the final linear color
 // into a UNORM swapchain. Gated by ubo.cameraPos.w (1 = encode, 0 = skip).
 vec3 linearToSrgb(vec3 c) {
@@ -403,14 +402,14 @@ void main() {
     gMat = int(pc.emissive.w + 0.5);
 
     vec4 baseSample = texture(baseColorTex, xfUV(XF_BASE_COLOR, inUV));
-    vec3 albedo = srgbToLinear(baseSample.rgb) * pc.baseColorFactor.rgb;
+    vec3 albedo = baseSample.rgb * pc.baseColorFactor.rgb;   // _SRGB view: already linear
 
     vec3 mr = texture(mrTex, xfUV(XF_MR, inUV)).rgb;        // g=roughness, b=metallic (linear)
     float metallic  = clamp(mr.b * pc.mrParams.x, 0.0, 1.0);
     float roughness = clamp(mr.g * pc.mrParams.y, 0.04, 1.0);
     float a = roughness * roughness;
     float ao = texture(occlusionTex, xfUV(XF_OCCLUSION, inUV)).r;
-    vec3 emissive = srgbToLinear(texture(emissiveTex, xfUV(XF_EMISSIVE, inUV)).rgb) * pc.emissive.rgb;
+    vec3 emissive = texture(emissiveTex, xfUV(XF_EMISSIVE, inUV)).rgb * pc.emissive.rgb;   // _SRGB view
 
     vec3 V = normalize(ubo.cameraPos.xyz - inWorldPos);
     vec3 Ng = normalize(inNormal);
@@ -500,20 +499,21 @@ void main() {
     float attenuationDist    = MAT.p5.w;
 
     // Fold the texture variants into the factors. sheenColor/specularColor are
-    // sRGB-encoded per spec; the rest are linear single channels.
+    // sRGB-encoded per spec and arrive decoded (_SRGB views); the rest are
+    // linear single channels.
     clearcoatFactor    *= texture(clearcoatTex, xfUV(XF_CLEARCOAT, inUV)).r;
     clearcoatRoughness  = clamp(clearcoatRoughness * texture(clearcoatRoughTex, xfUV(XF_CLEARCOAT_ROUGH, inUV)).g, 0.03, 1.0);
-    sheenColor         *= srgbToLinear(texture(sheenColorTex, xfUV(XF_SHEEN_COLOR, inUV)).rgb);
+    sheenColor         *= texture(sheenColorTex, xfUV(XF_SHEEN_COLOR, inUV)).rgb;
     sheenRoughness      = clamp(sheenRoughness * texture(sheenRoughTex, xfUV(XF_SHEEN_ROUGH, inUV)).a, 0.05, 1.0);
     specularFactor     *= texture(specularTex, xfUV(XF_SPECULAR, inUV)).a;
-    specularColor      *= srgbToLinear(texture(specularColorTex, xfUV(XF_SPECULAR_COLOR, inUV)).rgb);
+    specularColor      *= texture(specularColorTex, xfUV(XF_SPECULAR_COLOR, inUV)).rgb;
     transmissionFactor  = clamp(transmissionFactor * texture(transmissionTex, xfUV(XF_TRANSMISSION, inUV)).r, 0.0, 1.0);
     volumeThickness    *= texture(thicknessTex, xfUV(XF_THICKNESS, inUV)).g;
     // KHR_materials_scatter (draft; issue #79). Strength rides the texture's
     // ALPHA channel, the multi-scatter colour its RGB (sRGB-encoded), per spec.
     float scatterStrength = clamp(MAT.p6.x * texture(scatterStrengthTex, xfUV(XF_SCATTER_STRENGTH, inUV)).a, 0.0, 1.0);
     float scatterG        = clamp(MAT.p6.y, -0.99, 0.99);
-    vec3  multiscatterColor = MAT.p7.rgb * srgbToLinear(texture(multiscatterColorTex, xfUV(XF_MULTISCATTER_COLOR, inUV)).rgb);
+    vec3  multiscatterColor = MAT.p7.rgb * texture(multiscatterColorTex, xfUV(XF_MULTISCATTER_COLOR, inUV)).rgb;
     // KHR_materials_diffuse_roughness (draft; issue #84). R channel, per spec.
     float diffuseRoughness = clamp(MAT.p6.z * texture(diffuseRoughTex, xfUV(XF_DIFFUSE_ROUGHNESS, inUV)).r, 0.0, 1.0);
     // KHR_materials_fuzz (draft; issue #84). Weight on R; the colour and
@@ -723,7 +723,7 @@ void main() {
         float coatAnisoRot = MAT.p8.w;
         vec3  coatColor    = MAT.p9.rgb;
         if (hasCoat) {
-            coatColor *= srgbToLinear(texture(coatColorTex, xfUV(XF_COAT_COLOR, inUV)).rgb);
+            coatColor *= texture(coatColorTex, xfUV(XF_COAT_COLOR, inUV)).rgb;
             // Per spec: strength rides B; RG is a direction VECTOR biased into
             // [0,1], whose angle ADDS to the authored rotation. The absent-map
             // default for this slot is (1, 0.5, 1), not white — see

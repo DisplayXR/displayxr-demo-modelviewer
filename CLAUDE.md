@@ -125,8 +125,12 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   BRDF LUT + irradiance cube + roughness-mipped prefiltered cube; split-sum in
   `pbr.frag`. The **skybox** samples the prefiltered cube at a high mip
   (blurred) — sharp far features cause lightfield cross-talk.
-- **sRGB** base-color/emissive are decoded in the shader (textures uploaded
-  UNORM). **Normal mapping is tangent-free** (screen-space derivative frame).
+- **sRGB** colour textures (base colour, emissive, sheen/specular/multiscatter/
+  coat colour) are uploaded `VK_FORMAT_R8G8B8A8_SRGB` so the sampler decodes
+  BEFORE filtering; every other slot is UNORM (`uploadTexture(tex, srgb)`, role
+  chosen per referencing slot). Never decode in the shader after a UNORM fetch —
+  that filters encoded values and fails glTF `TextureLinearInterpolationTest`
+  (128 vs 188). **Normal mapping is tangent-free** (screen-space derivative frame).
 - **stb / tinygltf:** `model_loader_gltf.cpp` uses `TINYGLTF_NO_STB_IMAGE` + a
   custom image-loader callback calling `stbi_load_from_memory`; the OBJ/FBX/USD
   backends decode textures via `model_loader_material.cpp` the same way. The stb
