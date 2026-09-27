@@ -1118,7 +1118,7 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
     return true;
 }
 
-ModelImage ModelRenderer::uploadTexture(const ModelTexture& tex) {
+ModelImage ModelRenderer::uploadTexture(const ModelTexture& tex, bool srgb) {
     ModelImage img;
     if (tex.width <= 0 || tex.height <= 0 || tex.rgba.empty()) return img;
     img.width = tex.width;
@@ -1128,7 +1128,14 @@ ModelImage ModelRenderer::uploadTexture(const ModelTexture& tex) {
 
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_R8G8B8A8_UNORM;  // sRGB decode done in the shader
+    // _SRGB for colour slots: the hardware decodes each texel before filtering,
+    // and the mip blits below average decoded (linear) values. Decoding in the
+    // shader AFTER a UNORM fetch filtered the encoded values instead — a
+    // 50/50 blend of 0 and 255 came out as encoded 128 (linear 0.216) instead
+    // of linear 0.5 (glTF TextureLinearInterpolationTest), and every minified
+    // mip was darkened the same way. R8G8B8A8_SRGB is a mandatory
+    // SAMPLED_IMAGE_FILTER_LINEAR + BLIT_SRC + BLIT_DST format in Vulkan.
+    ici.format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     ici.extent = {w, h, 1};
     ici.mipLevels = mips;
     ici.arrayLayers = 1;
@@ -1828,11 +1835,42 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, indexBuffer_,
                       md.indices.data(), indexBuffer_.size);
 
-    // Upload textures (parallel to md.textures; empty entries stay null).
-    modelTextures_.resize(md.textures.size());
-    for (size_t i = 0; i < md.textures.size(); ++i)
-        if (!md.textures[i].rgba.empty())
-            modelTextures_[i] = uploadTexture(md.textures[i]);
+    // Upload textures (parallel to md.textures; empty entries stay null), once
+    // per role they are referenced in. glTF fixes the transfer function by the
+    // referencing SLOT, not by the image (spec 3.6.2: any colour-space data in
+    // the PNG/JPEG MUST be ignored), so the role decides the format:
+    //   sRGB   the RGB colour slots — base colour, emissive, sheen colour,
+    //          specular colour, multiscatter colour, coat colour
+    //   linear everything else
+    // The alpha-only slots (sheen roughness, specular, scatter strength) read a
+    // channel neither format decodes, so they reuse the sRGB image when their
+    // texture is also a colour slot's (the usual packing for those three
+    // extensions) instead of forcing a second, UNORM upload of it.
+    const size_t nTex = md.textures.size();
+    std::vector<uint8_t> needLinear(nTex, 0), needSrgb(nTex, 0), alphaOnly(nTex, 0);
+    auto mark = [&](std::vector<uint8_t>& v, int idx) {
+        if (idx >= 0 && (size_t)idx < nTex) v[(size_t)idx] = 1;
+    };
+    for (const ModelMaterial& m : md.materials) {
+        for (int idx : {m.baseColorTex, m.emissiveTex, m.sheenColorTex,
+                        m.specularColorTex, m.multiscatterColorTex, m.coatColorTex})
+            mark(needSrgb, idx);
+        for (int idx : {m.metallicRoughnessTex, m.normalTex, m.occlusionTex,
+                        m.clearcoatTex, m.clearcoatRoughnessTex, m.transmissionTex,
+                        m.thicknessTex, m.coatAnisotropyTex, m.diffuseRoughnessTex,
+                        m.fuzzTex, m.coatNormalTex})
+            mark(needLinear, idx);
+        for (int idx : {m.sheenRoughnessTex, m.specularTex, m.scatterStrengthTex})
+            mark(alphaOnly, idx);
+    }
+    modelTextures_.resize(nTex);
+    modelTexturesSrgb_.resize(nTex);
+    for (size_t i = 0; i < nTex; ++i) {
+        if (md.textures[i].rgba.empty()) continue;
+        if (needSrgb[i]) modelTexturesSrgb_[i] = uploadTexture(md.textures[i], /*srgb=*/true);
+        if (needLinear[i] || (alphaOnly[i] && !needSrgb[i]))
+            modelTextures_[i] = uploadTexture(md.textures[i], /*srgb=*/false);
+    }
 
     materials_ = std::move(md.materials);
     hasTransmissive_ = false;
@@ -1922,27 +1960,36 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
             return modelTextures_[idx].view;
         return def;
     };
+    auto srgbViewOr = [&](int idx, VkImageView def) -> VkImageView {
+        if (idx >= 0 && idx < (int)modelTexturesSrgb_.size() && modelTexturesSrgb_[idx].view != VK_NULL_HANDLE)
+            return modelTexturesSrgb_[idx].view;
+        return def;
+    };
+    // Alpha-only slots: either upload serves (alpha is never decoded).
+    auto alphaViewOr = [&](int idx, VkImageView def) -> VkImageView {
+        return viewOr(idx, srgbViewOr(idx, def));
+    };
     materialSets_.reserve(materials_.size());
     for (const auto& m : materials_) {
         // White is the correct absent-texture default for every one of these:
         // each sampled value MULTIPLIES its factor, so 1.0 is the identity.
         const VkImageView v[MTEX_COUNT] = {
-            viewOr(m.baseColorTex,          whiteTex_.view),
+            srgbViewOr(m.baseColorTex,          whiteTex_.view),
             viewOr(m.metallicRoughnessTex,  whiteTex_.view),
             viewOr(m.normalTex,             flatNormalTex_.view),
             viewOr(m.occlusionTex,          whiteTex_.view),
-            viewOr(m.emissiveTex,           whiteTex_.view),
+            srgbViewOr(m.emissiveTex,           whiteTex_.view),
             viewOr(m.clearcoatTex,          whiteTex_.view),
             viewOr(m.clearcoatRoughnessTex, whiteTex_.view),
-            viewOr(m.sheenColorTex,         whiteTex_.view),
-            viewOr(m.sheenRoughnessTex,     whiteTex_.view),
-            viewOr(m.specularTex,           whiteTex_.view),
-            viewOr(m.specularColorTex,      whiteTex_.view),
+            srgbViewOr(m.sheenColorTex,         whiteTex_.view),
+            alphaViewOr(m.sheenRoughnessTex,    whiteTex_.view),
+            alphaViewOr(m.specularTex,          whiteTex_.view),
+            srgbViewOr(m.specularColorTex,      whiteTex_.view),
             viewOr(m.transmissionTex,       whiteTex_.view),
             viewOr(m.thicknessTex,          whiteTex_.view),
-            viewOr(m.scatterStrengthTex,    whiteTex_.view),
-            viewOr(m.multiscatterColorTex,  whiteTex_.view),
-            viewOr(m.coatColorTex,          whiteTex_.view),
+            alphaViewOr(m.scatterStrengthTex,   whiteTex_.view),
+            srgbViewOr(m.multiscatterColorTex,  whiteTex_.view),
+            srgbViewOr(m.coatColorTex,          whiteTex_.view),
             viewOr(m.coatAnisotropyTex,     coatAnisoDefaultTex_.view),
             viewOr(m.diffuseRoughnessTex,   whiteTex_.view),
             viewOr(m.fuzzTex,               whiteTex_.view),
@@ -3546,6 +3593,9 @@ void ModelRenderer::cleanupModel() {
     for (auto& t : modelTextures_)
         if (t.image != VK_NULL_HANDLE) modelDestroyImage(device_, t);
     modelTextures_.clear();
+    for (auto& t : modelTexturesSrgb_)
+        if (t.image != VK_NULL_HANDLE) modelDestroyImage(device_, t);
+    modelTexturesSrgb_.clear();
     // Freeing the pool frees all material sets allocated from it.
     if (matPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, matPool_, nullptr); matPool_ = VK_NULL_HANDLE; }
     materialSets_.clear();

@@ -10,7 +10,9 @@
  * ModelData::textures (returning its index), and approximate a Phong specular
  * exponent as a metallic-roughness roughness. Decoding goes through
  * stbi_load_from_memory (the impl already linked from common/), matching the
- * glTF backend — textures are uploaded UNORM and sRGB-decoded in the shader.
+ * glTF backend. The renderer picks each texture's transfer function from the
+ * slot that references it (colour slots upload _SRGB, the rest UNORM) — see
+ * ModelRenderer::uploadTexture.
  */
 
 #pragma once

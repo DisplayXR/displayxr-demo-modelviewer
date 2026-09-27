@@ -369,7 +369,13 @@ private:
     bool bakeIblCubes();  // (re)generate irradiance + prefiltered cubes from the active environment
     bool createEnvDescriptor();          // set-0 sampler the generation passes read the HDRI from
     void bindEnvEquirect(VkImageView v); // point that descriptor at an image (HDRI or the 1x1 dummy)
-    ModelImage uploadTexture(const struct ModelTexture& tex);
+    // srgb = true uploads the texels as VK_FORMAT_R8G8B8A8_SRGB, so the sampler
+    // decodes the sRGB transfer function BEFORE it filters (and the mip blits
+    // average in linear) — glTF 2.0 §3.9.2's "the transfer function SHOULD be
+    // decoded before performing linear interpolation". Only for the RGB colour
+    // slots (base colour, emissive, and the KHR_materials_* colour textures);
+    // alpha is never decoded, on either format.
+    ModelImage uploadTexture(const struct ModelTexture& tex, bool srgb = false);
 // Set 1 is one combined-image-sampler per material texture slot: the five core
     // glTF maps plus the texture-driven variants of the KHR_materials_* factors.
     // Passed as an array rather than 13 positional parameters — the order is the
@@ -729,7 +735,13 @@ private:
     // ── Loaded model GPU data ────────────────────────────────────────────
     ModelBuffer vertexBuffer_;
     ModelBuffer indexBuffer_;
+    // Parallel to ModelData::textures, one per ROLE the texture is referenced
+    // in: modelTextures_ is the UNORM upload (linear data: metallic-roughness,
+    // normal, occlusion, the KHR_* scalar maps), modelTexturesSrgb_ the _SRGB
+    // upload (colour slots). A slot a texture is never used in stays null, so a
+    // texture is uploaded twice only when one image really serves both roles.
     std::vector<ModelImage>     modelTextures_;
+    std::vector<ModelImage>     modelTexturesSrgb_;
     std::vector<ModelMaterial>  materials_;
     std::vector<ModelPrimitive> primitives_;
 
