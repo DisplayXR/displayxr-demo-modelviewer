@@ -1733,8 +1733,8 @@ void ModelRenderer::setLightingMode(LightingMode m) {
     // The grading is PART of the mode. The page runs three.js at unit exposure
     // with NoToneMapping, so Studio has to as well - a filmic knee alone would
     // pull every highlight the rig exists to produce back under 1.0 and undo
-    // the comparison. Sky keeps the #70 phase-0 pairing (PBR Neutral needs the
-    // +1 EV to reach its knee at all). [ / ] and G still override afterwards;
+    // the comparison. Sky uses the Khronos glTF Sample Viewer's default grading
+    // (0 EV, PBR Neutral) so assets match the reference render. [ / ] and G still override afterwards;
     // this only sets the mode's starting point.
     // Room grades like Studio and for the same reason: it is the SAME page,
     // whose WebGLRenderer is at its NoToneMapping / unit-exposure default. The
@@ -1744,7 +1744,7 @@ void ModelRenderer::setLightingMode(LightingMode m) {
         exposureEV_ = 0.0f;
         toneCurve_  = ToneCurve::Clamp;
     } else {
-        exposureEV_ = 1.0f;
+        exposureEV_ = 0.0f;
         toneCurve_  = ToneCurve::PbrNeutral;
     }
     MV_LOG("ModelRenderer: lighting = %s (exposure %+.2f EV, tone %s)\n",

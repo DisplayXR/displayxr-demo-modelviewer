@@ -696,16 +696,14 @@ private:
     std::string envName_ = "analytic sky";
 
     // ── Grading (issue #70 phase 0) ──────────────────────────────────────────
-    // +1 EV is not arbitrary: this viewer's fixed key light and analytic sky
-    // produce a dim linear image, while PBR Neutral (like any filmic curve)
-    // expects a scene exposed so mid-grey lands near 0.18 and highlights run
-    // past 1.0. At EV 0 the scene never reaches the curve's shoulder, so the
-    // curve only ever subtracts its 0.04 linear black point — all cost, no
-    // highlight rolloff, measurably darker than no tone mapping at all
-    // (helmet mean luma 55.6 clamped vs 46.6). Exposure and curve have to be
-    // chosen together; this is that choice. Revisit against the phase 1
-    // material grid rather than tuning by eye on one asset.
-    float     exposureEV_ = 1.0f;
+    // Default look = the Khronos glTF Sample Viewer's: unit exposure (0 EV) and
+    // Khronos PBR Neutral. The reference is the glTF-Sample-Viewer/Renderer
+    // default (exposure 1.0, PBR Neutral); measured on DamagedHelmet our sky at
+    // 0 EV reads mean luma 78.4 vs 79.9 under their Cannon_Exterior HDRI, so the
+    // environment barely moves it and exposure is the whole difference. This
+    // replaces the earlier +1 EV pairing (a brighter house look that read ~45 %
+    // above the Khronos render). [ / ] and G still override at runtime.
+    float     exposureEV_ = 0.0f;
     ToneCurve toneCurve_  = ToneCurve::PbrNeutral;
     LightingMode lightingMode_ = LightingMode::Sky;
 
