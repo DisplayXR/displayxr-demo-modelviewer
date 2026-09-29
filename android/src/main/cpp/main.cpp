@@ -945,7 +945,20 @@ create_swapchains()
 		log_xr_result("xrEnumerateSwapchainFormats(fill)", res);
 		return false;
 	}
-	const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
+	// Prefer an honest `_SRGB` swapchain (INV-4.6 / ADR-021), like the desktop
+	// legs. Since runtime v2.21.7 (#1589 / #1623) vk_native reads a UNORM
+	// swapchain as holding LINEAR values and encodes it on output. On a UNORM
+	// swapchain ModelRenderer has the shaders encode linear->sRGB themselves
+	// (updateUniforms: cameraPos.w = 1) and blits those display-referred bytes
+	// straight in, so the runtime encoded them a second time (washed out:
+	// lifted blacks, desaturated). With `_SRGB`, renderEye sees
+	// swapchainIsSrgb_: the shaders emit scene-linear, the opaque clear is
+	// linearized, and the UNORM->_SRGB blit's write does the one encode. The
+	// debug button-bar swapchain (hud_bar) takes this same format; its CPU
+	// display-referred bytes land via vkCmdCopyBufferToImage (no conversion),
+	// so they are now honestly declared as encoded. UNORM stays the fallback.
+	const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB,
+	                             VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
 	for (int64_t pref : preferred) {
 		for (uint32_t i = 0; i < format_count && g_swapchain_format == VK_FORMAT_UNDEFINED; ++i) {
 			if (formats[i] == pref) {
