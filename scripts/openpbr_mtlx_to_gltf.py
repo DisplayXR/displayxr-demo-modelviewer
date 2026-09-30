@@ -540,7 +540,7 @@ def mesh_arrays(prim, xf_cache, mpu, faces=None):
     uv = uv - tile
     udim = 1001 + int(tile[0]) + 10 * int(tile[1])
     uv = np.stack([uv[:, 0], 1 - uv[:, 1]], 1)
-    return P * mpu, nrm, uv, tris, udim
+    return P * mpu, nrm, uv, tris, udim, bool(mesh.GetDoubleSidedAttr().Get())
 
 COPYRIGHT = ("OpenPBR Shader Playground Copyright 2024 Adobe. All rights reserved. "
              "ASWF Digital Assets License v1.1. Modified: a subset of meshes converted from "
@@ -648,7 +648,7 @@ def group_meshes(stage, root, xf, mpu, exclude=()):
             warn(f"{prim.GetPath()}: no material bound - skipped"); continue
         for m, faces in parts:
             r = mesh_arrays(prim, xf, mpu, faces)
-            if r: out.setdefault((m.GetPrim().GetName(), r[4]), []).append((str(prim.GetPath()), r))
+            if r: out.setdefault((m.GetPrim().GetName(), r[4], r[5]), []).append((str(prim.GetPath()), r))
     return out
 
 def write_group(groups, out, mdir, mpu, a):
@@ -659,16 +659,21 @@ def write_group(groups, out, mdir, mpu, a):
     lo, hi = allP.min(0), allP.max(0)
     centre = np.array([(lo[0] + hi[0]) / 2, lo[1], (lo[2] + hi[2]) / 2])   # centred, resting on y=0
     print(f"{os.path.basename(out)}: bbox {np.round(hi - lo, 3)} m")
-    multi = {m for m, _ in groups if sum(1 for k in groups if k[0] == m) > 1}
-    for (mat_name, udim), items in sorted(groups.items()):
-        # A material whose meshes span UDIM tiles becomes one glTF material per tile.
+    multi = {k[0] for k in groups if sum(1 for j in groups if j[0] == k[0] and j[1] != k[1]) > 0}
+    for (mat_name, udim, double_sided), items in sorted(groups.items()):
+        # A material whose meshes span UDIM tiles becomes one glTF material per
+        # tile; USD's doubleSided lives on the gprim, glTF's on the material, so
+        # sidedness splits an instance too.
         mname = f"{mat_name}.{udim}" if mat_name in multi else mat_name
+        if any(k[0] == mat_name and k[1] == udim and k[2] != double_sided for k in groups):
+            mname += ".2s" if double_sided else ".1s"
         P = np.concatenate([r[0] for _, r in items]) - centre
         thickness = float(np.sort(P.max(0) - P.min(0))[0])   # thinnest bbox axis: crude volume thickness
         ov = usd_overrides(a.stage, mat_name)
         if ov: print(f"  {mname}: USD overrides on {sorted(ov)}")
         g = Graph(os.path.join(mdir, mat_name + ".mtlx"), a.max_tex, udim, ov)
         mi = build_material(glb, mname, g.surface(), mpu, thickness, a.nits_per_unit)
+        if double_sided: glb.g["materials"][mi]["doubleSided"] = True
         N = np.concatenate([r[1] for _, r in items]); UV = np.concatenate([r[2] for _, r in items])
         off, T = 0, []
         for _, r in items: T.append(r[3] + off); off += len(r[0])
