@@ -571,6 +571,14 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
             // renderers without full volumetric transport — so this counts as
             // implemented rather than ignored, but see the README matrix.
             "KHR_materials_scatter",
+            // Draft extensions (issues #81, #84). All three are read by
+            // parseMaterialExtensions() and shaded, but were never added here,
+            // so every coat/fuzz asset was told its layers were ignored while
+            // they rendered — found converting OpenPBR scenes, whose materials
+            // map onto exactly these.
+            "KHR_materials_coat",
+            "KHR_materials_fuzz",
+            "KHR_materials_diffuse_roughness",
             "KHR_texture_transform",
             nullptr
         };
