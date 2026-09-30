@@ -100,6 +100,13 @@ only — see the README.
 
 ## Not representable
 
+> **Ratified glTF only.** This table predates the draft extensions the viewer now
+> implements. With `KHR_materials_coat` (#81), `coat_color`, `coat_ior`,
+> `coat_darkening` and coat anisotropy survive; `KHR_materials_scatter` (#79)
+> carries subsurface; `KHR_materials_fuzz` + `KHR_materials_diffuse_roughness`
+> (#84) carry fuzz and `base_diffuse_roughness`. An exporter that targets the
+> drafts — `scripts/openpbr_mtlx_to_gltf.py` does — loses much less than below.
+
 glTF 2.0 has no slot for these. They are lost at export regardless of renderer.
 
 | OpenPBR | Why it doesn't survive |
@@ -131,3 +138,27 @@ export — this viewer just doesn't read it yet. That is category (3), not (2).
   says so, which rules category (3) in or out immediately.
 - **Suspect units on iridescence.** The micrometre/nanometre factor of 1000 is
   the single most likely silent export error in this table.
+
+---
+
+## Converting a MaterialX OpenPBR scene
+
+`scripts/openpbr_mtlx_to_gltf.py` is the export step made runnable for content
+that ships as OpenUSD + `.mtlx` rather than glTF — the reference being the ASWF
+[OpenPBR Shader Playground](https://dpel.aswf.io/openpbr-shader-playground).
+It evaluates each material's node graph per pixel and bakes it into core glTF
+plus the (draft) extensions above, one `.glb` per scene group; its docstring
+lists every mapping decision and limit. Found by running it on the Playground:
+
+- **`emission_luminance` is not absolute in practice.** The spec says nits, but
+  in the Arnold reference render meetMAT peaks at ~2 and glows hard, so the
+  script maps it 1:1 onto `emissiveStrength` (`--nits-per-unit 1`). Treating it
+  as real nits (÷100 for SDR white) leaves every emitter in the scene dark.
+- **Authored-but-disabled lobes are real.** The Playground's bubbles set
+  `thin_film_thickness` and `thin_film_ior` but never `thin_film_weight`, whose
+  default is 0 — so there is no iridescence in the *original* either. The script
+  warns rather than "fixing" it; a mismatch there is not an export loss.
+- **Screen-space transmission sees only opaque surfaces.** A transmissive object
+  refracts the opaque scene behind it, never another transmissive one — so juice
+  inside a glass largely vanishes. A property of this renderer, not the export.
+
