@@ -66,7 +66,7 @@ consumes (adding a format is front-end work only):
 | `.stl` | `model_loader_stl.cpp` | hand-rolled, no dep | single neutral default |
 | `.obj` | `model_loader_obj.cpp` | tinyobjloader (vendored) | Phong `.mtl` → MR shim |
 | `.fbx` | `model_loader_fbx.cpp` | ufbx (vendored) | PBR maps, Phong fallback |
-| `.usd*` | `model_loader_usd.cpp` | tinyusdz/tydra (FetchContent) | UsdPreviewSurface (PBR) |
+| `.usd*` | `model_loader_usd.cpp` (+ `model_loader_mtlx.cpp`) | tinyusdz/tydra (FetchContent) | UsdPreviewSurface (PBR); MaterialX OpenPBR (`.mtlx` references) |
 
 OBJ + FBX share `model_loader_material.{h,cpp}` (texture decode + Phong→roughness).
 The four open-dialog filters (Windows spatial picker + Win32 fallback, macOS

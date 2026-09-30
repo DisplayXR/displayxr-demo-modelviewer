@@ -2126,6 +2126,11 @@ static void TryAutoLoadBundledScene() {
     std::string dir = ExeDir();
     if (dir.empty()) return;
     std::string path = dir + "/sample.glb";
+    // DXR_MODELVIEWER_MODEL=<path> replaces the bundled sample at startup, any
+    // format the loader takes (.glb/.gltf/.usd*/.obj/.fbx/.stl). An environment
+    // variable for the same reason as DXR_MODELVIEWER_DETERMINISTIC: the .app
+    // has no argv, and a capture harness must not have to overwrite sample.glb.
+    if (const char* m = getenv("DXR_MODELVIEWER_MODEL"); m && m[0]) path = m;
     if (!FileExists(path)) {
         LOG_INFO("No bundled model at %s (skipping auto-load)", path.c_str());
         return;

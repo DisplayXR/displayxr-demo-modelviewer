@@ -55,11 +55,26 @@ FetchContent_MakeAvailable(glm)
 if(WIN32)
     add_compile_definitions(NOMINMAX)
 endif()
+# v0.9.9-rc7, not v0.9.4: v0.9.4's CompositeSublayers() leaves the shared
+# asset resolver pointing at the PREVIOUS sibling sublayer's directory, so a
+# scene whose sublayers live in different folders (the ASWF OpenPBR Shader
+# Playground: cameras/, materials/, assets/) fails on its second sublayer.
+# rc7 resets the resolver per sublayer. It is the newest tag before upstream's
+# TinyUSDZ -> LightUSD rename (v1.0.0-rc2+), which changes the namespace.
 FetchContent_Declare(tinyusdz
     GIT_REPOSITORY https://github.com/lighttransport/tinyusdz.git
-    GIT_TAG        v0.9.4
+    GIT_TAG        v0.9.9-rc7
+    GIT_SHALLOW    TRUE
 )
 set(TINYUSDZ_BUILD_TESTS        OFF CACHE INTERNAL "" FORCE)
+# Upstream's own switch for its -Weverything -Werror; the per-diagnostic
+# demotions below stay for the GCC path, where upstream injects -Werror late.
+set(TINYUSDZ_NO_WERROR          ON  CACHE INTERNAL "" FORCE)
+# OpenPBR/MaterialX content ships its maps as (LZW) TIFF; TinyDNG decodes them.
+set(TINYUSDZ_WITH_TIFF          ON  CACHE INTERNAL "" FORCE)
+# rc7 adds image-writer.cc, which compiles stb_image_write's implementation;
+# common/ already provides it (atlas capture), so take tinyusdz's out.
+set(TINYUSDZ_NO_STB_IMAGE_WRITE_IMPLEMENTATION ON CACHE INTERNAL "" FORCE)
 set(TINYUSDZ_BUILD_EXAMPLES     OFF CACHE INTERNAL "" FORCE)
 set(TINYUSDZ_WITH_OPENSUBDIV    OFF CACHE INTERNAL "" FORCE)
 set(TINYUSDZ_WITH_AUDIO         OFF CACHE INTERNAL "" FORCE)
@@ -153,7 +168,8 @@ add_library(model_renderer STATIC
     model_loader_obj.cpp       # .obj backend (tinyobjloader, vendored)
     model_loader_fbx.cpp       # .fbx backend (ufbx, vendored)
     third_party/ufbx.c         # ufbx implementation (C TU)
-    model_loader_usd.cpp       # .usdz/.usd backend (tinyusdz) — stub
+    model_loader_usd.cpp       # .usdz/.usd backend (tinyusdz)
+    model_loader_mtlx.cpp      # MaterialX OpenPBR -> ModelMaterial for .mtlx-bound USD looks
     model_vulkan_utils.h
     model_vulkan_utils.cpp
     ${SHADER_HEADERS}
