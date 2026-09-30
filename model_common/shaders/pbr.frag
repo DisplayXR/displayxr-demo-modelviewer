@@ -134,6 +134,33 @@ layout(set = 2, binding = 2) uniform sampler2D   brdfLUT;         // split-sum s
 // UNORM swapchain, already-sRGB-encoded) value into a linear `color` that then
 // ran the whole tail again, which is what made glass render washed out.
 layout(set = 2, binding = 3) uniform sampler2D   sceneColor;
+
+// Sample sceneColor at `lod` without ever reading a texel the capture did not
+// write. captureSceneColor() copies and mips only this eye's viewport sub-rect;
+// the rest of every level is UNDEFINED memory. Scaling the UV into the sub-rect
+// (ubo.viewport) is not enough on its own, for two reasons:
+//   * bilinear filtering at a UV clamped to the sub-rect edge still reads the
+//     neighbouring texel, which lies outside it — at a coarse level that is a
+//     large block of garbage;
+//   * the written extent halves by integer division (1280 -> ... -> 5 -> 2)
+//     while the image's own mips halve separately (2560 -> ... -> 10 -> 5), so
+//     at deep levels the written fraction drifts below ubo.viewport (2/5 != 1/2).
+// A refracted ray that leaves the screen is clamped to exactly that edge, so a
+// thick transmissive volume painted undefined memory — on MoltenVK as pure
+// (0,G,0) patches at silhouettes. Clamping to the centre of the last WRITTEN
+// texel of both levels trilinear blends makes every tap defined.
+vec3 sampleSceneColor(vec2 uv, float lod) {
+    int   maxLevel = textureQueryLevels(sceneColor) - 1;
+    ivec2 full0    = textureSize(sceneColor, 0);
+    ivec2 written0 = ivec2(ubo.viewport.xy * vec2(full0) + 0.5);
+    int   l0 = clamp(int(floor(lod)), 0, maxLevel);
+    int   l1 = min(l0 + 1, maxLevel);
+    vec2 hi0 = (vec2(max(written0 >> l0, ivec2(1))) - 0.5) / vec2(textureSize(sceneColor, l0));
+    vec2 hi1 = (vec2(max(written0 >> l1, ivec2(1))) - 0.5) / vec2(textureSize(sceneColor, l1));
+    // The low edge needs no clamp: texel 0 is always written, and the sampler
+    // is CLAMP_TO_EDGE.
+    return textureLod(sceneColor, min(uv, min(hi0, hi1)), lod).rgb;
+}
 // Sheen directional albedo E(N·V, sheenRoughness) — see sheen_lut.frag. Lets
 // sheen redistribute energy rather than add it.
 layout(set = 2, binding = 4) uniform sampler2D   sheenLUT;
@@ -931,7 +958,7 @@ void main() {
         // behind it. Same idea as the prefiltered IBL chain, applied to scene
         // colour instead of the environment.
         float sceneLod = probe ? 0.0 : float(textureQueryLevels(sceneColor) - 1) * roughness;
-        vec3 transmitted = textureLod(sceneColor, uv, sceneLod).rgb;
+        vec3 transmitted = sampleSceneColor(uv, sceneLod);
 
         if (probe) {
             // Acceptance probe: hand the raw sample to the display transform.
@@ -1016,7 +1043,7 @@ void main() {
                 // the scene chain is the most-blurred copy available, which is
                 // the closest stand-in for a diffuse transmission lobe.
                 float diffuseLod = float(textureQueryLevels(sceneColor) - 1);
-                vec3 scatterFwd = textureLod(sceneColor, uv, diffuseLod).rgb * lobeAlbedo;
+                vec3 scatterFwd = sampleSceneColor(uv, diffuseLod) * lobeAlbedo;
 
                 float fwd = 0.5 * (1.0 + scatterG);
                 float bwd = 0.5 * (1.0 - scatterG);
