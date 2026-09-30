@@ -58,10 +58,18 @@ cage, not the limit surface.
 
 Requirements (a venv is easiest):  pip install usd-core numpy pillow tifffile imagecodecs
   (imagecodecs: the Playground's .tif textures are LZW-compressed.)
+  --decimate additionally needs: pip install fast-simplification
 
 Usage:
     python scripts/openpbr_mtlx_to_gltf.py <scene.usda> <outdir> \
         --groups mug_grp,lamp_grp,meetMAT_grp [--exclude pCube7,pCube28] [--max-tex 1024]
+
+Slim recipe for the Playground (85 -> 50 MB for nine groups, each lever
+measured in isolation with scripts/compare_captures.py against the unslimmed
+render): --jpeg-quality 90 --decimate bubbles=0.2,bubblesMasonJar=0.2,OJ=0.4.
+Bubbles and juice decimate for free (mean |diff| 0.000 -- the bubbles alone
+were 18 MB); JPEG costs <= 0.09/255. NOT iceCube (1.1/255, visible) and not
+OJglass (textured normal map -> the seam approximation shows as streaks).
 
 The scene's textures need only be present for the groups you convert -- the
 Playground is 1.9 GB, almost all of it textures, so fetch per-material rather
@@ -218,6 +226,7 @@ class GLB:
                   "materials": [], "accessors": [], "bufferViews": [], "buffers": [],
                   "images": [], "textures": [], "samplers": [{"wrapS": 10497, "wrapT": 10497}]}
         self.bin = bytearray(); self.used = set()
+        self.jpeg_quality = 0; self.tex_cache = {}
 
     def view(self, data, target=None):
         while len(self.bin) % 4: self.bin += b"\0"
@@ -227,6 +236,10 @@ class GLB:
         return len(self.g["bufferViews"]) - 1
 
     def accessor(self, arr, typ, target):
+        # glTF's JSON cannot carry NaN/Inf (min/max would be invalid JSON and the
+        # viewer rejects the whole file), so refuse rather than write a broken asset.
+        if arr.dtype.kind == "f" and not np.isfinite(arr).all():
+            raise ValueError(f"non-finite values in a {typ} accessor")
         comp = 5125 if arr.dtype == np.uint32 else 5126
         acc = {"bufferView": self.view(arr.tobytes(), target), "componentType": comp,
                "count": len(arr), "type": typ}
@@ -235,14 +248,28 @@ class GLB:
         self.g["accessors"].append(acc)
         return len(self.g["accessors"]) - 1
 
-    def texture(self, img01, name):
-        """img01: HxWxC float in [0,1], already in the encoding glTF wants for its slot."""
+    def texture(self, img01, name, colour=False):
+        """img01: HxWxC float in [0,1], already in the encoding glTF wants for its slot.
+
+        `colour` marks an sRGB colour slot (baseColor, emissive). Those go out as
+        JPEG when --jpeg-quality is set and there is no alpha; data textures
+        (normals, metal/rough, masks) always stay lossless PNG, where block
+        artefacts would read as bumps or roughness noise. Byte-identical images
+        are stored once (a material often feeds one map to two inputs)."""
         a = (np.clip(img01, 0, 1) * 255 + 0.5).astype(np.uint8)
         if a.shape[2] == 1: a = a[..., 0]
-        buf = io.BytesIO(); Image.fromarray(a).save(buf, "PNG", optimize=True)
-        self.g["images"].append({"name": name, "mimeType": "image/png", "bufferView": self.view(buf.getvalue())})
+        buf = io.BytesIO()
+        if colour and self.jpeg_quality and a.ndim == 3 and a.shape[2] == 3:
+            Image.fromarray(a).save(buf, "JPEG", quality=self.jpeg_quality, optimize=True)
+            mime = "image/jpeg"
+        else:
+            Image.fromarray(a).save(buf, "PNG", optimize=True); mime = "image/png"
+        data = buf.getvalue()
+        if data in self.tex_cache: return {"index": self.tex_cache[data]}
+        self.g["images"].append({"name": name, "mimeType": mime, "bufferView": self.view(data)})
         self.g["textures"].append({"sampler": 0, "source": len(self.g["images"]) - 1})
-        return {"index": len(self.g["textures"]) - 1}
+        self.tex_cache[data] = len(self.g["textures"]) - 1
+        return {"index": self.tex_cache[data]}
 
     def write(self, path):
         for k in [k for k, v in self.g.items() if v == []]: del self.g[k]
@@ -310,7 +337,7 @@ def build_material(glb, name, p, mpu, thickness_m, nits_per_unit):
         if is_img(op):
             tex, op = match(tex if is_img(bc) else np.broadcast_to(tex, op.shape[:2] + (3,)).copy(), op)
             tex = np.concatenate([tex, op[..., :1]], -1)
-        pbr["baseColorTexture"] = glb.texture(tex, f"{name}_baseColor")
+        pbr["baseColorTexture"] = glb.texture(tex, f"{name}_baseColor", colour=True)
         pbr["baseColorFactor"] = [1, 1, 1, 1 if is_img(op) else scal(op)]
     else:
         pbr["baseColorFactor"] = vec3(bc) + [scal(op)]
@@ -426,7 +453,7 @@ def build_material(glb, name, p, mpu, thickness_m, nits_per_unit):
         if is_img(L) or is_img(C):
             LC = (as3(C) if is_img(C) else np.float32(vec3(C))) * (L[..., :1] if is_img(L) else scal(L))
             LC = np.maximum(LC, 0); peak = float(LC.max()) or 1.0
-            m["emissiveTexture"] = glb.texture(lin_to_srgb(LC / peak), f"{name}_emissive")
+            m["emissiveTexture"] = glb.texture(lin_to_srgb(LC / peak), f"{name}_emissive", colour=True)
             m["emissiveFactor"] = [1, 1, 1]; strength = peak / nits_per_unit
         else:
             m["emissiveFactor"] = vec3(C); strength = scal(L) / nits_per_unit
@@ -499,6 +526,48 @@ COPYRIGHT = ("OpenPBR Shader Playground Copyright 2024 Adobe. All rights reserve
              "OpenUSD + MaterialX OpenPBR to glTF 2.0 by openpbr_mtlx_to_gltf.py (DisplayXR); materials are "
              "baked approximations of the originals.")
 
+def decimate(P, UV, T, keep, name):
+    """Quadric decimation to `keep` of the triangles (fast-simplification).
+
+    The simplifier needs connected topology, so corners are welded by POSITION
+    first; replaying its collapses yields an original->decimated vertex map that
+    carries each surviving vertex's UV across. Two approximations follow, which
+    is why this is opt-in per material and must be eyeballed: a vertex on a UV
+    seam keeps ONE of its UVs (a texture can smear across the seam), and normals
+    are recomputed smooth (hard edges soften). Right for dense smooth untextured
+    or low-frequency meshes (the Playground's bubbles, juice, ice); wrong for a
+    printed label."""
+    import fast_simplification as fs
+    uq, pid = np.unique(np.round(P, 6), axis=0, return_inverse=True)
+    pid = pid.reshape(-1)
+    F = pid[T]
+    F = F[(F[:, 0] != F[:, 1]) & (F[:, 1] != F[:, 2]) & (F[:, 0] != F[:, 2])]
+    _, _, coll = fs.simplify(uq, F, target_reduction=1.0 - keep, return_collapses=True)
+    dp, dt, vmap = fs.replay_simplification(uq, F, coll)
+    # Many tiny disconnected components (the Playground's bubbles are thousands
+    # of spheres) can collapse to degenerate points the simplifier emits as NaN.
+    # Drop every triangle touching one; say how many.
+    bad = ~np.isfinite(dp).all(1)
+    if bad.any():
+        tbad = bad[dt].any(1)
+        warn(f"{name}: decimation left {int(bad.sum())} non-finite vertices - dropped {int(tbad.sum())} tris")
+        dt = dt[~tbad]
+    # Keep only referenced vertices (the non-finite ones are now orphans).
+    used, dt = np.unique(dt, return_inverse=True)
+    dt = dt.reshape(-1, 3)
+    remap = np.full(len(dp), -1); remap[used] = np.arange(len(used))
+    dp = dp[used]
+    vmap = np.where(vmap >= 0, remap[np.maximum(vmap, 0)], -1)
+    duv = np.zeros((len(dp), 2))
+    ok = vmap[pid] >= 0
+    duv[vmap[pid][ok]] = UV[ok]
+    fn = np.cross(dp[dt[:, 1]] - dp[dt[:, 0]], dp[dt[:, 2]] - dp[dt[:, 0]])
+    dn = np.zeros_like(dp)
+    for k in range(3): np.add.at(dn, dt[:, k], fn)
+    dn /= np.maximum(np.linalg.norm(dn, axis=1, keepdims=True), 1e-12)
+    print(f"  decimate {name}: {len(T)} -> {len(dt)} tris")
+    return dp, dn, duv, dt
+
 def group_meshes(stage, root, xf, mpu, exclude=()):
     from pxr import UsdGeom, UsdShade
     out = {}
@@ -526,6 +595,7 @@ def group_meshes(stage, root, xf, mpu, exclude=()):
 
 def write_group(groups, out, mdir, mpu, a):
     glb = GLB()
+    glb.jpeg_quality = a.jpeg_quality
     glb.g["asset"]["copyright"] = a.copyright
     allP = np.concatenate([r[0] for g in groups.values() for _, r in g])
     lo, hi = allP.min(0), allP.max(0)
@@ -543,6 +613,9 @@ def write_group(groups, out, mdir, mpu, a):
         off, T = 0, []
         for _, r in items: T.append(r[3] + off); off += len(r[0])
         T = np.concatenate(T)
+        keep = a.decimate.get(mname, a.decimate.get(mat_name))
+        if keep is not None and keep < 1.0:
+            P, N, UV, T = decimate(P, UV, T, keep, mname)
         key = np.concatenate([np.round(P, 6), np.round(N, 4), np.round(UV, 6)], 1)   # weld corners
         uniq, inv = np.unique(key, axis=0, return_inverse=True)
         inv = inv.reshape(-1)
@@ -567,11 +640,18 @@ def main():
                     help="comma-separated prim names to skip with their subtrees (strays that "
                          "would blow up a group's bounds, e.g. spare cardboard far from the plane)")
     ap.add_argument("--max-tex", type=int, default=1024)
+    ap.add_argument("--jpeg-quality", type=int, default=0,
+                    help="encode sRGB colour textures (no alpha) as JPEG at this quality; "
+                         "0 = lossless PNG everywhere (default)")
+    ap.add_argument("--decimate", default="",
+                    help="per-material triangle budget, e.g. 'bubbles=0.25,iceCube=0.4' keeps 25%%/40%%. "
+                         "Opt-in: see decimate() for what it approximates")
     ap.add_argument("--copyright", default=COPYRIGHT,
                     help="asset.copyright string (default: the Shader Playground's required notice)")
     ap.add_argument("--nits-per-unit", type=float, default=1.0,
                     help="emission_luminance (nits) that maps to glTF emissive 1.0")
     a = ap.parse_args()
+    a.decimate = {k: float(v) for k, v in (kv.split("=") for kv in a.decimate.split(",") if kv)}
     from pxr import Usd, UsdGeom
     stage = Usd.Stage.Open(a.scene)
     mpu = UsdGeom.GetStageMetersPerUnit(stage)
