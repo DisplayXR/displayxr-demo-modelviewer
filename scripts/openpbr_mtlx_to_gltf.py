@@ -51,9 +51,12 @@ UDIMs: glTF has none, so each mesh's UVs are moved back to [0,1) from its own
 tile, and a material whose meshes span tiles is baked once per tile
 ("<name>.<tile>"). Exact unless a single mesh straddles tiles.
 
-Known limits: GeomSubset per-face materials collapse to the mesh binding (warned); colorcorrect / ramp / heighttonormal
-nodes pass their input through (warned); textured specular / transmission /
-subsurface weights are averaged (warned). Catmull-Clark meshes export their
+GeomSubsets: each subset's faces take its own material; unclaimed faces take the
+mesh binding. A group may be an absolute path -- "/World" converts the scene.
+
+Known limits: colorcorrect / ramp / heighttonormal
+nodes pass their input through (warned); textured specular weights, and a
+textured transmission weight combined with subsurface, are averaged (warned). Catmull-Clark meshes export their
 cage, not the limit surface.
 
 Requirements (a venv is easiest):  pip install usd-core numpy pillow tifffile imagecodecs
@@ -473,7 +476,8 @@ def flat(pv, interp, fvi, counts, nfv):
     if interp == "uniform": return np.repeat(v, counts, 0)
     return np.repeat(v.reshape(1, -1), nfv, 0)
 
-def mesh_arrays(prim, xf_cache, mpu):
+def mesh_arrays(prim, xf_cache, mpu, faces=None):
+    """World-space corner arrays for a mesh, or for only `faces` (a GeomSubset)."""
     from pxr import UsdGeom
     mesh = UsdGeom.Mesh(prim)
     pts = np.asarray(mesh.GetPointsAttr().Get(), np.float64)
@@ -500,7 +504,11 @@ def mesh_arrays(prim, xf_cache, mpu):
     starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
     tris = [np.stack([s + 0 * np.arange(c - 2), s + np.arange(1, c - 1), s + np.arange(2, c)], 1)
             for s, c in zip(starts, counts) if c >= 3]
+    face_of = np.concatenate([np.full(c - 2, f) for f, c in enumerate(counts) if c >= 3])
     tris = np.concatenate(tris)
+    if faces is not None:
+        tris = tris[np.isin(face_of, faces)]
+        if len(tris) == 0: return None
     if flip: tris = tris[:, [0, 2, 1]]
     if nrm is None:   # smooth normals over shared points (subdiv cages are authored smooth)
         fn = np.cross(P[tris[:, 1]] - P[tris[:, 0]], P[tris[:, 2]] - P[tris[:, 0]])
@@ -515,7 +523,7 @@ def mesh_arrays(prim, xf_cache, mpu):
     # WHOLE mesh by its tile (the median, so a vertex sitting exactly on a tile
     # edge is not split off) back to [0,1)^2 -- both axes: the Playground's
     # pacifier and plane plastic live on 1011/1012, one tile up in V.
-    tile = np.floor(np.median(uv, axis=0)).clip(0, None)
+    tile = np.floor(np.median(uv[np.unique(tris)], axis=0)).clip(0, None)
     uv = uv - tile
     udim = 1001 + int(tile[0]) + 10 * int(tile[1])
     uv = np.stack([uv[:, 0], 1 - uv[:, 1]], 1)
@@ -580,17 +588,27 @@ def group_meshes(stage, root, xf, mpu, exclude=()):
         if UsdGeom.Imageable(prim).ComputeVisibility() == "invisible": continue
         api = UsdShade.MaterialBindingAPI(prim)
         mat, _ = api.ComputeBoundMaterial()
-        names = set()
+        # GeomSubset bindings: each subset's faces take ITS material, and whatever
+        # faces no subset claims take the mesh's own binding (if it has one). The
+        # Playground's dresser is bound this way only, with nothing on the mesh.
+        parts, claimed = [], []
         for sub in api.GetMaterialBindSubsets():
             sm, _ = UsdShade.MaterialBindingAPI(sub.GetPrim()).ComputeBoundMaterial()
-            if sm: names.add(sm.GetPrim().GetName())
-            if not mat: mat = sm
-        if mat: names.add(mat.GetPrim().GetName())
-        if len(names) > 1:
-            warn(f"{prim.GetPath()}: per-face materials {sorted(names)} - whole mesh takes {mat.GetPrim().GetName()}")
-        if not mat: warn(f"{prim.GetPath()}: no material bound - skipped"); continue
-        r = mesh_arrays(prim, xf, mpu)
-        if r: out.setdefault((mat.GetPrim().GetName(), r[4]), []).append((str(prim.GetPath()), r))
+            idx = np.asarray(sub.GetIndicesAttr().Get() or [], np.int64)
+            claimed.append(idx)
+            if sm: parts.append((sm, idx))
+            else: warn(f"{sub.GetPrim().GetPath()}: subset with no material - skipped")
+        if parts:
+            nface = len(UsdGeom.Mesh(prim).GetFaceVertexCountsAttr().Get())
+            rest = np.setdiff1d(np.arange(nface), np.concatenate(claimed))
+            if len(rest) and mat: parts.append((mat, rest))
+        elif mat:
+            parts = [(mat, None)]
+        else:
+            warn(f"{prim.GetPath()}: no material bound - skipped"); continue
+        for m, faces in parts:
+            r = mesh_arrays(prim, xf, mpu, faces)
+            if r: out.setdefault((m.GetPrim().GetName(), r[4]), []).append((str(prim.GetPath()), r))
     return out
 
 def write_group(groups, out, mdir, mpu, a):
@@ -659,9 +677,12 @@ def main():
     mdir = os.path.join(os.path.dirname(a.scene), "materials")
     os.makedirs(a.outdir, exist_ok=True)
     for grp in a.groups.split(","):
-        groups = group_meshes(stage, "/World/" + grp, xf, mpu, set(filter(None, a.exclude.split(","))))
+        # A group is a prim under /World, or an absolute path ("/World" = the scene).
+        root = grp if grp.startswith("/") else "/World/" + grp
+        groups = group_meshes(stage, root, xf, mpu, set(filter(None, a.exclude.split(","))))
         if not groups: warn(f"{grp}: no meshes"); continue
-        write_group(groups, os.path.join(a.outdir, grp.replace("_grp", "") + ".glb"), mdir, mpu, a)
+        stem = root.rstrip("/").split("/")[-1].replace("_grp", "")
+        write_group(groups, os.path.join(a.outdir, stem + ".glb"), mdir, mpu, a)
     print(f"{len(WARN)} warnings")
 
 if __name__ == "__main__":
