@@ -18,6 +18,9 @@ viewer" pipeline of docs/openpbr-to-gltf.md, made runnable.
 
 What it does
 ------------
+Materials are the .mtlx graph PLUS the inputs the scene's USD layers author over
+it (usd_overrides()) -- the Playground re-sets 23 materials that way.
+
 Geometry: every visible UsdGeomMesh under each /World/<group>, in world space,
 metres, fan-triangulated, merged into one primitive per material, one .glb per
 group (re-centred, resting on y=0).
@@ -140,22 +143,32 @@ def parse_val(s, typ):
     return s
 
 class Graph:
-    def __init__(self, path, max_tex, tile=1001):
+    def __init__(self, path, max_tex, tile=1001, overrides=None):
         txt = open(path).read().replace("<UDIM>", "@UDIM@")
         self.root = ET.fromstring(txt)
         self.dir = os.path.dirname(path)
         self.nodes = {n.get("name"): n for n in self.root}
         self.max_tex = max_tex
         self.tile = tile   # the UDIM tile this instance of the material is baked for
+        # {node name: {input name: value}} authored over the .mtlx in USD layers
+        # (usd_overrides()); applied per USD's rule, see inp().
+        self.overrides = overrides or {}
         self.cache = {}
 
     def inp(self, node, name, default=None):
-        """Last-wins, like MaterialX (the mug declares base_color twice)."""
+        """Last-wins, like MaterialX (the mug declares base_color twice).
+
+        USD composition rule for the overrides: a CONNECTION authored in the
+        .mtlx (weaker) still wins over a value authored by a stronger USD layer
+        (UsdShadeInput resolves connections before values); an unconnected
+        input takes the override."""
         hit = None
         for i in node.findall("input"):
             if i.get("name") == name: hit = i
+        if hit is not None and hit.get("nodename"): return self.eval(hit.get("nodename"))
+        ov = self.overrides.get(node.get("name"), {})
+        if name in ov: return ov[name]
         if hit is None: return default
-        if hit.get("nodename"): return self.eval(hit.get("nodename"))
         return parse_val(hit.get("value"), hit.get("type"))
 
     def eval(self, name):
@@ -163,7 +176,7 @@ class Graph:
         n = self.nodes[name]; t = n.tag; typ = n.get("type")
         if t == "image":
             f = n.find("input[@name='file']")
-            rel = f.get("value")
+            rel = self.overrides.get(name, {}).get("file") or f.get("value")
             if "@UDIM@" in rel:
                 # glTF has no UDIMs. Each mesh's UVs are moved back to [0,1) from its
                 # own tile (mesh_arrays), and a material is baked once PER TILE its
@@ -218,7 +231,7 @@ class Graph:
     def surface(self):
         s = self.root.find("open_pbr_surface")
         if s is None: raise SystemExit("no open_pbr_surface")
-        names = {i.get("name") for i in s.findall("input")}
+        names = {i.get("name") for i in s.findall("input")} | set(self.overrides.get(s.get("name"), {}))
         return {k: self.inp(s, k) for k in names}
 
 # ---------------------------------------------------------------- glTF writer
@@ -534,6 +547,33 @@ COPYRIGHT = ("OpenPBR Shader Playground Copyright 2024 Adobe. All rights reserve
              "OpenUSD + MaterialX OpenPBR to glTF 2.0 by openpbr_mtlx_to_gltf.py (DisplayXR); materials are "
              "baked approximations of the originals.")
 
+def usd_overrides(stage, mat_name):
+    """Inputs authored on /World/Looks/<mat>/<node> by the scene's USD layers.
+
+    The Playground binds each material as `references = @x.mtlx@` PLUS an
+    `over` in materials/material_assignment.usda that re-sets OpenPBR inputs
+    and graph-node inputs (a swapped texture file, remap ranges, a bottle whose
+    coat is switched OFF). Those overrides ARE the authored look -- reading the
+    .mtlx alone gets 23 of the scene's materials wrong. OpenUSD cannot load the
+    .mtlx reference without its usdMtlx plugin (usd-core ships none), so the
+    only things composed under a Looks material are exactly these overs."""
+    from pxr import Sdf, Gf
+    prim = stage.GetPrimAtPath(f"/World/Looks/{mat_name}")
+    out = {}
+    if not prim: return out
+    for child in prim.GetAllChildren():   # overs only: GetChildren() skips undefined prims
+        for attr in child.GetAuthoredAttributes():
+            nm = attr.GetName()
+            if not nm.startswith("inputs:") or not attr.HasAuthoredValue(): continue
+            v = attr.Get()
+            if isinstance(v, Sdf.AssetPath): v = v.path
+            elif isinstance(v, bool): pass
+            elif isinstance(v, (int, float)): v = np.array([float(v)], np.float32)
+            elif hasattr(v, "__len__"): v = np.array(list(v), np.float32)
+            else: continue
+            out.setdefault(child.GetName(), {})[nm[len("inputs:"):]] = v
+    return out
+
 def decimate(P, UV, T, keep, name):
     """Quadric decimation to `keep` of the triangles (fast-simplification).
 
@@ -625,7 +665,9 @@ def write_group(groups, out, mdir, mpu, a):
         mname = f"{mat_name}.{udim}" if mat_name in multi else mat_name
         P = np.concatenate([r[0] for _, r in items]) - centre
         thickness = float(np.sort(P.max(0) - P.min(0))[0])   # thinnest bbox axis: crude volume thickness
-        g = Graph(os.path.join(mdir, mat_name + ".mtlx"), a.max_tex, udim)
+        ov = usd_overrides(a.stage, mat_name)
+        if ov: print(f"  {mname}: USD overrides on {sorted(ov)}")
+        g = Graph(os.path.join(mdir, mat_name + ".mtlx"), a.max_tex, udim, ov)
         mi = build_material(glb, mname, g.surface(), mpu, thickness, a.nits_per_unit)
         N = np.concatenate([r[1] for _, r in items]); UV = np.concatenate([r[2] for _, r in items])
         off, T = 0, []
@@ -672,6 +714,7 @@ def main():
     a.decimate = {k: float(v) for k, v in (kv.split("=") for kv in a.decimate.split(",") if kv)}
     from pxr import Usd, UsdGeom
     stage = Usd.Stage.Open(a.scene)
+    a.stage = stage
     mpu = UsdGeom.GetStageMetersPerUnit(stage)
     xf = UsdGeom.XformCache(Usd.TimeCode.EarliestTime())
     mdir = os.path.join(os.path.dirname(a.scene), "materials")
