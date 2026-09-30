@@ -72,9 +72,16 @@ set(TINYUSDZ_BUILD_TESTS        OFF CACHE INTERNAL "" FORCE)
 set(TINYUSDZ_NO_WERROR          ON  CACHE INTERNAL "" FORCE)
 # OpenPBR/MaterialX content ships its maps as (LZW) TIFF; TinyDNG decodes them.
 set(TINYUSDZ_WITH_TIFF          ON  CACHE INTERNAL "" FORCE)
-# rc7 adds image-writer.cc, which compiles stb_image_write's implementation;
-# common/ already provides it (atlas capture), so take tinyusdz's out.
-set(TINYUSDZ_NO_STB_IMAGE_WRITE_IMPLEMENTATION ON CACHE INTERNAL "" FORCE)
+# rc7 adds image-writer.cc, which compiles stb_image_write's implementation.
+# displayxr::common provides one on Windows and macOS (atlas capture), so take
+# tinyusdz's out THERE -- two copies are a duplicate-symbol link error. Linux
+# gets no stb_image_write from common, so tinyusdz's copy must stay: turning
+# it off everywhere left image-writer.cc with undefined stbi_write_* symbols.
+if(WIN32 OR APPLE)
+    set(TINYUSDZ_NO_STB_IMAGE_WRITE_IMPLEMENTATION ON  CACHE INTERNAL "" FORCE)
+else()
+    set(TINYUSDZ_NO_STB_IMAGE_WRITE_IMPLEMENTATION OFF CACHE INTERNAL "" FORCE)
+endif()
 set(TINYUSDZ_BUILD_EXAMPLES     OFF CACHE INTERNAL "" FORCE)
 set(TINYUSDZ_WITH_OPENSUBDIV    OFF CACHE INTERNAL "" FORCE)
 set(TINYUSDZ_WITH_AUDIO         OFF CACHE INTERNAL "" FORCE)
