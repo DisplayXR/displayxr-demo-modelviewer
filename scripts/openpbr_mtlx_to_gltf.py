@@ -29,6 +29,11 @@ silently -- every unmapped input or unevaluated node is a WARN line.
 
 Mapping decisions worth knowing (see docs/openpbr-to-gltf.md for the table):
   * base_weight is premultiplied into baseColorFactor.
+  * Where a surface transmits, baseColor is baked as mix(base_color,
+    transmission_color, transmission_weight): glTF tints transmitted light by
+    baseColor, OpenPBR by transmission_color. Without it the Playground's
+    painted mason jar went opaque teal and the bottle-plane lost its clear green.
+  * A textured transmission_weight (no subsurface) becomes transmissionTexture.
   * subsurface + transmission both replace the diffuse lobe in OpenPBR
     (mix(mix(diffuse, sss, sw), transmission, tw)), so the glTF
     transmissionFactor is their union and KHR_materials_scatter carries the
@@ -42,9 +47,11 @@ Mapping decisions worth knowing (see docs/openpbr-to-gltf.md for the table):
   * Coat is written as KHR_materials_coat AND a KHR_materials_clearcoat
     fallback; fuzz likewise with a KHR_materials_sheen fallback.
 
-Known limits: one UDIM tile per texture (the lowest present; mesh UVs are
-wrapped into [0,1), exact for a mesh on one tile); GeomSubset per-face materials
-collapse to the mesh binding (warned); colorcorrect / ramp / heighttonormal
+UDIMs: glTF has none, so each mesh's UVs are moved back to [0,1) from its own
+tile, and a material whose meshes span tiles is baked once per tile
+("<name>.<tile>"). Exact unless a single mesh straddles tiles.
+
+Known limits: GeomSubset per-face materials collapse to the mesh binding (warned); colorcorrect / ramp / heighttonormal
 nodes pass their input through (warned); textured specular / transmission /
 subsurface weights are averaged (warned). Catmull-Clark meshes export their
 cage, not the limit surface.
@@ -54,7 +61,7 @@ Requirements (a venv is easiest):  pip install usd-core numpy pillow tifffile im
 
 Usage:
     python scripts/openpbr_mtlx_to_gltf.py <scene.usda> <outdir> \
-        --groups mug_grp,lamp_grp,meetMAT_grp [--max-tex 1024]
+        --groups mug_grp,lamp_grp,meetMAT_grp [--exclude pCube7,pCube28] [--max-tex 1024]
 
 The scene's textures need only be present for the groups you convert -- the
 Playground is 1.9 GB, almost all of it textures, so fetch per-material rather
@@ -122,12 +129,13 @@ def parse_val(s, typ):
     return s
 
 class Graph:
-    def __init__(self, path, max_tex):
+    def __init__(self, path, max_tex, tile=1001):
         txt = open(path).read().replace("<UDIM>", "@UDIM@")
         self.root = ET.fromstring(txt)
         self.dir = os.path.dirname(path)
         self.nodes = {n.get("name"): n for n in self.root}
         self.max_tex = max_tex
+        self.tile = tile   # the UDIM tile this instance of the material is baked for
         self.cache = {}
 
     def inp(self, node, name, default=None):
@@ -146,12 +154,18 @@ class Graph:
             f = n.find("input[@name='file']")
             rel = f.get("value")
             if "@UDIM@" in rel:
-                # glTF has no UDIMs. Take the lowest tile present; mesh UVs are wrapped
-                # into [0,1) at load, which is exact for a mesh living on one tile.
+                # glTF has no UDIMs. Each mesh's UVs are moved back to [0,1) from its
+                # own tile (mesh_arrays), and a material is baked once PER TILE its
+                # meshes use, so take this instance's tile. A texture that lacks it
+                # (a mask painted on one tile only) falls back to the lowest present.
                 import glob
-                tiles = sorted(glob.glob(os.path.join(self.dir, rel.replace("@UDIM@", "[0-9][0-9][0-9][0-9]"))))
-                if len(tiles) > 1: warn(f"{name}: {len(tiles)} UDIM tiles - using {os.path.basename(tiles[0])} only")
-                rel = os.path.relpath(tiles[0], self.dir) if tiles else rel.replace("@UDIM@", "1001")
+                want = rel.replace("@UDIM@", str(self.tile))
+                if os.path.exists(os.path.join(self.dir, want)):
+                    rel = want
+                else:
+                    tiles = sorted(glob.glob(os.path.join(self.dir, rel.replace("@UDIM@", "[0-9][0-9][0-9][0-9]"))))
+                    if tiles: warn(f"{name}: no tile {self.tile} - using {os.path.basename(tiles[0])}")
+                    rel = os.path.relpath(tiles[0], self.dir) if tiles else want
             path = os.path.normpath(os.path.join(self.dir, rel))
             if not os.path.exists(path):
                 warn(f"{name}: texture missing on disk ({rel}) - using node default")
@@ -273,6 +287,23 @@ def build_material(glb, name, p, mpu, thickness_m, nits_per_unit):
 
     # base colour (premultiplied by base_weight) + opacity
     bc = get("base_color") * get("base_weight"); op = get("geometry_opacity")
+    # glTF tints TRANSMITTED light by baseColor; OpenPBR tints it by
+    # transmission_color and uses base_color only for the diffuse it replaces.
+    # So where a surface transmits, glTF's baseColor must BE transmission_color:
+    # bake mix(base_color, transmission_color, transmission_weight). Exact at
+    # weight 0 and 1. Skipped with subsurface, whose colour rides the scatter
+    # extension instead. (Painted glass: without this the paint's base colour
+    # tinted the whole jar.)
+    tw_ = get("transmission_weight")
+    if (is_img(tw_) or scal(tw_) > 0) and not is_img(get("subsurface_weight")) and scal(get("subsurface_weight")) == 0:
+        tc = get("transmission_color")
+        tcol = as3(tc) if is_img(tc) else np.float32(vec3(tc))
+        base = as3(bc) if is_img(bc) else np.float32(vec3(bc))
+        w = tw_[..., :1] if is_img(tw_) else np.float32(scal(tw_))
+        if is_img(base) and is_img(w): base, w = match(base, w)
+        if is_img(tcol) and is_img(base): tcol, base = match(tcol, base)
+        bc = base * (1 - w) + tcol * w
+        if not is_img(bc): bc = np.asarray(bc, np.float32).reshape(-1)
     if is_img(bc) or is_img(op):
         bc3 = as3(bc) if is_img(bc) else np.broadcast_to(vec3(bc), (1, 1, 3)).astype(np.float32)
         tex = lin_to_srgb(bc3)
@@ -345,12 +376,23 @@ def build_material(glb, name, p, mpu, thickness_m, nits_per_unit):
     # Both replace the diffuse lobe, so the glTF transmission weight is their union
     # and KHR_materials_scatter says what share of it is scattered.
     tw, sw_ = get("transmission_weight"), get("subsurface_weight")
-    if is_img(tw) or is_img(sw_): warn(f"{name}: textured transmission/subsurface weight - using mean")
+    # A textured transmission weight WITHOUT subsurface maps straight onto glTF's
+    # transmissionTexture (R) -- e.g. clear glass with painted-on smears, where the
+    # mean would turn the whole jar semi-opaque. Mixed with subsurface the union
+    # below is nonlinear in the two, so that case still averages.
+    tw_tex = None
+    if is_img(tw) and not is_img(sw_) and scal(sw_) == 0:
+        tw_tex = glb.texture(tw[..., :1], f"{name}_transmission")
+        tw = np.float32(1.0)
+    elif is_img(tw) or is_img(sw_):
+        warn(f"{name}: textured transmission/subsurface weight - using mean")
     tw, sw_ = scal(tw), scal(sw_)
     total = tw + (1 - tw) * sw_
     thin = bool(get("geometry_thin_walled"))
     if total > 0:
-        use("KHR_materials_transmission", {"transmissionFactor": total})
+        body = {"transmissionFactor": total}
+        if tw_tex: body["transmissionTexture"] = tw_tex
+        use("KHR_materials_transmission", body)
         vol = {"thicknessFactor": 0.0 if thin else thickness_m}
         depth = scal(get("transmission_depth"))
         if sw_ > 0:
@@ -442,19 +484,29 @@ def mesh_arrays(prim, xf_cache, mpu):
         nrm = np.asarray(nrm, np.float64) @ np.linalg.inv(M[:3, :3]).T
     nrm /= np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-12)
     uv = np.zeros((nfv, 2)) if st is None else np.asarray(st, np.float64)
-    uv = np.stack([uv[:, 0] - np.floor(uv[:, 0]).clip(0, None) * (uv[:, 0] >= 1), 1 - uv[:, 1]], 1)
-    return P * mpu, nrm, uv, tris
+    # UDIM: a mesh on tile 1001 + 10*v + u has UVs in [u, u+1) x [v, v+1). Move the
+    # WHOLE mesh by its tile (the median, so a vertex sitting exactly on a tile
+    # edge is not split off) back to [0,1)^2 -- both axes: the Playground's
+    # pacifier and plane plastic live on 1011/1012, one tile up in V.
+    tile = np.floor(np.median(uv, axis=0)).clip(0, None)
+    uv = uv - tile
+    udim = 1001 + int(tile[0]) + 10 * int(tile[1])
+    uv = np.stack([uv[:, 0], 1 - uv[:, 1]], 1)
+    return P * mpu, nrm, uv, tris, udim
 
 COPYRIGHT = ("OpenPBR Shader Playground Copyright 2024 Adobe. All rights reserved. "
              "ASWF Digital Assets License v1.1. Modified: a subset of meshes converted from "
              "OpenUSD + MaterialX OpenPBR to glTF 2.0 by openpbr_mtlx_to_gltf.py (DisplayXR); materials are "
              "baked approximations of the originals.")
 
-def group_meshes(stage, root, xf, mpu):
+def group_meshes(stage, root, xf, mpu, exclude=()):
     from pxr import UsdGeom, UsdShade
     out = {}
     from pxr import Usd
-    for prim in Usd.PrimRange(stage.GetPrimAtPath(root)):
+    it = iter(Usd.PrimRange(stage.GetPrimAtPath(root)))
+    for prim in it:
+        if prim.GetName() in exclude:
+            it.PruneChildren(); continue
         if not prim.IsA(UsdGeom.Mesh): continue
         if UsdGeom.Imageable(prim).ComputeVisibility() == "invisible": continue
         api = UsdShade.MaterialBindingAPI(prim)
@@ -469,7 +521,7 @@ def group_meshes(stage, root, xf, mpu):
             warn(f"{prim.GetPath()}: per-face materials {sorted(names)} - whole mesh takes {mat.GetPrim().GetName()}")
         if not mat: warn(f"{prim.GetPath()}: no material bound - skipped"); continue
         r = mesh_arrays(prim, xf, mpu)
-        if r: out.setdefault(mat.GetPrim().GetName(), []).append((str(prim.GetPath()), r))
+        if r: out.setdefault((mat.GetPrim().GetName(), r[4]), []).append((str(prim.GetPath()), r))
     return out
 
 def write_group(groups, out, mdir, mpu, a):
@@ -479,10 +531,13 @@ def write_group(groups, out, mdir, mpu, a):
     lo, hi = allP.min(0), allP.max(0)
     centre = np.array([(lo[0] + hi[0]) / 2, lo[1], (lo[2] + hi[2]) / 2])   # centred, resting on y=0
     print(f"{os.path.basename(out)}: bbox {np.round(hi - lo, 3)} m")
-    for mname, items in sorted(groups.items()):
+    multi = {m for m, _ in groups if sum(1 for k in groups if k[0] == m) > 1}
+    for (mat_name, udim), items in sorted(groups.items()):
+        # A material whose meshes span UDIM tiles becomes one glTF material per tile.
+        mname = f"{mat_name}.{udim}" if mat_name in multi else mat_name
         P = np.concatenate([r[0] for _, r in items]) - centre
         thickness = float(np.sort(P.max(0) - P.min(0))[0])   # thinnest bbox axis: crude volume thickness
-        g = Graph(os.path.join(mdir, mname + ".mtlx"), a.max_tex)
+        g = Graph(os.path.join(mdir, mat_name + ".mtlx"), a.max_tex, udim)
         mi = build_material(glb, mname, g.surface(), mpu, thickness, a.nits_per_unit)
         N = np.concatenate([r[1] for _, r in items]); UV = np.concatenate([r[2] for _, r in items])
         off, T = 0, []
@@ -508,6 +563,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("scene"); ap.add_argument("outdir")
     ap.add_argument("--groups", required=True, help="comma-separated prim names under /World")
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated prim names to skip with their subtrees (strays that "
+                         "would blow up a group's bounds, e.g. spare cardboard far from the plane)")
     ap.add_argument("--max-tex", type=int, default=1024)
     ap.add_argument("--copyright", default=COPYRIGHT,
                     help="asset.copyright string (default: the Shader Playground's required notice)")
@@ -521,7 +579,7 @@ def main():
     mdir = os.path.join(os.path.dirname(a.scene), "materials")
     os.makedirs(a.outdir, exist_ok=True)
     for grp in a.groups.split(","):
-        groups = group_meshes(stage, "/World/" + grp, xf, mpu)
+        groups = group_meshes(stage, "/World/" + grp, xf, mpu, set(filter(None, a.exclude.split(","))))
         if not groups: warn(f"{grp}: no meshes"); continue
         write_group(groups, os.path.join(a.outdir, grp.replace("_grp", "") + ".glb"), mdir, mpu, a)
     print(f"{len(WARN)} warnings")
