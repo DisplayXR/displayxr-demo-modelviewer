@@ -145,7 +145,16 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   import* for the per-backend table). **FBX now skins + animates** (ufbx skins +
   baked anim-stack clips wired into the same ModelData fields the glTF path uses;
   no blend shapes yet, and non-skinned meshes don't follow node animation);
-  **USD honours base-color/emissive textures + PBR factors** but not
+  **USD with MaterialX OpenPBR looks loads natively** (`model_loader_mtlx.cpp`:
+  a MaterialX-subset reader + per-texel graph evaluator + the same OpenPBR →
+  ModelMaterial bake as `scripts/openpbr_mtlx_to_gltf.py` — keep the two in
+  step; a difference is a bug in one). tinyusdz composes the scene but resolves
+  `.mtlx` references to EMPTY materials, so the loader records each `.mtlx`
+  reference before composition and reads USD overrides off the composed stage.
+  tinyusdz is pinned to v0.9.9-rc7 (v0.9.4's sublayer resolver bug; newer tags
+  are the LightUSD rename). macOS `DXR_MODELVIEWER_MODEL=<path>` picks the
+  startup model; `DXR_MODELVIEWER_MTLX_MAXTEX` caps baked textures (1024).
+  **UsdPreviewSurface honours base-color/emissive textures + PBR factors** but not
   normal/metallic-roughness maps yet. Non-glTF material fidelity is best-effort
   (Phong→MR shim for OBJ/FBX).
 - **No Draco** mesh compression, **no KTX2/Basis** textures (stb = PNG/JPEG only).

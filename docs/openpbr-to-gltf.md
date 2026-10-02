@@ -162,3 +162,28 @@ lists every mapping decision and limit. Found by running it on the Playground:
   refracts the opaque scene behind it, never another transmissive one — so juice
   inside a glass largely vanishes. A property of this renderer, not the export.
 
+---
+
+## Loading OpenPBR USD directly
+
+The viewer also opens an OpenPBR USD scene **without converting it**: drop
+`ShdrPlygrnd_OpenPBR.usda` on it (macOS: `DXR_MODELVIEWER_MODEL=<path>`).
+`model_common/model_loader_mtlx.cpp` is the C++ port of this script's material
+path — same MaterialX evaluator, same mapping decisions — so everything in the
+tables above applies unchanged; only the glTF step is gone. What that buys:
+
+- no Python toolchain and no 1.9 GB → 150 MB export step; the whole Playground
+  (61 MaterialX materials, 2.6 M vertices, ~110 maps) loads in ~13 s;
+- USD's own semantics where glTF had none: per-gprim `doubleSided`, GeomSubset
+  materials, per-tile UDIM instances, inherited visibility.
+
+Measured against the converter's `.glb` of the same scene at the same texture
+budget: mean |diff| **0.32/255** over the whole frame — the two paths agree.
+
+Two things about the scene itself surfaced while building this. The
+Playground's `materials/material_assignment.usda` re-sets inputs on 23 of its
+54 materials, so reading the `.mtlx` files alone gets them wrong (both paths
+now apply those overrides, with USD's rule that a connection authored in the
+`.mtlx` beats a stronger layer's value). And it overrides a `place2d` node on
+the walls that no `.mtlx` defines — a dangling override, correctly ignored.
+

@@ -27,7 +27,7 @@ bundled sample is the Khronos DamagedHelmet, auto-loaded at startup.
 | STL | `.stl` | Neutral default material | Binary + ASCII; geometry only |
 | OBJ | `.obj` (+ `.mtl`) | Phong → metallic-roughness shim | Best-effort material fidelity |
 | FBX | `.fbx` | PBR maps, Phong fallback | Skinned + animated (auto-plays first clip); no blend shapes yet |
-| USD | `.usdz` `.usd` `.usda` `.usdc` | UsdPreviewSurface PBR | Base-color/emissive textures + PBR factors; normal & metallic-roughness *maps* not yet honoured |
+| USD | `.usdz` `.usd` `.usda` `.usdc` | UsdPreviewSurface PBR, **MaterialX OpenPBR** | Scenes are composed (subLayers, references, payloads, inherits, variants). Materials bound as `@x.mtlx@` references are evaluated natively, including the inputs USD layers author over them — see [OpenPBR → glTF](docs/openpbr-to-gltf.md#loading-openpbr-usd-directly). UsdPreviewSurface: base-color/emissive textures + PBR factors; its normal & metallic-roughness *maps* not yet honoured |
 
 Every format feeds the same renderer (metallic-roughness PBR + image-based
 lighting). Not yet supported: **Draco** mesh compression and **KTX2 / Basis**
