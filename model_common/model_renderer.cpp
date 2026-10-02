@@ -3395,7 +3395,14 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toDst.image = swapchainImage;
     toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    // The source stage must be able to perform srcAccessMask: TOP_OF_PIPE
+    // performs no accesses, so the second eye's COLOR_ATTACHMENT_WRITE needs
+    // COLOR_ATTACHMENT_OUTPUT (VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02819;
+    // DisplayXR/displayxr-leia-plugin#280). That is also the first eye's
+    // toColor destination stage, so the two barriers chain.
+    const VkPipelineStageFlags toDstSrcStage =
+        (viewportX == 0) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    vkCmdPipelineBarrier(cmd, toDstSrcStage, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &toDst);
 
     // Blit [0,0]-[vpW,vpH] of the internal image into the swapchain viewport
