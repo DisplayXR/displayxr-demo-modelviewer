@@ -155,7 +155,9 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   are the LightUSD rename). macOS `DXR_MODELVIEWER_MODEL=<path>` picks the
   startup model; `DXR_MODELVIEWER_MTLX_MAXTEX` caps baked textures (1024).
   **Scene lights** (`LightingMode::Scene`, auto-selected when a file carries
-  UsdLux / KHR_lights_punctual lights): unshadowed, one calibration constant
+  UsdLux / KHR_lights_punctual lights): cube shadow maps (one D32 2D array,
+  layer = light*6+face; face math duplicated in pbr.frag -- change both),
+  transmissive materials cast none, one calibration constant
   (`kSceneLightScale`, see docs/openpbr-to-gltf.md#scene-lights-and-cameras).
   TRAP: atlas captures are LINEAR -- never sRGB-decode them when measuring.
   macOS `DXR_MODELVIEWER_CAMERA=<name|index>` starts at a USD GeomCamera.

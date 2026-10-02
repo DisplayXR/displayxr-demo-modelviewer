@@ -761,15 +761,16 @@ bool ModelRenderer::createPipeline() {
 
     // Set 2: IBL — irradiance cube, prefiltered cube, BRDF LUT, plus the mipped
     // scene-colour copy transmissive surfaces refract against (all fragment).
-    VkDescriptorSetLayoutBinding ib[5] = {};
-    for (uint32_t i = 0; i < 5; ++i) {
+    // Binding 5 is the scene-light shadow array (sampler2DArrayShadow).
+    VkDescriptorSetLayoutBinding ib[6] = {};
+    for (uint32_t i = 0; i < 6; ++i) {
         ib[i].binding = i;
         ib[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         ib[i].descriptorCount = 1;
         ib[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo ilci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    ilci.bindingCount = 5;
+    ilci.bindingCount = 6;
     ilci.pBindings = ib;
     if (vkCreateDescriptorSetLayout(device_, &ilci, nullptr, &iblSetLayout_) != VK_SUCCESS) return false;
 
@@ -1403,7 +1404,20 @@ bool ModelRenderer::createIbl() {
     if (!bakeIblCubes()) return false;
 
     // Descriptor set (set = 2).
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5};
+    // Shadow sampler (depth compare) + a 1x1x1 placeholder so binding 5 is valid
+    // for every model; ensureShadowResources() swaps in the real image.
+    {
+        VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = VK_FILTER_LINEAR; sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.compareEnable = VK_TRUE; sci.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+        sci.maxLod = 0.0f;
+        if (vkCreateSampler(device_, &sci, nullptr, &shadowSampler_) != VK_SUCCESS) return false;
+        if (!createShadowImage(1, 1)) return false;
+    }
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &ps;
     if (vkCreateDescriptorPool(device_, &dpci, nullptr, &iblPool_) != VK_SUCCESS) return false;
@@ -1436,6 +1450,13 @@ void ModelRenderer::writeIblSet() {
         ++n;
     }
     if (n) vkUpdateDescriptorSets(device_, n, w, 0, nullptr);
+    if (shadowArrayView_ != VK_NULL_HANDLE && shadowSampler_ != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo si = {shadowSampler_, shadowArrayView_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet sw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        sw.dstSet = iblSet_; sw.dstBinding = 5; sw.descriptorCount = 1;
+        sw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; sw.pImageInfo = &si;
+        vkUpdateDescriptorSets(device_, 1, &sw, 0, nullptr);
+    }
 }
 
 void ModelRenderer::destroyCubeMap(CubeMap& cube) {
@@ -1712,6 +1733,7 @@ void normalizeInto(float out[4], const float dir[3], float intensity) {
 void ModelRenderer::setLightingMode(LightingMode m) {
     const bool wasRoom = envUsesRoom();
     lightingMode_ = m;
+    shadowsDirty_ = true;
     // Room swaps the environment the IBL cubes are BAKED from, which nothing
     // else about a mode does — Sky/Studio/None all read the same sky bake and
     // differ only in uniforms. So this one transition needs a rebake.
@@ -1882,6 +1904,8 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     for (const ModelMaterial& m : materials_)
         if (m.transmissionFactor > 0.0f) { hasTransmissive_ = true; break; }
     if (!uploadMaterialExtensions(materials_)) return false;
+    matNoShadow_.assign(materials_.size(), 0);
+    for (size_t i = 0; i < materials_.size(); ++i) matNoShadow_[i] = materials_[i].transmissionFactor > 0.0f;
     primitives_ = std::move(md.primitives);
 
     // Animation graph (Phase 1). Auto-play the first clip; no clips → static
@@ -2038,6 +2062,25 @@ bool ModelRenderer::loadModel(const char* gltfPath) {
                sceneLights_.size(), MV_MAX_SCENE_LIGHTS);
     // A file that carries lights is lit by them; leaving Scene on for a model
     // without any would light it with nothing.
+    // Shadow far plane: the farthest model corner from any light.
+    {
+        float mn[3], mx[3];
+        shadowFar_ = 10.0f;
+        if (!sceneLights_.empty() && getSceneBBox(mn, mx)) {
+            float far2 = 0.0f;
+            for (const ModelLight& L : sceneLights_)
+                for (int c = 0; c < 8; ++c) {
+                    float d2 = 0.0f;
+                    for (int a = 0; a < 3; ++a) {
+                        float v = ((c >> a) & 1 ? mx[a] : mn[a]) - L.position[a];
+                        d2 += v * v;
+                    }
+                    far2 = std::max(far2, d2);
+                }
+            shadowFar_ = std::max(1.0f, std::sqrt(far2) * 1.05f);
+        }
+    }
+    shadowsDirty_ = true;
     if (!sceneLights_.empty()) setLightingMode(LightingMode::Scene);
     else if (lightingMode_ == LightingMode::Scene) setLightingMode(LightingMode::Sky);
     return true;
@@ -2105,16 +2148,19 @@ float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const
 // ModelLight) into this renderer's radiance units; one constant for every
 // light. The light math itself is exact at 1.0 -- an analytic check (white
 // Lambertian plane, one normalized rect light, J = 1 at 1 m) reads 0.271
-// against the expected 1/pi through PBR Neutral, 0.278. 1.7 is the median
-// reference/ours ratio, lights only, at the OpenPBR Shader Playground's
-// renderCam_CU_planeTOP against its published still: Arnold's frame also
-// carries bounce light, the (unshipped) dome and shadows, which this renderer
-// does not, so the spread is wide (paper wants ~2.3, wood ~0.85) and one
-// constant is the honest summary. Revisit once shadows land.
+// against the expected 1/pi through PBR Neutral, 0.278. 2.5 is the median
+// reference/ours ratio over DIRECTLY LIT pixels (lights only, shadows on) at
+// the OpenPBR Shader Playground's renderCam_CU_planeTOP against its published
+// still -- 2.54 there, 2.43 over all pixels (IQR 1.4-3.7). Arnold's frame also
+// carries bounce light and its (unshipped) dome, which this renderer does not,
+// so shadowed regions read low; directly lit ones are what the light model is.
+// (Before shadows the same fit read 1.7 with a far wider spread: light leaking
+// through the walls was inflating the unshadowed render.)
 // kSceneAmbientScale dims the sky IBL to a neutral fill: a scene that brings
 // its own lights is not also lit by an outdoor sky, and its dome light (when it
 // has one) is not imported yet.
-static constexpr float kSceneLightScale   = 1.7f;
+static constexpr float kShadowNear        = 0.01f;   // metres; scene-light shadow cubes
+static constexpr float kSceneLightScale   = 2.5f;
 static constexpr float kSceneAmbientScale = 0.10f;
 
 // DXR_MODELVIEWER_SCENE_LIGHT_SCALE / _SCENE_AMBIENT override the two constants
@@ -2244,6 +2290,13 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
             v[4] = L.axis[0]; v[5] = L.axis[1]; v[6] = L.axis[2]; v[7] = L.cosOuter;
             for (int c = 0; c < 3; ++c) v[8 + c] = L.color[c] * L.intensity;
             v[11] = L.cosInner;
+            // [3] = (shadowed, near, far, radius). A light has a shadow cube once
+            // ensureShadowResources() sized the array for it; distant lights none.
+            const bool shadowed = L.type != ModelLight::Type::Directional &&
+                                  shadowLayers_ >= (uint32_t)(i + 1) * 6 && !shadowFailed_;
+            v[12] = shadowed ? 1.0f : 0.0f;
+            v[13] = kShadowNear;
+            v[14] = shadowFar_;
             v[15] = L.radius;
         }
     }
@@ -2378,6 +2431,7 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
     // Advance + loop the playhead within the clip duration (frozen when paused;
     // the pose below is still recomputed so the held frame stays correct).
     if (!paused_) {
+        shadowsDirty_ = true;   // a moving pose moves its shadows
         animTime_ += dtSeconds;
         if (anim.duration > 0.0f) {
             animTime_ = std::fmod(animTime_, anim.duration);
@@ -3179,6 +3233,14 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
 
+    // Scene-light shadow maps, before the first eye that needs them: on load, on
+    // a lighting change, and per frame only while an animation plays.
+    if (lightingMode_ == LightingMode::Scene && !sceneLights_.empty() && shadowsDirty_ &&
+        modelLoaded_ && ensureShadowResources()) {
+        recordShadowPass(cmd);
+        shadowsDirty_ = false;
+    }
+
     VkClearValue clears[3];
     if (transparentBg) {
         // (0,0,0,0) is a fixed point of the sRGB EOTF — nothing to convert.
@@ -3670,6 +3732,302 @@ void ModelRenderer::readFacingProbe() {
            sumFront * inv, verdict);
 }
 
+// ============================================================================
+// Scene-light shadows
+// ============================================================================
+
+// Face f of light i's cube is layer i*6+f. Forward / up hint per face, in the
+// order pbr.frag's shadowFace() selects them (+X -X +Y -Y +Z -Z). The view is
+// glm::lookAt(L, L+fwd, up), the projection a 90-degree perspectiveRH_ZO, and
+// the viewport has POSITIVE height -- so NDC (x, y) = (d.s, d.u) / (d.fwd) with
+// s = normalize(cross(fwd, up)), u = cross(s, fwd), and v = ndc.y*0.5+0.5 is
+// the sampled row. pbr.frag recomputes exactly this; change both or neither.
+static const float kShadowFaceFwd[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+static const float kShadowFaceUp[6][3]  = {{0, 1, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, 1, 0}};
+static constexpr uint32_t kShadowRes  = 1024;
+
+bool ModelRenderer::createShadowImage(uint32_t res, uint32_t layers) {
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_D32_SFLOAT;
+    ici.extent = {res, res, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = layers;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device_, &ici, nullptr, &shadowImage_) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(device_, shadowImage_, &mr);
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = modelFindMemoryType(physDevice_, mr.memoryTypeBits,
+                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device_, &mai, nullptr, &shadowMem_) != VK_SUCCESS) return false;
+    vkBindImageMemory(device_, shadowImage_, shadowMem_, 0);
+
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = shadowImage_;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    vci.format = VK_FORMAT_D32_SFLOAT;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, layers};
+    if (vkCreateImageView(device_, &vci, nullptr, &shadowArrayView_) != VK_SUCCESS) return false;
+    shadowLayerViews_.assign(layers, VK_NULL_HANDLE);
+    for (uint32_t l = 0; l < layers; ++l) {
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, l, 1};
+        if (vkCreateImageView(device_, &vci, nullptr, &shadowLayerViews_[l]) != VK_SUCCESS) return false;
+    }
+
+    // Clear to "nothing occludes" and leave it sampleable, so binding 5 is valid
+    // before (and without) any shadow pass.
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = cmdPool_; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+    VkCommandBuffer cmd; vkAllocateCommandBuffers(device_, &cai, &cmd);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = shadowImage_; b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, layers};
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+    VkClearDepthStencilValue one = {1.0f, 0};
+    vkCmdClearDepthStencilImage(cmd, shadowImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &one, 1,
+                                &b.subresourceRange);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+    shadowRes_ = res;
+    shadowLayers_ = layers;
+    return true;
+}
+
+void ModelRenderer::destroyShadowResources(bool keepPipeline) {
+    for (auto fb : shadowFbs_) if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(device_, fb, nullptr);
+    shadowFbs_.clear();
+    for (auto v : shadowLayerViews_) if (v != VK_NULL_HANDLE) vkDestroyImageView(device_, v, nullptr);
+    shadowLayerViews_.clear();
+    if (shadowArrayView_ != VK_NULL_HANDLE) { vkDestroyImageView(device_, shadowArrayView_, nullptr); shadowArrayView_ = VK_NULL_HANDLE; }
+    if (shadowImage_ != VK_NULL_HANDLE) { vkDestroyImage(device_, shadowImage_, nullptr); shadowImage_ = VK_NULL_HANDLE; }
+    if (shadowMem_ != VK_NULL_HANDLE) { vkFreeMemory(device_, shadowMem_, nullptr); shadowMem_ = VK_NULL_HANDLE; }
+    for (auto& u : shadowUbos_) if (u.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, u);
+    shadowUbos_.clear();
+    shadowSets_.clear();
+    if (shadowDescPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, shadowDescPool_, nullptr); shadowDescPool_ = VK_NULL_HANDLE; }
+    shadowRes_ = shadowLayers_ = 0;
+    if (!keepPipeline) {
+        if (shadowPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, shadowPipeline_, nullptr); shadowPipeline_ = VK_NULL_HANDLE; }
+        if (shadowRenderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, shadowRenderPass_, nullptr); shadowRenderPass_ = VK_NULL_HANDLE; }
+        if (shadowSampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, shadowSampler_, nullptr); shadowSampler_ = VK_NULL_HANDLE; }
+    }
+}
+
+bool ModelRenderer::ensureShadowResources() {
+    if (shadowFailed_) return false;
+    const uint32_t n = (uint32_t)std::min<size_t>(sceneLights_.size(), MV_MAX_SCENE_LIGHTS);
+    if (n == 0) return false;
+    const uint32_t layers = n * 6;
+    if (shadowRes_ == kShadowRes && shadowLayers_ == layers && shadowPipeline_ != VK_NULL_HANDLE) return true;
+
+    auto fail = [&](const char* what) {
+        MV_ERR("ModelRenderer: shadow %s failed - scene lights render unshadowed\n", what);
+        shadowFailed_ = true;
+        return false;
+    };
+    vkQueueWaitIdle(queue_);   // the old image may still be referenced by set 2
+
+    if (shadowRenderPass_ == VK_NULL_HANDLE) {
+        VkAttachmentDescription att = {};
+        att.format = VK_FORMAT_D32_SFLOAT;
+        att.samples = VK_SAMPLE_COUNT_1_BIT;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub = {};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.pDepthStencilAttachment = &ref;
+        // In: the previous frame's pbr.frag reads must finish before the depth
+        // writes. Out: the writes must be visible to this frame's pbr.frag.
+        VkSubpassDependency deps[2] = {};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL; deps[0].dstSubpass = 0;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0; deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        rpci.attachmentCount = 1; rpci.pAttachments = &att;
+        rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+        rpci.dependencyCount = 2; rpci.pDependencies = deps;
+        if (vkCreateRenderPass(device_, &rpci, nullptr, &shadowRenderPass_) != VK_SUCCESS) return fail("render pass");
+    }
+    if (shadowPipeline_ == VK_NULL_HANDLE) {
+        // Depth only: pbr.vert (so skinning and morphs cast correctly), no
+        // fragment stage. Both faces drawn; slope-scaled bias against acne.
+        VkShaderModule vs = createShaderModule(device_, pbr_vert_data, sizeof(pbr_vert_data));
+        if (vs == VK_NULL_HANDLE) return fail("shader");
+        VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        st.stage = VK_SHADER_STAGE_VERTEX_BIT; st.module = vs; st.pName = "main";
+        VkVertexInputBindingDescription vib = {0, sizeof(ModelVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+        VkVertexInputAttributeDescription via[6] = {
+            {0, 0, VK_FORMAT_R32G32B32_SFLOAT,    (uint32_t)offsetof(ModelVertex, pos)},
+            {1, 0, VK_FORMAT_R32G32B32_SFLOAT,    (uint32_t)offsetof(ModelVertex, normal)},
+            {2, 0, VK_FORMAT_R32G32_SFLOAT,       (uint32_t)offsetof(ModelVertex, uv)},
+            {3, 0, VK_FORMAT_R16G16B16A16_UINT,   (uint32_t)offsetof(ModelVertex, joints0)},
+            {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(ModelVertex, weights0)},
+            {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, (uint32_t)offsetof(ModelVertex, tangent)},
+        };
+        VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vib;
+        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = via;
+        VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1; vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+        rs.depthBiasEnable = VK_TRUE; rs.depthBiasConstantFactor = 1.25f; rs.depthBiasSlopeFactor = 1.75f;
+        VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dyn = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dyn.dynamicStateCount = 2; dyn.pDynamicStates = dynStates;
+        VkGraphicsPipelineCreateInfo gpci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gpci.stageCount = 1; gpci.pStages = &st;
+        gpci.pVertexInputState = &vi; gpci.pInputAssemblyState = &ia; gpci.pViewportState = &vp;
+        gpci.pRasterizationState = &rs; gpci.pMultisampleState = &ms; gpci.pDepthStencilState = &ds;
+        gpci.pColorBlendState = &cb; gpci.pDynamicState = &dyn;
+        gpci.layout = pipelineLayout_; gpci.renderPass = shadowRenderPass_; gpci.subpass = 0;
+        VkResult pr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpci, nullptr, &shadowPipeline_);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        if (pr != VK_SUCCESS) return fail("pipeline");
+    }
+
+    // Image, views, per-face framebuffers / UBOs / set-0s at the new size.
+    destroyShadowResources(/*keepPipeline*/ true);
+    if (!createShadowImage(kShadowRes, layers)) return fail("image");
+    shadowFbs_.assign(layers, VK_NULL_HANDLE);
+    for (uint32_t l = 0; l < layers; ++l) {
+        VkFramebufferCreateInfo fbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fbci.renderPass = shadowRenderPass_; fbci.attachmentCount = 1; fbci.pAttachments = &shadowLayerViews_[l];
+        fbci.width = kShadowRes; fbci.height = kShadowRes; fbci.layers = 1;
+        if (vkCreateFramebuffer(device_, &fbci, nullptr, &shadowFbs_[l]) != VK_SUCCESS) return fail("framebuffer");
+    }
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, layers},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, layers}};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = layers; dpci.poolSizeCount = 2; dpci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(device_, &dpci, nullptr, &shadowDescPool_) != VK_SUCCESS) return fail("descriptor pool");
+    shadowUbos_.resize(layers);
+    shadowSets_.assign(layers, VK_NULL_HANDLE);
+    for (uint32_t l = 0; l < layers; ++l) {
+        VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsai.descriptorPool = shadowDescPool_; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsLayout_;
+        if (vkAllocateDescriptorSets(device_, &dsai, &shadowSets_[l]) != VK_SUCCESS) return fail("descriptor set");
+        shadowUbos_[l] = modelCreateBuffer(device_, physDevice_, sizeof(UniformBlock),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (shadowUbos_[l].buffer == VK_NULL_HANDLE) return fail("uniform buffer");
+        VkDescriptorBufferInfo ubi = {shadowUbos_[l].buffer, 0, sizeof(UniformBlock)};
+        VkDescriptorBufferInfo sbi = {materialExtBuffer_.buffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        w[0].dstSet = shadowSets_[l]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &ubi;
+        w[1].dstSet = shadowSets_[l]; w[1].dstBinding = 1; w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &sbi;
+        vkUpdateDescriptorSets(device_, materialExtBuffer_.buffer != VK_NULL_HANDLE ? 2 : 1, w, 0, nullptr);
+    }
+    writeIblSet();   // binding 5 now points at the real image
+    MV_LOG("ModelRenderer: scene-light shadows: %u light(s), %ux%u x %u layers, far %.2f m\n",
+           n, kShadowRes, kShadowRes, layers, shadowFar_);
+    return true;
+}
+
+void ModelRenderer::recordShadowPass(VkCommandBuffer cmd) {
+    const uint32_t n = shadowLayers_ / 6;
+    VkDeviceSize voff = 0;
+    for (uint32_t li = 0; li < n && li < sceneLights_.size(); ++li) {
+        const ModelLight& L = sceneLights_[li];
+        if (L.type == ModelLight::Type::Directional) continue;   // no cube for a distant light
+        const glm::vec3 pos(L.position[0], L.position[1], L.position[2]);
+        const glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(90.0f), 1.0f, kShadowNear, shadowFar_);
+        for (uint32_t f = 0; f < 6; ++f) {
+            const uint32_t layer = li * 6 + f;
+            const glm::vec3 fwd(kShadowFaceFwd[f][0], kShadowFaceFwd[f][1], kShadowFaceFwd[f][2]);
+            const glm::vec3 up(kShadowFaceUp[f][0], kShadowFaceUp[f][1], kShadowFaceUp[f][2]);
+            const glm::mat4 view = glm::lookAt(pos, pos + fwd, up);
+            UniformBlock ub{};
+            const glm::mat4 vp = proj * view;
+            std::memcpy(ub.viewProj, glm::value_ptr(vp), sizeof(ub.viewProj));
+            std::memcpy(ub.view, glm::value_ptr(view), sizeof(ub.view));
+            void* mapped = nullptr;
+            vkMapMemory(device_, shadowUbos_[layer].memory, 0, sizeof(UniformBlock), 0, &mapped);
+            std::memcpy(mapped, &ub, sizeof(UniformBlock));
+            vkUnmapMemory(device_, shadowUbos_[layer].memory);
+
+            VkClearValue clear; clear.depthStencil = {1.0f, 0};
+            VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            rpbi.renderPass = shadowRenderPass_; rpbi.framebuffer = shadowFbs_[layer];
+            rpbi.renderArea.extent = {kShadowRes, kShadowRes};
+            rpbi.clearValueCount = 1; rpbi.pClearValues = &clear;
+            vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+            VkViewport v = {0.0f, 0.0f, (float)kShadowRes, (float)kShadowRes, 0.0f, 1.0f};   // POSITIVE height
+            VkRect2D sc = {{0, 0}, {kShadowRes, kShadowRes}};
+            vkCmdSetViewport(cmd, 0, 1, &v);
+            vkCmdSetScissor(cmd, 0, 1, &sc);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &shadowSets_[layer], 0, nullptr);
+            if (defaultMatSet_ != VK_NULL_HANDLE)
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1, &defaultMatSet_, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_.buffer, &voff);
+            vkCmdBindIndexBuffer(cmd, indexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
+            for (const auto& p : primitives_) {
+                // Transmissive materials cast nothing: light passes through glass,
+                // and a light INSIDE a translucent body (the Playground's LED in
+                // meetMAT's head) must still reach the room.
+                if (p.material >= 0 && (size_t)p.material < matNoShadow_.size() && matNoShadow_[(size_t)p.material]) continue;
+                PushBlock pb{};
+                if (p.skin >= 0) {
+                    const glm::mat4 ident(1.0f);
+                    std::memcpy(pb.model, glm::value_ptr(ident), sizeof(pb.model));
+                    pb.mrParams[2] = 1.0f;
+                    pb.mrParams[3] = (float)p.jointBase;
+                } else {
+                    std::memcpy(pb.model, p.modelMatrix, sizeof(pb.model));
+                }
+                vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(PushBlock), &pb);
+                vkCmdDrawIndexed(cmd, p.indexCount, 1, p.firstIndex, 0, 0);
+            }
+            vkCmdEndRenderPass(cmd);
+        }
+    }
+}
+
 void ModelRenderer::cleanupModel() {
     if (vertexBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, vertexBuffer_);
     if (indexBuffer_.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, indexBuffer_);
@@ -3753,6 +4111,7 @@ void ModelRenderer::cleanup() {
         if (*v != VK_NULL_HANDLE) { vkDestroyPipeline(device_, *v, nullptr); *v = VK_NULL_HANDLE; }
     if (skyboxPipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, skyboxPipeline_, nullptr); skyboxPipeline_ = VK_NULL_HANDLE; }
     destroyMaskPass();   // before pipelineLayout_ — the mask pipeline shares it
+    destroyShadowResources(/*keepPipeline*/ false);   // likewise
     if (pipelineLayout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (dsLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, dsLayout_, nullptr); dsLayout_ = VK_NULL_HANDLE; }
     if (jointSetLayout_ != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device_, jointSetLayout_, nullptr); jointSetLayout_ = VK_NULL_HANDLE; }

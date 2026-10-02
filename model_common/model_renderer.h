@@ -730,6 +730,34 @@ private:
     std::vector<ModelLight> sceneLights_;   // the loaded model's lights (Scene mode)
     std::vector<ModelCamera> sceneCameras_; // the loaded model's cameras
 
+    // ── Scene-light shadows (LightingMode::Scene) ───────────────────────────
+    // One cube shadow map per light, its six faces as layers of ONE D32 2D-array
+    // image (layer = light*6 + face), sampled as a sampler2DArrayShadow (set 2,
+    // binding 5) -- no cube arrays, no dynamic sampler indexing (MoltenVK). The
+    // face matrices are built so pbr.frag recomputes face, UV and depth from the
+    // light->surface vector alone; shadowFaceBasis() here and in pbr.frag must
+    // agree. Rendered on load / lighting change, per frame only while animating.
+    bool createShadowImage(uint32_t res, uint32_t layers);   // image + views (+ clear)
+    bool ensureShadowResources();                            // size for sceneLights_
+    void recordShadowPass(VkCommandBuffer cmd);
+    void destroyShadowResources(bool keepPipeline);
+    VkImage        shadowImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory shadowMem_ = VK_NULL_HANDLE;
+    VkImageView    shadowArrayView_ = VK_NULL_HANDLE;
+    std::vector<VkImageView>   shadowLayerViews_;
+    std::vector<VkFramebuffer> shadowFbs_;
+    std::vector<ModelBuffer>   shadowUbos_;
+    std::vector<VkDescriptorSet> shadowSets_;
+    VkRenderPass     shadowRenderPass_ = VK_NULL_HANDLE;
+    VkPipeline       shadowPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool shadowDescPool_ = VK_NULL_HANDLE;
+    VkSampler        shadowSampler_ = VK_NULL_HANDLE;
+    uint32_t shadowRes_ = 0, shadowLayers_ = 0;   // current image (1x1x1 = the placeholder)
+    bool  shadowsDirty_ = true;
+    bool  shadowFailed_ = false;
+    float shadowFar_ = 10.0f;                      // metres, set per model
+    std::vector<char> matNoShadow_;                // per material: transmissive, casts none
+
     // ── Skinning (set = 3: joint-matrix SSBO, vertex stage) ──────────────
     VkDescriptorSetLayout jointSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool jointPool_ = VK_NULL_HANDLE;       // recreated per model

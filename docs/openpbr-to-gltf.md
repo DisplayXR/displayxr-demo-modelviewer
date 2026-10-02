@@ -205,12 +205,20 @@ irradiance J·shape/d². The renderer's light math is exact. A white Lambertian
 plane under one J = 1 rect light at 1 m reads **0.271**, and the expected
 1/π through PBR Neutral is 0.278.
 
-**Calibration.** One constant, 1.7, maps J/d² onto the reference stills. It's
-the median ratio, lights only, at `renderCam_CU_planeTOP` against the published
-top-down still. The spread is wide: paper wants about 2.3 and wood about 0.85,
-because Arnold's frame also carries bounce light, the dome (its HDRI is not in
-the asset repo) and shadows, none of which this renderer has. Revisit after
-shadows.
+**Shadows.** Each light renders a cube shadow map. Its six faces are layers of
+one depth array, sampled as `sampler2DArrayShadow`, so no cube arrays and no
+dynamic sampler indexing are needed. Transmissive materials cast nothing. That
+keeps the LED inside meetMAT's head lighting the room and lets light through
+glass. Arnold instead casts a coloured shadow through the bottle, which a
+depth-only map cannot.
+
+**Calibration.** One constant, **2.5**, maps J/d² onto the reference stills.
+It's the median reference/ours ratio over directly lit pixels (lights only,
+shadows on) at `renderCam_CU_planeTOP` against the published top-down still:
+2.54 there, 2.43 over all pixels (IQR 1.4–3.7). Shadowed regions read low
+because Arnold also carries bounce light and the dome, and this renderer has
+neither. Before shadows the same fit gave 1.7 with a far wider spread, because
+light leaking through the walls inflated the unshadowed render.
 
 **Measure captures as linear.** The atlas PNG holds linear values (this
 viewer's UNORM swapchain), not sRGB. Decoding them as sRGB, as I first did,

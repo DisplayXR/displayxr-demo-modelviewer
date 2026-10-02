@@ -65,6 +65,7 @@ layout(set = 0, binding = 0) uniform UBO {
 // baseboards, the jelly toy) came out white.
 float envScale() { return ubo.sceneInfo.y > 0.5 ? ubo.sceneInfo.z : 1.0; }
 
+
 layout(push_constant) uniform Push {
     mat4 model;
     vec4 baseColorFactor;  // linear (glTF factor)
@@ -176,6 +177,46 @@ vec3 sampleSceneColor(vec2 uv, float lod) {
 // Sheen directional albedo E(N·V, sheenRoughness) — see sheen_lut.frag. Lets
 // sheen redistribute energy rather than add it.
 layout(set = 2, binding = 4) uniform sampler2D   sheenLUT;
+// Scene-light shadow cubes: light i's six faces are layers i*6 .. i*6+5 of one
+// depth array (see ModelRenderer::recordShadowPass -- the face table and the
+// projection below must match it exactly).
+layout(set = 2, binding = 5) uniform sampler2DArrayShadow sceneShadowMap;
+
+// Visibility of scene light `li` (at lightPos) from surface point P, normal Ng.
+// l3 = (shadowed, near, far, radius). Face = major axis of the light->P vector,
+// order +X -X +Y -Y +Z -Z; per face, s = normalize(cross(fwd, up)), u =
+// cross(s, fwd), uv = (d.s, d.u)/(d.fwd)*0.5+0.5, depth = perspectiveRH_ZO's
+// far*(z - near)/(z*(far - near)). Normal offset scales with the texel's world
+// size at that distance; 4 taps of the hardware 2x2 compare.
+float sceneShadow(int li, vec3 lightPos, vec3 P, vec3 Ng, vec4 l3) {
+    if (l3.x < 0.5) return 1.0;
+    float texel = 2.0 / float(textureSize(sceneShadowMap, 0).x);   // NDC units per texel
+    vec3 d0 = P - lightPos;
+    float dist0 = length(d0);
+    vec3 Pb = P + Ng * (1.5 * texel * dist0);
+    vec3 d = Pb - lightPos;
+    vec3 ad = abs(d);
+    int face;
+    if (ad.x >= ad.y && ad.x >= ad.z) face = d.x > 0.0 ? 0 : 1;
+    else if (ad.y >= ad.z)            face = d.y > 0.0 ? 2 : 3;
+    else                              face = d.z > 0.0 ? 4 : 5;
+    const vec3 FWD[6] = vec3[6](vec3(1,0,0), vec3(-1,0,0), vec3(0,1,0), vec3(0,-1,0), vec3(0,0,1), vec3(0,0,-1));
+    const vec3 UP[6]  = vec3[6](vec3(0,1,0), vec3(0,1,0),  vec3(0,0,1), vec3(0,0,-1), vec3(0,1,0), vec3(0,1,0));
+    vec3 fw = FWD[face];
+    vec3 sx = normalize(cross(fw, UP[face]));
+    vec3 ux = cross(sx, fw);
+    float z = max(dot(d, fw), 1e-5);
+    vec2 uv = vec2(dot(d, sx), dot(d, ux)) / z * 0.5 + 0.5;
+    float n = l3.y, f = l3.z;
+    float depth = f * (z - n) / (z * (f - n));
+    float layer = float(li * 6 + face);
+    vec2 o = vec2(0.75 * texel * 0.5);
+    float v = texture(sceneShadowMap, vec4(uv + vec2(-o.x, -o.y), layer, depth))
+            + texture(sceneShadowMap, vec4(uv + vec2( o.x, -o.y), layer, depth))
+            + texture(sceneShadowMap, vec4(uv + vec2(-o.x,  o.y), layer, depth))
+            + texture(sceneShadowMap, vec4(uv + vec2( o.x,  o.y), layer, depth));
+    return v * 0.25;
+}
 
 layout(location = 0) out vec4 outColor;
 // Scene-linear twin of outColor: the same shaded radiance BEFORE exposure, the
@@ -651,7 +692,7 @@ void main() {
     // Scene lights: the file's own lights, through the same base lobe as the
     // studio rig. Irradiance = J * shape / d^2 (see ModelLight): shape is 1 for
     // a point, the cosine of a one-sided rect/disk emitter, or the KHR spot cone.
-    // Unshadowed for now -- a light outside an enclosure reaches in through it.
+    // Shadowed through per-light cube maps (sceneShadow); distant lights are not.
     bool sceneOn = ubo.sceneInfo.y > 0.5;
     vec3 sceneDiffuse = vec3(0.0);   // what transmission must take back out
     vec3 sceneIrr = vec3(0.0);       // sum E * N.L -- what the scatter lobe takes in
@@ -662,6 +703,7 @@ void main() {
             vec4 lp = ubo.sceneLights[li * MV_SCENE_LIGHT_VEC4S + 0];
             vec4 la = ubo.sceneLights[li * MV_SCENE_LIGHT_VEC4S + 1];
             vec4 lc = ubo.sceneLights[li * MV_SCENE_LIGHT_VEC4S + 2];
+            vec4 l3 = ubo.sceneLights[li * MV_SCENE_LIGHT_VEC4S + 3];
             int ltype = int(lp.w + 0.5);
             vec3 Ls;
             float att;
@@ -681,6 +723,8 @@ void main() {
                     att *= t * t;
                 }
             }
+            if (ltype != MV_LIGHT_DIRECTIONAL && att > 0.0)
+                att *= sceneShadow(li, lp.xyz, inWorldPos, normalize(inNormal), l3);
             vec3 E = lc.rgb * (att * ubo.sceneInfo.w);
             direct += studioDirectLobe(N, V, Ls, albedo, f0, f90, a, metallic,
                                        diffuseRoughness, ndotv) * E;
