@@ -162,6 +162,7 @@ static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
 static float g_fitVHeight   = kDefaultVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
 static bool  g_fitValid     = false;
+static float g_displayHeightM = 0.0f;   // physical panel height (for ApplySceneCamera)
 
 // ============================================================================
 // Globals
@@ -2078,6 +2079,37 @@ static void ApplyAutoFitForLoadedScene() {
     g_input.pitch = 0.0f;
     g_input.viewParams.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kDefaultVirtualDisplayHeightM;
     g_input.viewParams.scaleFactor = 1.0f;
+
+    // DXR_MODELVIEWER_CAMERA=<name|index> starts AT one of the file's cameras
+    // (USD GeomCamera) instead of the auto-fit -- the viewpoint of the file's own
+    // reference renders. The rig is display-centric, so the camera becomes a
+    // virtual display focusDistance down its view axis, sized so the physical
+    // viewer (nominalViewerZ in front of a displayHeight panel) scales onto the
+    // camera's position: vHeight = focusDistance * displayHeight / nominalViewerZ.
+    // Roll is not representable (the rig has yaw + pitch) and the field of view
+    // is the panel's -- from the same eye, a crop of the authored frame.
+    if (const char* want = getenv("DXR_MODELVIEWER_CAMERA"); want && want[0]) {
+        const auto& cams = g_modelRenderer.sceneCameras();
+        const ModelCamera* pick = nullptr;
+        for (const auto& c : cams) if (c.name == want) pick = &c;
+        if (!pick) { char* e = nullptr; long i = strtol(want, &e, 10);
+                     if (e && !*e && i >= 0 && (size_t)i < cams.size()) pick = &cams[(size_t)i]; }
+        if (pick && g_displayHeightM > 0.0f && g_input.nominalViewerZ > 0.0f) {
+            const float D = pick->focusDistance;
+            g_input.cameraPosX = pick->position[0] + pick->forward[0] * D;
+            g_input.cameraPosY = pick->position[1] + pick->forward[1] * D;
+            g_input.cameraPosZ = pick->position[2] + pick->forward[2] * D;
+            g_input.yaw   = atan2f(-pick->forward[0], -pick->forward[2]);
+            g_input.pitch = asinf(fmaxf(-1.0f, fminf(1.0f, pick->forward[1])));
+            g_input.viewParams.virtualDisplayHeight = D * g_displayHeightM / g_input.nominalViewerZ;
+            g_input.animateEnabled = false;   // hold the authored viewpoint
+            LOG_INFO("Scene camera '%s': eye (%.3f, %.3f, %.3f) focus %.3f m vHeight %.3f",
+                     pick->name.c_str(), pick->position[0], pick->position[1], pick->position[2],
+                     D, g_input.viewParams.virtualDisplayHeight);
+        } else {
+            LOG_WARN("DXR_MODELVIEWER_CAMERA='%s': no such camera (%zu in file)", want, cams.size());
+        }
+    }
     // Treat scene load as a fresh user interaction so the auto-orbit idle
     // timer restarts. Without this, an asset loaded after the 10s idle
     // threshold starts rotating immediately on first display.
@@ -2280,6 +2312,7 @@ int main() {
 
     g_input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
     g_input.nominalViewerZ = xr.nominalViewerZ;
+    g_displayHeightM = xr.displayHeightM;
     g_input.renderingModeCount = xr.renderingModeCount;
     // Align the runtime's active rendering mode with the app's default
     // (currentRenderingMode = 1, the first 3D mode) at startup. The sim display

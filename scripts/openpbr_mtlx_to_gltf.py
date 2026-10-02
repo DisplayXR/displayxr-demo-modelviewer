@@ -57,6 +57,9 @@ tile, and a material whose meshes span tiles is baked once per tile
 GeomSubsets: each subset's faces take its own material; unclaimed faces take the
 mesh binding. A group may be an absolute path -- "/World" converts the scene.
 
+Lights: UsdLux lights under a group are written as KHR_lights_punctual (see
+usd_lights()), which the viewer draws in its Scene lighting mode.
+
 Known limits: colorcorrect / ramp / heighttonormal
 nodes pass their input through (warned); textured specular weights, and a
 textured transmission weight combined with subsurface, are averaged (warned). Catmull-Clark meshes export their
@@ -651,7 +654,58 @@ def group_meshes(stage, root, xf, mpu, exclude=()):
             if r: out.setdefault((m.GetPrim().GetName(), r[4], r[5]), []).append((str(prim.GetPath()), r))
     return out
 
-def write_group(groups, out, mdir, mpu, a):
+def usd_lights(stage, root, xf, mpu):
+    """UsdLux lights under `root` -> KHR_lights_punctual-ready dicts (metres).
+
+    Same unit mapping as the viewer's native USD loader (ModelLight in
+    model_common/model_loader.h): intensity J such that irradiance =
+    J * shape / d^2. normalize=1 divides emission by area, so a small light is
+    a point emitter of J = I*2^E*mpu^2 (rect/disk) or I*2^E*mpu^2/4 (sphere);
+    normalize=0 multiplies by the projected area in m^2. glTF has no area
+    light: a rect/disk becomes a 90-degree spot (falloff cos^2 instead of a
+    one-sided emitter's cos -- the native loader keeps the true rect). Dome
+    lights are skipped (no glTF equivalent)."""
+    from pxr import Usd, UsdGeom, UsdLux, Gf
+    out = []
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(root)):
+        if not prim.HasAPI(UsdLux.LightAPI): continue
+        if UsdGeom.Imageable(prim).ComputeVisibility() == "invisible": continue
+        t = prim.GetTypeName()
+        if t not in ("SphereLight", "RectLight", "DiskLight", "DistantLight"):
+            if t != "DomeLight": warn(f"{prim.GetPath()}: {t} not exported")
+            continue
+        L = UsdLux.LightAPI(prim)
+        get = lambda n, d: (prim.GetAttribute("inputs:" + n).Get() if prim.GetAttribute("inputs:" + n) and prim.GetAttribute("inputs:" + n).Get() is not None else d)
+        E = float(get("intensity", 1.0)) * 2.0 ** float(get("exposure", 0.0))
+        norm = bool(get("normalize", False))
+        M = xf.GetLocalToWorldTransform(prim)
+        sx = M.TransformDir(Gf.Vec3d(1, 0, 0)).GetLength(); sy = M.TransformDir(Gf.Vec3d(0, 1, 0)).GetLength()
+        axis = M.TransformDir(Gf.Vec3d(0, 0, -1)).GetNormalized()
+        pos = M.ExtractTranslation() * mpu
+        if t == "DistantLight":
+            typ, J = "directional", E
+        elif t == "RectLight":
+            w = float(get("width", 1.0)) * sx * mpu; h = float(get("height", 1.0)) * sy * mpu
+            typ, J = "spot", (E * mpu * mpu if norm else E * w * h)
+        elif t == "DiskLight":
+            r = float(get("radius", 0.5)) * sx * mpu
+            typ, J = "spot", (E * mpu * mpu if norm else E * np.pi * r * r)
+        else:
+            r = float(get("radius", 0.5)) * sx * mpu
+            typ, J = "point", (E * mpu * mpu / 4.0 if norm else E * np.pi * r * r)
+        out.append({"name": prim.GetName(), "type": typ, "intensity": float(J),
+                    "color": [float(c) for c in get("color", (1, 1, 1))],
+                    "pos": np.array([pos[0], pos[1], pos[2]]), "axis": np.array([axis[0], axis[1], axis[2]])})
+    return out
+
+def quat_from_neg_z(a):
+    """Quaternion (x,y,z,w) rotating local -Z onto unit vector a."""
+    v = np.array([0.0, 0.0, -1.0]); d = float(np.dot(v, a))
+    if d < -0.999999: return [0.0, 1.0, 0.0, 0.0]     # antiparallel: 180 deg about Y
+    c = np.cross(v, a); q = np.array([c[0], c[1], c[2], 1.0 + d])
+    return (q / np.linalg.norm(q)).tolist()
+
+def write_group(groups, out, mdir, mpu, a, lights=()):
     glb = GLB()
     glb.jpeg_quality = a.jpeg_quality
     glb.g["asset"]["copyright"] = a.copyright
@@ -694,6 +748,21 @@ def write_group(groups, out, mdir, mpu, a):
         glb.g["nodes"].append({"name": mname, "mesh": len(glb.g["meshes"]) - 1})
         glb.g["scenes"][0]["nodes"].append(len(glb.g["nodes"]) - 1)
         print(f"  {mname:14s} {len(items):3d} meshes {len(T):7d} tris  {sorted(glb.g['materials'][mi].get('extensions', {}))}")
+    if lights:
+        ext = []
+        for L in lights:
+            body = {"name": L["name"], "type": L["type"], "intensity": L["intensity"], "color": L["color"]}
+            if L["type"] == "spot":
+                body["spot"] = {"innerConeAngle": 0.0, "outerConeAngle": float(np.pi / 2)}
+            ext.append(body)
+            glb.g["nodes"].append({"name": L["name"],
+                                   "translation": (L["pos"] - centre).tolist(),
+                                   "rotation": quat_from_neg_z(L["axis"]),
+                                   "extensions": {"KHR_lights_punctual": {"light": len(ext) - 1}}})
+            glb.g["scenes"][0]["nodes"].append(len(glb.g["nodes"]) - 1)
+        glb.g.setdefault("extensions", {})["KHR_lights_punctual"] = {"lights": ext}
+        glb.used.add("KHR_lights_punctual")
+        print(f"  {len(lights)} light(s) -> KHR_lights_punctual")
     glb.write(out)
     print(f"  -> {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
 
@@ -730,7 +799,8 @@ def main():
         groups = group_meshes(stage, root, xf, mpu, set(filter(None, a.exclude.split(","))))
         if not groups: warn(f"{grp}: no meshes"); continue
         stem = root.rstrip("/").split("/")[-1].replace("_grp", "")
-        write_group(groups, os.path.join(a.outdir, stem + ".glb"), mdir, mpu, a)
+        write_group(groups, os.path.join(a.outdir, stem + ".glb"), mdir, mpu, a,
+                    usd_lights(stage, root, xf, mpu))
     print(f"{len(WARN)} warnings")
 
 if __name__ == "__main__":

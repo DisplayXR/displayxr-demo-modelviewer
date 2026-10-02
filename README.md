@@ -402,6 +402,7 @@ to "why does the model change materials when the page hands it to the viewer":
 | `room` | **The storefront page's default.** three.js's `RoomEnvironment` — a box lit by one point light, six unlit furniture boxes and six emissive panels — which the page bakes to a PMREM and uses as its ONLY light source. This viewer reproduces it analytically (`model_common/shaders/room.glsl`) and feeds it through its own IBL bake, so the same panel reflections travel across a metal body. **No punctual lights at all, no tone curve, 0 EV**, matching the page's `NoToneMapping` default. Entering or leaving the mode rebakes the IBL cubes — a ~0.25 s hitch, once (the second containing it renders 46 frames instead of 61). In an opaque window the background becomes the room, blurred, because it is what the model reflects; transparent mode draws no background at all, exactly as before. |
 | `studio` | The three-point rig the DisplayXR storefront's inline-3D tile lights the same model with (three.js: key 2.2, fill 0.7, rim 1.0, plus a 0.6 hemisphere ambient), **no tone curve, 0 EV** — matching the page, which runs three.js at its `NoToneMapping` default. The sky IBL drops to a 0.15 residual, because the page has no environment map at all; not to 0, because a metal with no environment goes pure black wherever the three lights miss, and a black body carries no parallax detail for the panel to show. |
 | `none` | No lights; the IBL ambient only. |
+| `scene` | **The lights the FILE carries** — USD `UsdLux` (sphere, rect, disk, distant) or glTF `KHR_lights_punctual`. Selected automatically when a model carries lights, and in the `L` cycle only while it does. The sky key light goes off and the sky (IBL and backdrop alike) drops to a 0.10 fill. **PBR Neutral, 0 EV.** Lights are unshadowed for now, and a USD dome light is not imported. Intensities follow `UsdLux` units (see `ModelLight` in `model_common/model_loader.h`) through one calibration constant set against the OpenPBR Shader Playground's reference stills — details in [docs/openpbr-to-gltf.md](docs/openpbr-to-gltf.md#scene-lights-and-cameras). |
 
 Metal is what this is for. Three sharp lights on an otherwise unlit body read
 as metal; a smooth sky reflection over the whole body reads as matte. On
@@ -445,6 +446,16 @@ deliberately sampled from a high roughness mip: a sharp, high-contrast sky sits
 far from the display's zero-disparity plane, where it causes lightfield
 cross-talk. A soft background stays comfortable.
 
+**Scene cameras (macOS).** `DXR_MODELVIEWER_CAMERA=<name|index>` starts at one
+of the file's own cameras (USD `GeomCamera`) instead of the auto-fit — the
+viewpoint of the file's reference renders. The virtual display is placed the
+camera's `focusDistance` down its view axis and sized so the physical viewer
+lands on the camera; the field of view stays the panel's (from the same eye, a
+crop of the authored frame) and roll is dropped. `DXR_MODELVIEWER_MODEL=<path>`
+picks the startup model. `DXR_MODELVIEWER_SCENE_LIGHT_SCALE` /
+`DXR_MODELVIEWER_SCENE_AMBIENT` override the `scene` mode's two constants (they
+exist to refit them).
+
 **Deterministic capture.** Set `DXR_MODELVIEWER_DETERMINISTIC=1` to pin the idle
 auto-orbit off at startup. Reference renders are only comparable if nothing
 moves between them, and the viewer starts slowly rotating the scene ~10 s after
@@ -486,7 +497,7 @@ calibration, brightness, gamut and 3D cross-talk are separate concerns.
 | Drag-and-drop (Windows, macOS) | Load a supported model, or an `.hdr` environment, dropped onto the window |
 | `[` / `]` | Exposure down / up, in quarter stops |
 | `G` | Cycle the tone curve (PBR Neutral → ACES → none) |
-| `L` | Cycle the lighting mode (sky → studio → room → none) — see *Environment and grading* |
+| `L` | Cycle the lighting mode (sky → studio → room → none → scene, the last only for a model that carries lights) — see *Environment and grading* |
 | Space | Reset pose, zoom, depth |
 | Tab | Toggle HUD |
 | Ctrl+T | Toggle transparent background (desktop see-through; Windows only) |

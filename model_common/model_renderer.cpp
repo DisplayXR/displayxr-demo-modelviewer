@@ -1763,14 +1763,18 @@ const char* ModelRenderer::lightingModeName() const {
         case LightingMode::Studio: return "studio";
         case LightingMode::Room:   return "room";
         case LightingMode::NoLights:   return "none";
+        case LightingMode::Scene:  return "scene";
         default:                   return "sky";
     }
 }
 
 void ModelRenderer::cycleLightingMode() {
+    // Scene joins the cycle only while the model carries lights.
+    const LightingMode afterNone = sceneLights_.empty() ? LightingMode::Sky : LightingMode::Scene;
     setLightingMode(lightingMode_ == LightingMode::Sky    ? LightingMode::Studio
                   : lightingMode_ == LightingMode::Studio ? LightingMode::Room
                   : lightingMode_ == LightingMode::Room   ? LightingMode::NoLights
+                  : lightingMode_ == LightingMode::NoLights ? afterNone
                                                           : LightingMode::Sky);
 }
 
@@ -1779,6 +1783,7 @@ bool ModelRenderer::parseLightingMode(const std::string& env, LightingMode& out)
     if (env == "sky")    { out = LightingMode::Sky;    return true; }
     if (env == "room")   { out = LightingMode::Room;   return true; }
     if (env == "none")   { out = LightingMode::NoLights;   return true; }
+    if (env == "scene")  { out = LightingMode::Scene;  return true; }
     return false;
 }
 
@@ -2026,6 +2031,15 @@ bool ModelRenderer::loadModel(const char* gltfPath) {
     if (!finalizeModel(md)) return false;
     loadedModelPath_ = gltfPath;
     unsupportedExtensions_ = md.unsupportedExtensions;
+    sceneLights_ = md.lights;
+    sceneCameras_ = md.cameras;
+    if (sceneLights_.size() > MV_MAX_SCENE_LIGHTS)
+        MV_LOG("ModelRenderer: %zu scene lights - drawing the first %d\n",
+               sceneLights_.size(), MV_MAX_SCENE_LIGHTS);
+    // A file that carries lights is lit by them; leaving Scene on for a model
+    // without any would light it with nothing.
+    if (!sceneLights_.empty()) setLightingMode(LightingMode::Scene);
+    else if (lightingMode_ == LightingMode::Scene) setLightingMode(LightingMode::Sky);
     return true;
 }
 
@@ -2085,6 +2099,41 @@ bool ModelRenderer::pickSurface(const float[3], const float[3], float[3], float)
 
 float ModelRenderer::findBestYaw(const float[3], const float[3], uint32_t) const {
     return 0.0f;  // glTF models are authored front-facing.
+}
+
+// Scene-mode calibration. kSceneLightScale converts the file's J/d^2 (see
+// ModelLight) into this renderer's radiance units; one constant for every
+// light. The light math itself is exact at 1.0 -- an analytic check (white
+// Lambertian plane, one normalized rect light, J = 1 at 1 m) reads 0.271
+// against the expected 1/pi through PBR Neutral, 0.278. 1.7 is the median
+// reference/ours ratio, lights only, at the OpenPBR Shader Playground's
+// renderCam_CU_planeTOP against its published still: Arnold's frame also
+// carries bounce light, the (unshipped) dome and shadows, which this renderer
+// does not, so the spread is wide (paper wants ~2.3, wood ~0.85) and one
+// constant is the honest summary. Revisit once shadows land.
+// kSceneAmbientScale dims the sky IBL to a neutral fill: a scene that brings
+// its own lights is not also lit by an outdoor sky, and its dome light (when it
+// has one) is not imported yet.
+static constexpr float kSceneLightScale   = 1.7f;
+static constexpr float kSceneAmbientScale = 0.10f;
+
+// DXR_MODELVIEWER_SCENE_LIGHT_SCALE / _SCENE_AMBIENT override the two constants
+// above, read once. They exist to FIT them: render lights-only and ambient-only
+// at a reference camera, then solve ref ~= k*lights + c*ambient.
+static float sceneEnvFloat(const char* name, float dflt) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return dflt;
+    char* end = nullptr;
+    float v = std::strtof(e, &end);
+    return (end && end != e && v >= 0.0f) ? v : dflt;
+}
+static float sceneLightScale() {
+    static const float v = sceneEnvFloat("DXR_MODELVIEWER_SCENE_LIGHT_SCALE", kSceneLightScale);
+    return v;
+}
+static float sceneAmbientScale() {
+    static const float v = sceneEnvFloat("DXR_MODELVIEWER_SCENE_AMBIENT", kSceneAmbientScale);
+    return v;
 }
 
 void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
@@ -2148,8 +2197,11 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     // key light off exactly the way None does - leaving it on would add a sun
     // the page does not have, on top of an environment that already lights the
     // model.
+    // Scene is lit by the file's own lights: the analytic sun would be a light
+    // the scene does not have, so it goes off as in Room.
     ub.tone[2] = (lightingMode_ == LightingMode::NoLights
-                  || lightingMode_ == LightingMode::Room || envIsHdri_) ? 0.0f : 1.0f;
+                  || lightingMode_ == LightingMode::Room
+                  || lightingMode_ == LightingMode::Scene || envIsHdri_) ? 0.0f : 1.0f;
     // Probe SELECT, not a bool: 1 = transmission (#75), 2 = facing (#98). One
     // lane, one meaning — init() makes the two mutually exclusive.
     ub.tone[3] = facingProbe_ ? 2.0f : (transmissionProbe_ ? 1.0f : 0.0f);
@@ -2171,6 +2223,30 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.hemiGround[0] = kStudioHemiGround[0];
     ub.hemiGround[1] = kStudioHemiGround[1];
     ub.hemiGround[2] = kStudioHemiGround[2];
+
+    // Scene lights. Written unconditionally like the studio rig; the shader
+    // reads them only when sceneInfo.y is 1.
+    {
+        const bool sceneOn = lightingMode_ == LightingMode::Scene && !sceneLights_.empty();
+        const int n = (int)std::min<size_t>(sceneLights_.size(), MV_MAX_SCENE_LIGHTS);
+        ub.sceneInfo[0] = (float)n;
+        ub.sceneInfo[1] = sceneOn ? 1.0f : 0.0f;
+        ub.sceneInfo[2] = sceneAmbientScale();
+        ub.sceneInfo[3] = sceneLightScale();
+        for (int i = 0; i < n; ++i) {
+            const ModelLight& L = sceneLights_[(size_t)i];
+            float* v = ub.sceneLights + (size_t)i * MV_SCENE_LIGHT_VEC4S * 4;
+            int type = MV_LIGHT_POINT;
+            if (L.type == ModelLight::Type::Spot) type = MV_LIGHT_SPOT;
+            else if (L.type == ModelLight::Type::Directional) type = MV_LIGHT_DIRECTIONAL;
+            else if (L.type == ModelLight::Type::Rect) type = MV_LIGHT_RECT;
+            v[0] = L.position[0]; v[1] = L.position[1]; v[2] = L.position[2]; v[3] = (float)type;
+            v[4] = L.axis[0]; v[5] = L.axis[1]; v[6] = L.axis[2]; v[7] = L.cosOuter;
+            for (int c = 0; c < 3; ++c) v[8 + c] = L.color[c] * L.intensity;
+            v[11] = L.cosInner;
+            v[15] = L.radius;
+        }
+    }
     // DXR_MODELVIEWER_KULLA_CONTY=1 switches the scatter lobe to the spec's
     // multi->single scatter albedo remap, so the two can be MEASURED against the
     // conformance references rather than argued about. See pbr.frag.

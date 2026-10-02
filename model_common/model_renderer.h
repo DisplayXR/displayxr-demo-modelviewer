@@ -30,6 +30,7 @@
 // material SSBO's stride is a function of both numbers, so they cannot be
 // allowed to be written down twice. See the file's header and issue #81.
 #include "shaders/material_slots.glsl"
+#include "shaders/scene_lights.glsl"
 
 struct ModelRenderer {
     bool init(VkInstance instance,
@@ -103,7 +104,11 @@ struct ModelRenderer {
     // Studio/NoLights would silently rewrite any hand-set integer in a capture
     // script. Cycle order is sky -> studio -> room -> none (see
     // cycleLightingMode), which is not the enumerator order.
-    enum class LightingMode { Sky = 0, Studio = 1, NoLights = 2, Room = 3 };
+    // Scene lights the model with the lights the FILE carries (ModelData::lights;
+    // USD UsdLux, glTF KHR_lights_punctual) and dims the sky to a neutral fill.
+    // A model that carries lights selects it on load; one that does not leaves
+    // it for Sky. It is in the L cycle only while such a model is loaded.
+    enum class LightingMode { Sky = 0, Studio = 1, NoLights = 2, Room = 3, Scene = 4 };
     void         setLightingMode(LightingMode m);
     LightingMode lightingMode() const { return lightingMode_; }
     const char*  lightingModeName() const;
@@ -126,6 +131,8 @@ struct ModelRenderer {
     const std::vector<std::string>& unsupportedExtensions() const {
         return unsupportedExtensions_;
     }
+    // Cameras the loaded file carries (USD GeomCamera); empty for most assets.
+    const std::vector<ModelCamera>& sceneCameras() const { return sceneCameras_; }
     // "clearcoat, sheen, +3 more" — compact enough for a HUD line. Empty string
     // when the asset uses nothing we lack. Strips the "KHR_materials_" prefix.
     std::string unsupportedExtensionsSummary(size_t maxNamed = 2) const;
@@ -347,6 +354,10 @@ private:
         float studioRim[4];
         float hemiSky[4];     // rgb linear
         float hemiGround[4];  // rgb linear
+        // ── Scene lights (LightingMode::Scene); layout in shaders/scene_lights.glsl.
+        float sceneInfo[4];   // x = light count, y = Scene on, z = ambient scale,
+                              // w = calibration: renderer radiance per unit of J/d^2
+        float sceneLights[MV_MAX_SCENE_LIGHTS * MV_SCENE_LIGHT_VEC4S * 4];
     };
 
     bool createRenderTargets();
@@ -716,6 +727,8 @@ private:
     // Carried over from the loaded ModelData; cleared on every model load so it
     // always describes the asset currently on screen.
     std::vector<std::string> unsupportedExtensions_;
+    std::vector<ModelLight> sceneLights_;   // the loaded model's lights (Scene mode)
+    std::vector<ModelCamera> sceneCameras_; // the loaded model's cameras
 
     // ── Skinning (set = 3: joint-matrix SSBO, vertex stage) ──────────────
     VkDescriptorSetLayout jointSetLayout_ = VK_NULL_HANDLE;

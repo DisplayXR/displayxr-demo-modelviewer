@@ -630,6 +630,82 @@ bool model_load_usd(const char* path, ModelData& out) {
         if (mp.indexCount > 0) out.primitives.push_back(mp);
     }
 
+    // ── lights (UsdLux) → ModelLight; units per ModelLight in model_loader.h ──
+    size_t skippedLights = 0;
+    for (const tt::RenderLight& L : scene.lights) {
+        if (composed && !isVisible(stage, L.abs_path)) continue;
+        using LT = tt::RenderLight::Type;
+        if (L.type == LT::Dome || L.type == LT::Geometry || L.type == LT::Portal) { ++skippedLights; continue; }
+        const auto& m = L.transform.m;   // row-vector convention, as the node matrices
+        auto rowLen = [&](int r) { return std::sqrt(m[r][0] * m[r][0] + m[r][1] * m[r][1] + m[r][2] * m[r][2]); };
+        ModelLight ml;
+        ml.name = L.name;
+        for (int a = 0; a < 3; ++a) ml.position[a] = (float)m[3][a] * mpu;
+        const float zl = rowLen(2);
+        for (int a = 0; a < 3; ++a) ml.axis[a] = zl > 0 ? -(float)m[2][a] / zl : (a == 2 ? -1.0f : 0.0f);  // local -Z
+        for (int a = 0; a < 3; ++a) ml.color[a] = L.color[a];
+        if (L.enableColorTemperature)
+            std::fprintf(stderr, "[model_loader/usd] light %s: colorTemperature not applied\n", L.name.c_str());
+        const float E = L.intensity * std::exp2(L.exposure);
+        const float sx = rowLen(0), sy = rowLen(1), mpu2 = mpu * mpu;
+        switch (L.type) {
+            case LT::Distant:
+                ml.type = ModelLight::Type::Directional;
+                ml.intensity = E;
+                break;
+            case LT::Rect:
+                ml.type = ModelLight::Type::Rect;
+                ml.intensity = L.normalize ? E * mpu2 : E * (L.width * sx * mpu) * (L.height * sy * mpu);
+                break;
+            case LT::Disk:
+                ml.type = ModelLight::Type::Rect;   // one-sided cosine emitter, like rect
+                ml.intensity = L.normalize ? E * mpu2 : E * 3.14159265f * std::pow(L.radius * sx * mpu, 2.0f);
+                break;
+            default: {   // Point, Sphere, Cylinder (as a point)
+                ml.type = ModelLight::Type::Point;
+                const float r = L.radius * sx * mpu;
+                ml.radius = r;
+                ml.intensity = L.normalize ? E * mpu2 / 4.0f : E * 3.14159265f * r * r;
+                break;
+            }
+        }
+        std::fprintf(stderr, "[model_loader/usd] light %s: type %d pos (%.3f, %.3f, %.3f) m axis (%.2f, %.2f, %.2f) "
+                     "J %.4g (I %.4g, EV %.2f, normalize %d, scale %.3f x %.3f)\n",
+                     ml.name.c_str(), (int)ml.type, ml.position[0], ml.position[1], ml.position[2],
+                     ml.axis[0], ml.axis[1], ml.axis[2], ml.intensity, L.intensity, L.exposure,
+                     (int)L.normalize, sx, sy);
+        out.lights.push_back(ml);
+    }
+    if (!scene.lights.empty())
+        std::fprintf(stderr, "[model_loader/usd] %zu light(s) imported, %zu skipped (dome/geometry/portal)\n",
+                     out.lights.size(), skippedLights);
+
+    // ── cameras: world transform from tydra's node tree, focusDistance from the stage ──
+    std::function<void(const tt::Node&)> camWalk = [&](const tt::Node& n) {
+        if (n.category == tt::NodeCategory::Camera && n.id >= 0 && (size_t)n.id < scene.cameras.size()) {
+            const tt::RenderCamera& rc = scene.cameras[(size_t)n.id];
+            const auto& m = n.global_matrix.m;
+            ModelCamera mc;
+            mc.name = rc.name;
+            auto unit = [&](int r, float* o, float sign) {
+                double l = std::sqrt(m[r][0] * m[r][0] + m[r][1] * m[r][1] + m[r][2] * m[r][2]);
+                for (int a = 0; a < 3; ++a) o[a] = l > 0 ? (float)(sign * m[r][a] / l) : 0.0f;
+            };
+            for (int a = 0; a < 3; ++a) mc.position[a] = (float)m[3][a] * mpu;
+            unit(2, mc.forward, -1.0f);   // cameras look down local -Z
+            unit(1, mc.up, 1.0f);
+            mc.vfov = 2.0f * std::atan(0.5f * rc.verticalAperture / std::max(rc.focalLength, 1e-3f));
+            if (const tinyusdz::Prim* p = findPrim(stage, rc.abs_path))
+                if (const auto* gc = p->as<tinyusdz::GeomCamera>()) {
+                    float fd = 0.0f;
+                    if (gc->focusDistance.get_value().get_scalar(&fd) && fd > 0) mc.focusDistance = fd * mpu;
+                }
+            out.cameras.push_back(mc);
+        }
+        for (const auto& c : n.children) camWalk(c);
+    };
+    for (const auto& n : scene.nodes) camWalk(n);
+
     out.primitiveCount = (uint32_t)out.primitives.size();
     if (out.primitiveCount == 0 || out.vertices.empty()) {
         std::fprintf(stderr, "[model_loader/usd] '%s': no drawable triangle geometry\n", path);

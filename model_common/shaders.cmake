@@ -39,4 +39,6 @@ set(MV_SHADER_INCLUDE_NAMES
     # material SSBO's layout come from it, so a stale SPIR-V here would be a
     # stride mismatch — see #81 — not merely an out-of-date constant.
     material_slots.glsl
+    # Also #included by model_renderer.h: the scene-light UBO tail's size.
+    scene_lights.glsl
 )

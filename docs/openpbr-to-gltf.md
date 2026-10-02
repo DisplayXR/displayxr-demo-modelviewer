@@ -187,3 +187,39 @@ now apply those overrides, with USD's rule that a connection authored in the
 `.mtlx` beats a stronger layer's value). And it overrides a `place2d` node on
 the walls that no `.mtlx` defines — a dangling override, correctly ignored.
 
+---
+
+## Scene lights and cameras
+
+A file's own lights drive the viewer's `scene` lighting mode: natively from USD
+(`UsdLux` sphere / rect / disk / distant) and from glTF `KHR_lights_punctual`,
+which the converter now writes. glTF has no area light, so the converter turns a
+rect or disk into a 90° spot. Its falloff is cos² against the native loader's
+one-sided cos, which is the only difference between the two paths: on the whole
+Playground, native vs converted, mean |diff| is **1.17/255**.
+
+**Units.** `UsdLux` with `normalize = 1` divides emission by the light's area,
+so a light small next to its distance acts as a point emitter of intensity
+J = I·2^exposure·metersPerUnit² (rect/disk) or a quarter of that (sphere), with
+irradiance J·shape/d². The renderer's light math is exact. A white Lambertian
+plane under one J = 1 rect light at 1 m reads **0.271**, and the expected
+1/π through PBR Neutral is 0.278.
+
+**Calibration.** One constant, 1.7, maps J/d² onto the reference stills. It's
+the median ratio, lights only, at `renderCam_CU_planeTOP` against the published
+top-down still. The spread is wide: paper wants about 2.3 and wood about 0.85,
+because Arnold's frame also carries bounce light, the dome (its HDRI is not in
+the asset repo) and shadows, none of which this renderer has. Revisit after
+shadows.
+
+**Measure captures as linear.** The atlas PNG holds linear values (this
+viewer's UNORM swapchain), not sRGB. Decoding them as sRGB, as I first did,
+underestimates our radiance roughly 5× and points the blame at the light math.
+The analytic check above is what caught it.
+
+**Cameras.** `DXR_MODELVIEWER_CAMERA` (macOS) starts at a USD `GeomCamera`.
+At `renderCam_CU_planeTOP` the framing matches the published top-down still
+almost exactly. Not every still is a scene camera at its authored lens: the
+"close up" stills are crops, and should be matched by feature alignment rather
+than assumed.
+

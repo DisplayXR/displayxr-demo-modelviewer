@@ -380,6 +380,27 @@ void processNode(const tinygltf::Model& m, int nodeIdx, const glm::mat4& parent,
     const tinygltf::Node& node = m.nodes[nodeIdx];
     const glm::mat4 world = parent * nodeLocalMatrix(node);
 
+    // KHR_lights_punctual: a light points down its node's local -Z. Its
+    // intensity is candela (point/spot) or lux (directional) -- exactly the J
+    // of ModelLight, so it passes through unchanged.
+    if (node.light >= 0 && node.light < (int)m.lights.size()) {
+        const tinygltf::Light& L = m.lights[(size_t)node.light];
+        ModelLight ml;
+        ml.name = L.name;
+        const glm::vec3 pos(world[3]);
+        const glm::vec3 axis = glm::normalize(glm::vec3(world * glm::vec4(0, 0, -1, 0)));
+        for (int a = 0; a < 3; ++a) { ml.position[a] = pos[a]; ml.axis[a] = axis[a]; }
+        for (int a = 0; a < 3; ++a) ml.color[a] = L.color.size() >= 3 ? (float)L.color[(size_t)a] : 1.0f;
+        ml.intensity = (float)L.intensity;
+        if (L.type == "directional") ml.type = ModelLight::Type::Directional;
+        else if (L.type == "spot") {
+            ml.type = ModelLight::Type::Spot;
+            ml.cosOuter = (float)std::cos(L.spot.outerConeAngle);
+            ml.cosInner = (float)std::cos(L.spot.innerConeAngle);
+        } else ml.type = ModelLight::Type::Point;
+        out.lights.push_back(ml);
+    }
+
     if (node.mesh >= 0 && node.mesh < (int)m.meshes.size()) {
         const tinygltf::Mesh& mesh = m.meshes[node.mesh];
         for (const auto& prim : mesh.primitives) {
@@ -580,6 +601,8 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
             "KHR_materials_fuzz",
             "KHR_materials_diffuse_roughness",
             "KHR_texture_transform",
+            // Drawn by LightingMode::Scene, which a model carrying lights selects.
+            "KHR_lights_punctual",
             nullptr
         };
         for (const std::string& ext : model.extensionsUsed) {
