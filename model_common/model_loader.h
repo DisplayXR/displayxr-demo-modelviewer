@@ -282,6 +282,49 @@ struct ModelMorph {
     std::vector<float> nrmDeltas;    // same layout; empty when no NORMAL deltas
 };
 
+// A light the FILE carries (USD UsdLux, glTF KHR_lights_punctual), drawn by
+// LightingMode::Scene. World space, metres -- the same space as the vertices
+// (the viewer frames a model through the camera rig, never by moving it).
+//
+// `intensity` is J in irradiance = J * shape / d^2 (d in metres), so both
+// loaders reduce to one renderer-side model:
+//   glTF point/spot: J = KHR intensity (candela) -- the spec's own definition.
+//   USD sphere/rect/disk with normalize = 1: emission is divided by the light's
+//     area, so a small light behaves as a point emitter of J = I*2^E*mpu^2
+//     (rect/disk, one-sided, cosine falloff) or J = I*2^E*mpu^2/4 (sphere:
+//     projected pi r^2 over total 4 pi r^2). mpu = stage metersPerUnit: UsdLux
+//     measures areas and distances in scene units.
+//   USD with normalize = 0: J = I*2^E * projected area in m^2.
+//   USD distant: irradiance = I*2^E, no falloff.
+// The grading of LightingMode::Scene then holds ONE calibration constant for
+// all of them -- see ModelRenderer.
+struct ModelLight {
+    enum class Type { Point, Spot, Directional, Rect };
+    Type  type = Type::Point;
+    float position[3] = {0, 0, 0};
+    float axis[3] = {0, 0, -1};     // emission axis (rect/spot); travel direction (directional)
+    float color[3] = {1, 1, 1};     // linear
+    float intensity = 1.0f;         // J, see above
+    float radius = 0.0f;            // sphere radius (m), informational for now
+    float cosOuter = -1.0f, cosInner = 1.0f;   // spot cone
+    std::string name;
+};
+
+// A camera the file carries (USD GeomCamera), world space, metres. The viewer
+// can start AT one (macOS: DXR_MODELVIEWER_CAMERA) -- placing its virtual
+// display focusDistance down the view axis, sized so the scaled eye lands on
+// `position` -- which is what makes a render comparable to the file's own
+// reference stills. The field of view stays the physical display's; from the
+// same eye that is a crop of the authored frame, not a different perspective.
+struct ModelCamera {
+    std::string name;
+    float position[3] = {0, 0, 0};
+    float forward[3] = {0, 0, -1};
+    float up[3] = {0, 1, 0};
+    float focusDistance = 1.0f;   // metres
+    float vfov = 0.7f;            // radians (informational)
+};
+
 struct ModelData {
     std::vector<ModelVertex>    vertices;
     std::vector<uint32_t>       indices;
@@ -319,6 +362,12 @@ struct ModelData {
     // material-fidelity demo must never let that pass unremarked. Empty for a
     // file that uses nothing we lack. Populated by the glTF backend only.
     std::vector<std::string> unsupportedExtensions;
+
+    // Lights the file carries. Empty for most assets; non-empty switches the
+    // viewer to LightingMode::Scene on load.
+    std::vector<ModelLight> lights;
+    // Cameras the file carries (USD only today).
+    std::vector<ModelCamera> cameras;
 };
 
 // Parse a glTF 2.0 file (.glb or .gltf). Returns false on parse failure or if

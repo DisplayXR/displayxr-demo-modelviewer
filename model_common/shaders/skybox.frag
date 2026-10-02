@@ -23,6 +23,12 @@ layout(set = 0, binding = 0) uniform UBO {
                        // w=probe select (unused here)
     vec4 viewport;     // xy = viewport/target ratio, z/w = pbr.frag switches (unused here)
                        // — full lane ownership: ModelRenderer::UniformBlock
+    vec4 studio;       // (studio rig: unused here, declared to reach sceneInfo)
+    vec4 studioFill;
+    vec4 studioRim;
+    vec4 hemiSky;
+    vec4 hemiGround;
+    vec4 sceneInfo;    // y = Scene mode on, z = the ambient scale pbr.frag dims the sky IBL by
 } ubo;
 layout(set = 2, binding = 1) uniform samplerCube prefilteredMap;
 
@@ -54,6 +60,10 @@ void main() {
     // (exposure is applied inside applyToneMapping), so the two shaders agree
     // on what "scene-linear" means and transmission composites like with like.
     vec3 sceneLinear = textureLod(prefilteredMap, dir, lod).rgb;
+    // Scene mode dims the sky by the same factor as the ambient it feeds, so a
+    // lit interior is not framed by a daylight backdrop -- and so transmissive
+    // surfaces, which refract this backdrop, do not glow with it.
+    if (ubo.sceneInfo.y > 0.5) sceneLinear *= ubo.sceneInfo.z;
     vec3 color = applyToneMapping(sceneLinear, ubo.tone);
     if (ubo.cameraPos.w > 0.5) color = linearToSrgb(color);
     outColor = vec4(color, 1.0);

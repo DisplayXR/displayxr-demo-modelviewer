@@ -154,6 +154,11 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   tinyusdz is pinned to v0.9.9-rc7 (v0.9.4's sublayer resolver bug; newer tags
   are the LightUSD rename). macOS `DXR_MODELVIEWER_MODEL=<path>` picks the
   startup model; `DXR_MODELVIEWER_MTLX_MAXTEX` caps baked textures (1024).
+  **Scene lights** (`LightingMode::Scene`, auto-selected when a file carries
+  UsdLux / KHR_lights_punctual lights): unshadowed, one calibration constant
+  (`kSceneLightScale`, see docs/openpbr-to-gltf.md#scene-lights-and-cameras).
+  TRAP: atlas captures are LINEAR -- never sRGB-decode them when measuring.
+  macOS `DXR_MODELVIEWER_CAMERA=<name|index>` starts at a USD GeomCamera.
   **UsdPreviewSurface honours base-color/emissive textures + PBR factors** but not
   normal/metallic-roughness maps yet. Non-glTF material fidelity is best-effort
   (Phong→MR shim for OBJ/FBX).

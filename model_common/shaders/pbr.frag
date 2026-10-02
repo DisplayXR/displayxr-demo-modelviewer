@@ -18,6 +18,7 @@
 // material SSBO's stride depends on both, and #81 is what a divergence looks
 // like. Do not re-spell either number here.
 #include "material_slots.glsl"
+#include "scene_lights.glsl"
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -51,7 +52,18 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 studioRim;    // xyz = world dir TO the light, w = intensity
     vec4 hemiSky;      // rgb = linear sky colour
     vec4 hemiGround;   // rgb = linear ground colour
+    // ── Scene lights (LightingMode::Scene); layout in scene_lights.glsl ─────────
+    vec4 sceneInfo;    // x = count, y = on, z = ambient scale, w = calibration
+    vec4 sceneLights[MV_MAX_SCENE_LIGHTS * MV_SCENE_LIGHT_VEC4S];
 } ubo;
+
+// Scale on EVERY environment read. Scene mode dims the sky to a fill; doing it
+// at the source rather than on the summed ambient keeps the terms that are
+// built from the same irradiance consistent with it -- transmission SUBTRACTS
+// the diffuse ambient it replaces, so a post-sum dim made that difference
+// negative and every transmissive surface (the Playground's ice-material
+// baseboards, the jelly toy) came out white.
+float envScale() { return ubo.sceneInfo.y > 0.5 ? ubo.sceneInfo.z : 1.0; }
 
 layout(push_constant) uniform Push {
     mat4 model;
@@ -419,6 +431,22 @@ vec3 studioDirectLobe(vec3 N, vec3 V, vec3 L, vec3 albedo, vec3 f0, vec3 f90,
     return (kd * albedo / PI * dr + spec) * ndotl;
 }
 
+// The diffuse half of studioDirectLobe alone. Transmission REPLACES the diffuse
+// lobe by subtracting what was added, so every light that adds a diffuse term
+// has to be able to say how much -- else a transmissive surface keeps an opaque
+// diffuse coat under that light (the Playground's bottle went neon green).
+vec3 studioDiffuseLobe(vec3 N, vec3 V, vec3 L, vec3 albedo, vec3 f0, vec3 f90,
+                       float metallic, float diffuseRoughness, float ndotv) {
+    float ndotl = max(dot(N, L), 0.0);
+    if (ndotl <= 0.0) return vec3(0.0);
+    vec3  H     = normalize(V + L);
+    float vdoth = max(dot(V, H), 0.0);
+    vec3  F     = f0 + (f90 - f0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0);
+    vec3  kd    = (1.0 - F) * (1.0 - metallic);
+    float dr    = diffuseOrenNayar(ndotl, ndotv, dot(L, V), diffuseRoughness);
+    return kd * albedo / PI * dr * ndotl;
+}
+
 void main() {
     // Foreground-only clip (transparent mode): drop geometry behind the
     // display plane. 0 = disabled (opaque path unaffected).
@@ -620,6 +648,48 @@ void main() {
                                    a, metallic, diffuseRoughness, ndotv) * ubo.studioRim.w;
     }
 
+    // Scene lights: the file's own lights, through the same base lobe as the
+    // studio rig. Irradiance = J * shape / d^2 (see ModelLight): shape is 1 for
+    // a point, the cosine of a one-sided rect/disk emitter, or the KHR spot cone.
+    // Unshadowed for now -- a light outside an enclosure reaches in through it.
+    bool sceneOn = ubo.sceneInfo.y > 0.5;
+    vec3 sceneDiffuse = vec3(0.0);   // what transmission must take back out
+    vec3 sceneIrr = vec3(0.0);       // sum E * N.L -- what the scatter lobe takes in
+    if (sceneOn) {
+        int nLights = int(ubo.sceneInfo.x + 0.5);
+        for (int li = 0; li < MV_MAX_SCENE_LIGHTS; ++li) {
+            if (li >= nLights) break;
+            vec4 lp = ubo.sceneLights[li * MV_SCENE_LIGHT_VEC4S + 0];
+            vec4 la = ubo.sceneLights[li * MV_SCENE_LIGHT_VEC4S + 1];
+            vec4 lc = ubo.sceneLights[li * MV_SCENE_LIGHT_VEC4S + 2];
+            int ltype = int(lp.w + 0.5);
+            vec3 Ls;
+            float att;
+            if (ltype == MV_LIGHT_DIRECTIONAL) {
+                Ls = -la.xyz;
+                att = 1.0;
+            } else {
+                vec3 dv = lp.xyz - inWorldPos;
+                float d2 = max(dot(dv, dv), 1e-6);
+                Ls = dv * inversesqrt(d2);
+                att = 1.0 / d2;
+                float cosE = dot(la.xyz, -Ls);           // angle off the emission axis
+                if (ltype == MV_LIGHT_RECT) {
+                    att *= max(cosE, 0.0);
+                } else if (ltype == MV_LIGHT_SPOT) {     // KHR_lights_punctual cone
+                    float t = clamp((cosE - la.w) / max(lc.w - la.w, 1e-4), 0.0, 1.0);
+                    att *= t * t;
+                }
+            }
+            vec3 E = lc.rgb * (att * ubo.sceneInfo.w);
+            direct += studioDirectLobe(N, V, Ls, albedo, f0, f90, a, metallic,
+                                       diffuseRoughness, ndotv) * E;
+            sceneDiffuse += studioDiffuseLobe(N, V, Ls, albedo, f0, f90, metallic,
+                                              diffuseRoughness, ndotv) * E;
+            sceneIrr += E * max(dot(N, Ls), 0.0);
+        }
+    }
+
     // Ambient = image-based lighting (split-sum): irradiance cube for diffuse,
     // prefiltered cube + BRDF LUT for specular.
     vec3 Fr = Fr_base;
@@ -637,7 +707,7 @@ void main() {
     // before the sphere loses its shading entirely.
     vec3 Nd = (diffuseRoughness > 0.0)
             ? normalize(mix(N, V, 0.5 * diffuseRoughness)) : N;
-    vec3 diffuseIBL = texture(irradianceMap, Nd).rgb * albedo * (1.0 - metallic);
+    vec3 diffuseIBL = texture(irradianceMap, Nd).rgb * envScale() * albedo * (1.0 - metallic);
     float maxLod = float(textureQueryLevels(prefilteredMap) - 1);
     // Anisotropic reflections: bend the reflection vector towards the direction
     // the highlight is stretched in. This is the glTF sample-viewer approach —
@@ -661,7 +731,7 @@ void main() {
     // demo takes the under-stated one. Worth revisiting under a real HDRI, where
     // there is no hard horizon for the bend to cross.
     vec3 reflDir = reflect(-V, N);
-    vec3 prefiltered = textureLod(prefilteredMap, reflDir, roughness * maxLod).rgb;
+    vec3 prefiltered = textureLod(prefilteredMap, reflDir, roughness * maxLod).rgb * envScale();
     vec2 ab = texture(brdfLUT, vec2(ndotv, roughness)).rg;
     vec3 specularIBL = prefiltered * (Fr * ab.x + ab.y);
     vec3 ambient = (diffuseIBL + specularIBL) * ao;
@@ -712,7 +782,7 @@ void main() {
         float sheenV = V_Ashikhmin(ndotl, ndotv);
         direct += sheenColor * sheenD * sheenV * keyScale * ndotl;
         // Ambient sheen: the irradiance cube stands in for the full integral.
-        ambient += sheenColor * texture(irradianceMap, N).rgb
+        ambient += sheenColor * texture(irradianceMap, N).rgb * envScale()
                  * pow(1.0 - ndotv, 3.0) * ao;
     }
 
@@ -814,7 +884,7 @@ void main() {
         }
 
         vec2 ccAb = texture(brdfLUT, vec2(ndotv, clearcoatRoughness)).rg;
-        vec3 ccIbl = textureLod(prefilteredMap, reflect(-V, Nc), clearcoatRoughness * maxLod).rgb
+        vec3 ccIbl = textureLod(prefilteredMap, reflect(-V, Nc), clearcoatRoughness * maxLod).rgb * envScale()
                    * (ccF0 * ccAb.x + ccAb.y);
 
         // What the base sees through the coat: tint, then darkening. Both are
@@ -1037,8 +1107,12 @@ void main() {
             if (scatterMix > 0.0) {
                 // Backward half: a Lambertian reflection lobe of multi-scatter
                 // albedo. Same shape as the diffuse lobe, different albedo.
-                vec3 scatterBack = (lobeAlbedo / PI) * vec3(keyScale) * ndotl
-                                 + texture(irradianceMap, N).rgb * lobeAlbedo * ao;
+                // Scene lights enter the scatter lobe exactly as the key does:
+                // without this, every subsurface material (paper, wax, jelly) is
+                // unlit in Scene mode -- its diffuse is taken out above and
+                // nothing puts the scattered light back.
+                vec3 scatterBack = (lobeAlbedo / PI) * (vec3(keyScale) * ndotl + sceneIrr)
+                                 + texture(irradianceMap, N).rgb * envScale() * lobeAlbedo * ao;
                 // Forward half: what lies behind, fully diffused. The top mip of
                 // the scene chain is the most-blurred copy available, which is
                 // the closest stand-in for a diffuse transmission lobe.
@@ -1059,7 +1133,7 @@ void main() {
             // subtracts exactly the lobe that was added rather than a
             // Lambertian approximation of it.
             vec3 diffuseTerm = (kd * albedo / PI * dr) * vec3(keyScale) * ndotl
-                             + diffuseIBL * ao;
+                             + diffuseIBL * ao + sceneDiffuse;
             vec3 transmissionTerm = transmitted * (1.0 - metallic);
             color += (transmissionTerm - diffuseTerm) * transmissionFactor;
         }
@@ -1105,7 +1179,7 @@ void main() {
         // Ambient fuzz: the irradiance cube stands in for the full integral,
         // weighted by the same directional albedo. Same approximation the sheen
         // lobe makes, and the same caveat.
-        vec3 fuzzAmb = sheenColor * texture(irradianceMap, N).rgb * Efz * ao;
+        vec3 fuzzAmb = sheenColor * texture(irradianceMap, N).rgb * envScale() * Efz * ao;
         color = (fuzzDirect + fuzzAmb) * fuzzFactor
               + color * mix(1.0, 1.0 - Efz, fuzzFactor);
     }
