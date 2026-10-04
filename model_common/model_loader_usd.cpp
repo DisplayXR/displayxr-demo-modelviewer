@@ -58,6 +58,7 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <utility>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -154,15 +155,23 @@ namespace {
 struct MtlxRef { std::string file; std::string material; };
 
 // Every Material that references a .mtlx, keyed by absolute prim path, with the
-// file resolved against the directory of the layer that authored it.
-void collectMtlxRefs(const tinyusdz::PrimSpec& ps, const std::string& parent,
+// file resolved against the directory of the layer that authored it. The
+// reference is then REMOVED: tinyusdz would compose it to an empty Material
+// anyway (we bake the graph ourselves), and its own MaterialX reader rejects
+// valid documents - `displacementshader value=""` fails the WHOLE stage
+// (OpenPBR's open_pbr_default.mtlx). The Material prim itself stays.
+bool isMtlx(const tinyusdz::Reference& r) {
+    const std::string a = r.asset_path.GetAssetPath();
+    return a.size() >= 5 && a.compare(a.size() - 5, 5, ".mtlx") == 0;
+}
+void collectMtlxRefs(tinyusdz::PrimSpec& ps, const std::string& parent,
                      const std::string& rootDir, std::map<std::string, MtlxRef>& out) {
     const std::string path = parent + "/" + ps.name();
-    if (ps.metas().references) {
-        for (const auto& lo : ps.metas().references.value())
+    if (std::as_const(ps).metas().references) {
+        for (auto& lo : ps.metas().references.value()) {
             for (const tinyusdz::Reference& r : lo.second) {
+                if (!isMtlx(r)) continue;
                 const std::string a = r.asset_path.GetAssetPath();
-                if (a.size() < 5 || a.compare(a.size() - 5, 5, ".mtlx") != 0) continue;
                 std::filesystem::path f = std::filesystem::path(ps.get_current_working_path()) / a;
                 if (ps.get_current_working_path().empty() || !std::filesystem::exists(f))
                     f = std::filesystem::path(rootDir) / a;
@@ -170,8 +179,13 @@ void collectMtlxRefs(const tinyusdz::PrimSpec& ps, const std::string& parent,
                 mat = mat.substr(mat.find_last_of('/') + 1);
                 out[path] = {f.lexically_normal().string(), mat};
             }
+            lo.second.erase(std::remove_if(lo.second.begin(), lo.second.end(), isMtlx), lo.second.end());
+        }
+        auto& v = ps.metas().references.value();
+        v.erase(std::remove_if(v.begin(), v.end(), [](const auto& lo) { return lo.second.empty(); }), v.end());
+        if (v.empty()) ps.metas().references.reset();
     }
-    for (const auto& c : ps.children()) collectMtlxRefs(c, path, rootDir, out);
+    for (auto& c : ps.children()) collectMtlxRefs(c, path, rootDir, out);
 }
 
 bool composeStage(const std::string& path, tinyusdz::Stage& stage,
@@ -184,12 +198,21 @@ bool composeStage(const std::string& path, tinyusdz::Stage& stage,
     AssetResolutionResolver resolver;
     resolver.set_current_working_path(dir);
     resolver.set_search_paths({dir});
+    // `../` asset paths are ordinary USD (the ASWF StandardShaderBall's layers/
+    // reach ../maps and ../example_materials); tinyusdz refuses them unless
+    // asked. The user picked this file, so reading its siblings is the intent.
+    SublayersCompositionOptions subOpts;
+    subOpts.allow_parent_relative_paths = true;
+    ReferencesCompositionOptions refOpts;
+    refOpts.allow_parent_relative_paths = true;
+    PayloadCompositionOptions payOpts;
+    payOpts.allow_parent_relative_paths = true;
     {
         Layer o;
-        if (!CompositeSublayers(resolver, layer, &o, &warn, &err)) return false;
+        if (!CompositeSublayers(resolver, layer, &o, &warn, &err, subOpts)) return false;
         layer = std::move(o);
     }
-    for (const auto& kv : layer.primspecs()) collectMtlxRefs(kv.second, "", dir, mtlx);
+    for (auto& kv : layer.primspecs()) collectMtlxRefs(kv.second, "", dir, mtlx);
     for (int pass = 0; pass < 8; ++pass) {
         bool changed = false;
         auto step = [&](bool pending, auto&& fn) -> bool {
@@ -201,9 +224,9 @@ bool composeStage(const std::string& path, tinyusdz::Stage& stage,
             return true;
         };
         if (!step(layer.check_unresolved_references(), [&](Layer& o) {
-                return CompositeReferences(resolver, layer, &o, &warn, &err); })) return false;
+                return CompositeReferences(resolver, layer, &o, &warn, &err, refOpts); })) return false;
         if (!step(layer.check_unresolved_payload(), [&](Layer& o) {
-                return CompositePayload(resolver, layer, &o, &warn, &err); })) return false;
+                return CompositePayload(resolver, layer, &o, &warn, &err, payOpts); })) return false;
         if (!step(layer.check_unresolved_inherits(), [&](Layer& o) {
                 return CompositeInherits(layer, &o, &warn, &err); })) return false;
         if (!step(layer.check_unresolved_variant(), [&](Layer& o) {

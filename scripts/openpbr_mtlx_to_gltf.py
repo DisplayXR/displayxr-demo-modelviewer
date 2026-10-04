@@ -104,6 +104,25 @@ def lin_to_srgb(x):
     x = np.clip(x, 0, 1)
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1 / 2.4) - 0.055)
 
+# MaterialX colour spaces -> the working space (lin_rec709). The document's
+# `colorspace` is inherited by every color3/color4 value and colour image below
+# it unless a node or input names its own. ACEScg = AP1 primaries, linear; the
+# matrix is MaterialX's acescg_to_lin_rec709. Mirrors model_loader_mtlx.cpp.
+ACESCG_TO_REC709 = np.array([[1.70505, -0.62179, -0.08326],
+                             [-0.13026, 1.14080, -0.01055],
+                             [-0.02400, -0.12897, 1.15297]], np.float32)
+def cs_kind(name):
+    n = (name or "").lower()
+    if n in ("", "lin_rec709", "raw", "linear"): return "linear"
+    if n in ("srgb_tx", "srgb_texture"): return "srgb"
+    if n in ("acescg", "lin_ap1"): return "acescg"
+    return "unknown"
+def acescg_to_rec709(c):
+    """c[..., :3] AP1 -> Rec.709, gamut-clipped at 0 (glTF factors must be >= 0)."""
+    out = c.copy()
+    out[..., :3] = np.maximum(0, c[..., :3] @ ACESCG_TO_REC709.T)
+    return out
+
 # ---------------------------------------------------------------- texture I/O
 def load_image(path, max_tex):
     if path.lower().endswith((".tif", ".tiff")):
@@ -157,6 +176,21 @@ class Graph:
         # (usd_overrides()); applied per USD's rule, see inp().
         self.overrides = overrides or {}
         self.cache = {}
+        self.doc_cs = self.root.get("colorspace") or "lin_rec709"
+        self.warned_cs = set()
+
+    def colorspace(self, node, inp):
+        """Nearest authored colour space: the input, then its node, then the document."""
+        if inp is not None and inp.get("colorspace"): return inp.get("colorspace")
+        return node.get("colorspace") or self.doc_cs
+
+    def to_working(self, v, cs):
+        k = cs_kind(cs)
+        if k == "srgb": return srgb_to_lin(v)
+        if k == "acescg": return acescg_to_rec709(v) if v.shape[-1] >= 3 else v
+        if k == "unknown" and cs not in self.warned_cs:
+            self.warned_cs.add(cs); warn(f"colorspace '{cs}' not supported - treated as lin_rec709")
+        return v
 
     def inp(self, node, name, default=None):
         """Last-wins, like MaterialX (the mug declares base_color twice).
@@ -172,7 +206,10 @@ class Graph:
         ov = self.overrides.get(node.get("name"), {})
         if name in ov: return ov[name]
         if hit is None: return default
-        return parse_val(hit.get("value"), hit.get("type"))
+        v = parse_val(hit.get("value"), hit.get("type"))
+        if hit.get("type") in ("color3", "color4"):
+            v = self.to_working(v, self.colorspace(node, hit))
+        return v
 
     def eval(self, name):
         if name in self.cache: return self.cache[name]
@@ -199,9 +236,17 @@ class Graph:
                 v = np.array([0.5], np.float32) if typ == "float" else np.array([0.5, 0.5, 0.5], np.float32)
             else:
                 v = load_image(path, self.max_tex)
-                if f.get("colorspace") == "srgb_tx": v = srgb_to_lin(v)
+                # An explicit tag on the file input applies as authored (the
+                # Playground tags two float maps srgb_tx); an INHERITED space only
+                # transforms colour images - data maps (normals, masks) stay raw.
+                colour = typ in ("color3", "color4")
+                if f.get("colorspace") or colour:
+                    cs = self.colorspace(n, f)
+                    if cs_kind(cs) == "srgb": v = srgb_to_lin(v)
+                    elif cs_kind(cs) != "acescg": v = self.to_working(v, cs)
                 if typ == "float": v = v[..., :1]
                 elif v.shape[2] == 1: v = np.repeat(v, 3, 2)
+                if colour and cs_kind(cs) == "acescg": v = acescg_to_rec709(v)
         elif t == "extract":
             src = self.inp(n, "in"); idx = int(self.inp(n, "index", np.array([0]))[0])
             v = src[..., idx:idx + 1] if is_img(src) else src[idx:idx + 1]

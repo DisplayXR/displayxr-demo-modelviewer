@@ -155,6 +155,27 @@ float linToSrgb(float x) {
     x = std::clamp(x, 0.0f, 1.0f);
     return x <= 0.0031308f ? x * 12.92f : 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
 }
+// MaterialX colour spaces → the renderer's working space (lin_rec709). The
+// document's `colorspace` is inherited by every color3/color4 value and colour
+// image below it, unless a node or input names its own. ACEScg (AP1 primaries,
+// linear) needs a 3x3; the matrix is MaterialX's own acescg_to_lin_rec709.
+enum class Cs { Linear, Srgb, Acescg, Unknown };
+Cs csKind(std::string n) {
+    std::transform(n.begin(), n.end(), n.begin(), ::tolower);
+    if (n.empty() || n == "lin_rec709" || n == "raw" || n == "linear") return Cs::Linear;
+    if (n == "srgb_tx" || n == "srgb_texture") return Cs::Srgb;
+    if (n == "acescg" || n == "lin_ap1") return Cs::Acescg;
+    return Cs::Unknown;
+}
+void acescgToRec709(float* c) {
+    const float r = c[0], g = c[1], b = c[2];
+    c[0] = 1.70505f * r - 0.62179f * g - 0.08326f * b;
+    c[1] = -0.13026f * r + 1.14080f * g - 0.01055f * b;
+    c[2] = -0.02400f * r - 0.12897f * g + 1.15297f * b;
+    for (int i = 0; i < 3; ++i) c[i] = std::max(0.0f, c[i]);  // AP1 exceeds Rec.709: gamut-clip
+}
+bool isColorType(const std::string* t) { return t && (*t == "color3" || *t == "color4"); }
+
 float halfToFloat(uint16_t h) {
     uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023, f;
     if (e == 0) f = m ? 0 : (s << 31);  // flush subnormals
@@ -357,6 +378,7 @@ public:
     Graph(const XElem& doc, fs::path dir, const MtlxOverrides& ov, const MtlxBakeParams& p,
           std::vector<std::string>& warn)
         : dir_(std::move(dir)), ov_(ov), p_(p), warn_(warn) {
+        if (const std::string* cs = doc.get("colorspace")) docCs_ = *cs;
         for (const XElem& e : doc.kids)
             if (const std::string* n = e.get("name")) nodes_[*n] = &e;
     }
@@ -390,6 +412,15 @@ public:
         std::stringstream ss(*v);
         std::string tok;
         while (std::getline(ss, tok, ',')) { try { nums.push_back(std::stof(tok)); } catch (...) {} }
+        if (isColorType(ty) && nums.size() >= 3) {
+            const std::string cs = colorspace(n, hit);
+            switch (csKind(cs)) {
+            case Cs::Srgb: for (int i = 0; i < 3; ++i) nums[i] = srgbToLin(nums[i]); break;
+            case Cs::Acescg: acescgToRec709(nums.data()); break;
+            case Cs::Unknown: unknownCs(cs); break;
+            case Cs::Linear: break;
+            }
+        }
         return Val::constant(nums);
     }
 
@@ -452,6 +483,17 @@ public:
     }
 
 private:
+    // Nearest authored colour space: the input, then its node, then the document.
+    std::string colorspace(const XElem& node, const XElem* in) const {
+        if (in) if (const std::string* cs = in->get("colorspace")) return *cs;
+        if (const std::string* cs = node.get("colorspace")) return *cs;
+        return docCs_;
+    }
+    void unknownCs(const std::string& cs) {
+        if (warnedCs_.insert(cs).second)
+            warn_.push_back("colorspace '" + cs + "' not supported - treated as lin_rec709");
+    }
+
     // File for an image node: a USD override wins (it is an asset path, not a
     // connection); `<UDIM>` resolves to this instance's tile, else the lowest.
     fs::path imagePath(const XElem& n, const std::string& nodeName) {
@@ -491,10 +533,17 @@ private:
 
     Val image(const XElem& n, const std::string& name, const std::string& type) {
         fs::path path = imagePath(n, name);
-        std::string cs;
+        // An explicit tag on the file input applies as authored (the Playground
+        // tags two float maps srgb_tx and was baked that way); an INHERITED space
+        // only transforms colour images - data maps (normals, masks) stay raw.
+        const XElem* fileIn = nullptr;
         for (const XElem& k : n.kids)
-            if (k.tag == "input" && k.get("name") && *k.get("name") == "file" && k.get("colorspace"))
-                cs = *k.get("colorspace");
+            if (k.tag == "input" && k.get("name") && *k.get("name") == "file") fileIn = &k;
+        const bool explicitCs = fileIn && fileIn->get("colorspace");
+        const bool colourImg = type == "color3" || type == "color4";
+        const std::string cs = (explicitCs || colourImg) ? colorspace(n, fileIn) : std::string();
+        const Cs kind = csKind(cs);
+        if (kind == Cs::Unknown) unknownCs(cs);
         const int wantC = (type == "float") ? 1 : 3;
         auto r = tinyusdz::image::LoadImageFromFile(path.string());
         tinyusdz::Image im;
@@ -537,7 +586,7 @@ private:
             warn_.push_back(name + ": short image buffer - using 0.5");
             return Val::constant(std::vector<float>(wantC, 0.5f));
         }
-        const bool srgb = cs == "srgb_tx" || cs == "srgb_texture";
+        const bool srgb = kind == Cs::Srgb;
         for (int y = 0; y < v.h; ++y)
             for (int x = 0; x < v.w; ++x)
                 for (int ch = 0; ch < wantC; ++ch) {
@@ -550,6 +599,8 @@ private:
                         }
                     v.px[((size_t)y * v.w + x) * wantC + ch] = acc / (f * f);
                 }
+        if (kind == Cs::Acescg && wantC == 3)   // linear, so after the box average is exact
+            for (size_t i = 0; i < (size_t)v.w * v.h; ++i) acescgToRec709(&v.px[i * 3]);
         return v;
     }
 
@@ -559,6 +610,8 @@ private:
     std::vector<std::string>& warn_;
     std::map<std::string, const XElem*> nodes_;
     std::map<std::string, Val> cache_;
+    std::string docCs_ = "lin_rec709";
+    std::set<std::string> warnedCs_;
 };
 
 // ──────────────────────────── 3. OpenPBR bake ────────────────────────────────
