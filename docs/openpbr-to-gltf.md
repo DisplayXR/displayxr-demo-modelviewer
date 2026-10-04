@@ -187,6 +187,34 @@ now apply those overrides, with USD's rule that a connection authored in the
 `.mtlx` beats a stronger layer's value). And it overrides a `place2d` node on
 the walls that no `.mtlx` defines — a dangling override, correctly ignored.
 
+### Colour spaces
+
+Both paths honour MaterialX `colorspace` and bring every colour into the
+renderer's working space, `lin_rec709`. The nearest authored space wins:
+the input's own, then its node's, then the document's.
+
+| `colorspace` | colour constants (`color3`/`color4`) | images |
+|---|---|---|
+| `lin_rec709`, `raw`, none | unchanged | unchanged |
+| `srgb_tx`, `srgb_texture` | sRGB EOTF | sRGB EOTF, applied before the box downsample |
+| `acescg`, `lin_ap1` | MaterialX's `acescg_to_lin_rec709` 3×3, clipped at 0 | same matrix, applied after the downsample (it's linear) |
+| anything else | unchanged, with a warning | unchanged, with a warning |
+
+Clipping matters because AP1 is wider than Rec.709: a saturated ACEScg colour
+gets a negative component, and glTF factors must be ≥ 0. Every OpenPBR
+reference example (`open_pbr_*.mtlx` in the OpenPBR repo) is an `acescg`
+document. Read raw, car paint's `0.1, 0.6, 0.9` would render that triple; the
+correct linear-709 value is `0, 0.66, 0.96`.
+
+An inherited space transforms only colour-typed images. A `float` or
+`vector3` image (mask, roughness, normal) stays raw unless its own `file`
+input names a space; that explicit tag is applied as written. The Playground
+tags two float maps `srgb_tx`, and both paths decode them.
+
+Asset paths that climb out of the layer's folder (`@../maps/x.exr@`) are
+ordinary USD, and the native loader allows them. tinyusdz refuses them by
+default, which broke the ASWF StandardShaderBall.
+
 ---
 
 ## Scene lights and cameras
