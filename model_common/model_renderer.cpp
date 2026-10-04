@@ -3221,6 +3221,13 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                         swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB ||
                         swapchainFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
 
+    // Shadow resources BEFORE the UBO: updateUniforms() packs each light's
+    // "shadowed" flag from shadowLayers_, which ensureShadowResources() sets.
+    // Created after it, the first eye after a load packed "unshadowed" and drew
+    // one frame with the other eye shadowed.
+    const bool shadowPass = lightingMode_ == LightingMode::Scene && !sceneLights_.empty() &&
+                            shadowsDirty_ && modelLoaded_ && ensureShadowResources();
+
     updateUniforms(viewMatrix, projMatrix, clipFarViewSpace);
 
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -3235,8 +3242,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // Scene-light shadow maps, before the first eye that needs them: on load, on
     // a lighting change, and per frame only while an animation plays.
-    if (lightingMode_ == LightingMode::Scene && !sceneLights_.empty() && shadowsDirty_ &&
-        modelLoaded_ && ensureShadowResources()) {
+    if (shadowPass) {
         recordShadowPass(cmd);
         shadowsDirty_ = false;
     }
