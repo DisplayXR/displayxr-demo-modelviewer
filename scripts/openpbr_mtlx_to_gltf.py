@@ -384,10 +384,16 @@ def build_material(glb, name, p, mpu, thickness_m, nits_per_unit):
     # bake mix(base_color, transmission_color, transmission_weight). Exact at
     # weight 0 and 1. Skipped with subsurface, whose colour rides the scatter
     # extension instead. (Painted glass: without this the paint's base colour
-    # tinted the whole jar.)
+    # tinted the whole jar.) transmission_color means two things: with
+    # transmission_depth == 0, or on a thin-walled surface (no volume), it is a
+    # SURFACE tint (baked here); with depth > 0 on a solid it is the VOLUME
+    # colour reached at that depth (attenuationColor below) and the surface is
+    # untinted, so mix toward white -- baking it here too would apply it twice.
     tw_ = get("transmission_weight")
     if (is_img(tw_) or scal(tw_) > 0) and not is_img(get("subsurface_weight")) and scal(get("subsurface_weight")) == 0:
         tc = get("transmission_color")
+        if scal(get("transmission_depth")) > 0 and not bool(get("geometry_thin_walled")):
+            tc = np.ones(3, np.float32)
         tcol = as3(tc) if is_img(tc) else np.float32(vec3(tc))
         base = as3(bc) if is_img(bc) else np.float32(vec3(bc))
         w = tw_[..., :1] if is_img(tw_) else np.float32(scal(tw_))

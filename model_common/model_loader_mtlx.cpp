@@ -723,12 +723,19 @@ bool mtlx_bake_openpbr(const std::string& mtlxPath, const std::string& materialN
     // base colour (premultiplied by base_weight); on a transmissive surface glTF
     // tints transmitted light by baseColor where OpenPBR uses transmission_color,
     // so bake mix(base_color, transmission_color, transmission_weight) there.
+    // transmission_color means two things: with transmission_depth == 0, or on a
+    // thin-walled surface (no volume), it is a SURFACE tint (baked here); with
+    // depth > 0 on a solid it is the VOLUME colour reached at that depth
+    // (attenuationColor below) and the surface is untinted, so mix toward white
+    // instead -- baking it here too would apply it twice.
     Val bw = get("base_weight"), bcol = get("base_color");
     Val bc = zipWith({&bcol, &bw}, 3, [](const std::vector<float>& x, int) { return x[0] * x[1]; });
     Val tw = get("transmission_weight"), sw = get("subsurface_weight");
     const bool noSss = !isImg(sw) && mean(sw) == 0.0f;
     if ((isImg(tw) || mean(tw) > 0) && noSss) {
-        Val tc = get("transmission_color");
+        const bool volumeColour = mean(get("transmission_depth")) > 0 &&
+                                  mean(get("geometry_thin_walled")) <= 0.5f;
+        Val tc = volumeColour ? Val::constant({1.0f, 1.0f, 1.0f}) : get("transmission_color");
         bc = zipWith({&bc, &tc, &tw}, 3,
                      [](const std::vector<float>& x, int) { return x[0] * (1 - x[2]) + x[1] * x[2]; });
     }

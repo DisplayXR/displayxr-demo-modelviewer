@@ -80,6 +80,17 @@ glTF's absorption only applies inside a `KHR_materials_volume` with a non-zero
 `thicknessFactor`; an export that omits volume gets a thin transmissive surface
 with **no absorption at all**, so tinted glass arrives colourless.
 
+`transmission_color` also means two different things depending on
+`transmission_depth`. With depth 0, or on a `geometry_thin_walled` surface
+(which has no volume), it is a **surface** tint, which glTF can only express
+through `baseColorFactor`. With depth > 0 on a solid, it is the **volume**
+colour reached at that depth, and the surface itself is untinted. Bake it into
+`baseColorFactor` in that case too and it is applied twice: once at the surface
+and again through the volume. A honey ball then renders maroon instead of
+amber. Both this viewer's MaterialX loader and `scripts/openpbr_mtlx_to_gltf.py`
+therefore mix the transmitting part of `baseColorFactor` toward white for a
+solid with depth > 0.
+
 ### `emission` + `emission_lum` → `emissiveFactor` + `KHR_materials_emissive_strength`
 
 OpenPBR emission is photometric (real luminance units). glTF's is relative, with
