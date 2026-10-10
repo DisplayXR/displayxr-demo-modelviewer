@@ -787,18 +787,38 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
     // INV-1.3: open on the 3D panel. (screenLeft, screenTop) is the panel
     // top-left in top-down global coordinates (origin = primary top-left,
     // XrDisplayDesktopPositionDXR, runtime#715); flip into AppKit's bottom-up
-    // space. (0,0) = primary — the titled window is auto-constrained below
-    // the menu bar, so it is always a safe create position.
-    NSRect frame = NSMakeRect(100, 100, width, height);
-    NSScreen *primary = [NSScreen screens].firstObject;
-    if (primary != nil) {
-        CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
-        frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
-    }
+    // space.
+    //
+    // Resolve the NSScreen that holds the panel's top-left and put the WHOLE
+    // window (title bar included) inside its visibleFrame. Placing the content
+    // top AT the panel top pushes the title bar off-screen, and AppKit then
+    // re-constrains the window onto [NSScreen mainScreen] — whichever screen
+    // has focus at launch, i.e. often the laptop, not the 3D panel. Same fix
+    // as the runtime's cube_handle_{metal,vk}_macos.
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                        NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+    NSRect frame = NSMakeRect(100, 100, width, height);
+    NSScreen *target = nil;
+    NSScreen *primary = [NSScreen screens].firstObject;
+    if (primary != nil) {
+        const NSPoint p = NSMakePoint((CGFloat)screenLeft + 1.0,
+                                      primary.frame.size.height - (CGFloat)screenTop - 1.0);
+        for (NSScreen *s in [NSScreen screens]) {
+            if (NSPointInRect(p, s.frame)) { target = s; break; }
+        }
+    }
+    if (target != nil) {
+        const NSRect vf = target.visibleFrame; // below that screen's menu bar
+        const NSRect wf = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, width, height) styleMask:style];
+        const CGFloat titleH = wf.size.height - (CGFloat)height;
+        frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
+    }
     g_window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
+    if (target != nil) {
+        // Global coordinates, title bar on-screen: no re-constrain.
+        [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
+    }
     [g_window setTitle:@"DisplayXR 3D Model Viewer"];
     [g_window setDelegate:delegate];
 
