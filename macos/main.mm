@@ -914,6 +914,29 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
     [g_reticleView setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin];
     [g_metalView addSubview:g_reticleView];
 
+    // A/B knob (diagnostic): DISPLAYXR_MV_OVERLAYS=0 removes every AppKit view
+    // stacked over the CAMetalLayer (frosted HUD + top-bar NSVisualEffectViews,
+    // reticle). Overlapping AppKit/vibrancy views make WindowServer composite
+    // the Metal layer instead of presenting it directly, which can resample a
+    // lenticular weave. Controls stay on the keyboard.
+    {
+        const char *ov = getenv("DISPLAYXR_MV_OVERLAYS");
+        if (ov != nullptr && strcmp(ov, "0") == 0) {
+            [g_hudBackdrop removeFromSuperview];
+            [g_topBar removeFromSuperview];
+            [g_reticleView removeFromSuperview];
+            g_hudBackdrop = nil;
+            g_hudView = nil;
+            g_topBar = nil;
+            g_reticleView = nil;
+            g_openButton = nil;
+            g_modeButton = nil;
+            g_animButton = nil;
+            g_animButtonBackdrop = nil;
+            LOG_INFO("DISPLAYXR_MV_OVERLAYS=0: HUD, top bar and reticle removed (nothing over the Metal layer)");
+        }
+    }
+
     [NSApp activateIgnoringOtherApps:YES];
     LOG_INFO("macOS window created (%ux%u)", width, height);
     return true;
