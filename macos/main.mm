@@ -578,10 +578,31 @@ static void OpenLoadDialog() {
 @end
 
 @implementation MetalView
+// The layer must be 1:1 with the window's backing store: a CAMetalLayer left
+// at contentsScale 1 on a 2x display is RESAMPLED by WindowServer, which turns
+// a lenticular weave (computed per physical subpixel) into colour bands. A
+// layer the app creates is not managed by AppKit, so keep contentsScale =
+// backingScaleFactor here and on every backing change.
 - (CALayer*)makeBackingLayer {
     CAMetalLayer *layer = [CAMetalLayer layer];
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    CGFloat scale = self.window != nil ? self.window.backingScaleFactor
+                                       : [NSScreen mainScreen].backingScaleFactor;
+    layer.contentsScale = scale > 0 ? scale : 1.0;
     return layer;
+}
+- (void)syncLayerScale {
+    if (self.window != nil && self.layer != nil && self.window.backingScaleFactor > 0) {
+        self.layer.contentsScale = self.window.backingScaleFactor;
+    }
+}
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [self syncLayerScale];
+}
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    [self syncLayerScale];
 }
 - (BOOL)wantsLayer { return YES; }
 - (BOOL)wantsUpdateLayer { return YES; }
@@ -787,23 +808,48 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
     // INV-1.3: open on the 3D panel. (screenLeft, screenTop) is the panel
     // top-left in top-down global coordinates (origin = primary top-left,
     // XrDisplayDesktopPositionDXR, runtime#715); flip into AppKit's bottom-up
-    // space. (0,0) = primary — the titled window is auto-constrained below
-    // the menu bar, so it is always a safe create position.
-    NSRect frame = NSMakeRect(100, 100, width, height);
-    NSScreen *primary = [NSScreen screens].firstObject;
-    if (primary != nil) {
-        CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
-        frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
-    }
+    // space.
+    //
+    // Resolve the NSScreen that holds the panel's top-left and put the WHOLE
+    // window (title bar included) inside its visibleFrame. Placing the content
+    // top AT the panel top pushes the title bar off-screen, and AppKit then
+    // re-constrains the window onto [NSScreen mainScreen] — whichever screen
+    // has focus at launch, i.e. often the laptop, not the 3D panel. Same fix
+    // as the runtime's cube_handle_{metal,vk}_macos.
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                        NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+    NSRect frame = NSMakeRect(100, 100, width, height);
+    NSScreen *target = nil;
+    NSScreen *primary = [NSScreen screens].firstObject;
+    if (primary != nil) {
+        const NSPoint p = NSMakePoint((CGFloat)screenLeft + 1.0,
+                                      primary.frame.size.height - (CGFloat)screenTop - 1.0);
+        for (NSScreen *s in [NSScreen screens]) {
+            if (NSPointInRect(p, s.frame)) { target = s; break; }
+        }
+    }
+    if (target != nil) {
+        const NSRect vf = target.visibleFrame; // below that screen's menu bar
+        const NSRect wf = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, width, height) styleMask:style];
+        const CGFloat titleH = wf.size.height - (CGFloat)height;
+        frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
+    }
     g_window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
+    if (target != nil) {
+        // Global coordinates, title bar on-screen: no re-constrain.
+        [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
+    }
     [g_window setTitle:@"DisplayXR 3D Model Viewer"];
     [g_window setDelegate:delegate];
 
     g_metalView = [[MetalView alloc] initWithFrame:frame];
     [g_window setContentView:g_metalView];
+    // 1:1 with the backing store (see MetalView::makeBackingLayer). Create the
+    // layer NOW (AppKit otherwise makes it lazily, after the runtime adopts it)
+    // and set its scale.
+    [g_metalView setWantsLayer:YES];
+    g_metalView.layer.contentsScale = g_window.backingScaleFactor;
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_metalView];
 
@@ -893,6 +939,29 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
     g_reticleView = [[ReticleView alloc] initWithFrame:retFrame];
     [g_reticleView setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin];
     [g_metalView addSubview:g_reticleView];
+
+    // A/B knob (diagnostic): DISPLAYXR_MV_OVERLAYS=0 removes every AppKit view
+    // stacked over the CAMetalLayer (frosted HUD + top-bar NSVisualEffectViews,
+    // reticle). Overlapping AppKit/vibrancy views make WindowServer composite
+    // the Metal layer instead of presenting it directly, which can resample a
+    // lenticular weave. Controls stay on the keyboard.
+    {
+        const char *ov = getenv("DISPLAYXR_MV_OVERLAYS");
+        if (ov != nullptr && strcmp(ov, "0") == 0) {
+            [g_hudBackdrop removeFromSuperview];
+            [g_topBar removeFromSuperview];
+            [g_reticleView removeFromSuperview];
+            g_hudBackdrop = nil;
+            g_hudView = nil;
+            g_topBar = nil;
+            g_reticleView = nil;
+            g_openButton = nil;
+            g_modeButton = nil;
+            g_animButton = nil;
+            g_animButtonBackdrop = nil;
+            LOG_INFO("DISPLAYXR_MV_OVERLAYS=0: HUD, top bar and reticle removed (nothing over the Metal layer)");
+        }
+    }
 
     [NSApp activateIgnoringOtherApps:YES];
     LOG_INFO("macOS window created (%ux%u)", width, height);
