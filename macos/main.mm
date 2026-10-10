@@ -578,10 +578,31 @@ static void OpenLoadDialog() {
 @end
 
 @implementation MetalView
+// The layer must be 1:1 with the window's backing store: a CAMetalLayer left
+// at contentsScale 1 on a 2x display is RESAMPLED by WindowServer, which turns
+// a lenticular weave (computed per physical subpixel) into colour bands. A
+// layer the app creates is not managed by AppKit, so keep contentsScale =
+// backingScaleFactor here and on every backing change.
 - (CALayer*)makeBackingLayer {
     CAMetalLayer *layer = [CAMetalLayer layer];
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    CGFloat scale = self.window != nil ? self.window.backingScaleFactor
+                                       : [NSScreen mainScreen].backingScaleFactor;
+    layer.contentsScale = scale > 0 ? scale : 1.0;
     return layer;
+}
+- (void)syncLayerScale {
+    if (self.window != nil && self.layer != nil && self.window.backingScaleFactor > 0) {
+        self.layer.contentsScale = self.window.backingScaleFactor;
+    }
+}
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [self syncLayerScale];
+}
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    [self syncLayerScale];
 }
 - (BOOL)wantsLayer { return YES; }
 - (BOOL)wantsUpdateLayer { return YES; }
@@ -824,6 +845,11 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
 
     g_metalView = [[MetalView alloc] initWithFrame:frame];
     [g_window setContentView:g_metalView];
+    // 1:1 with the backing store (see MetalView::makeBackingLayer). Create the
+    // layer NOW (AppKit otherwise makes it lazily, after the runtime adopts it)
+    // and set its scale.
+    [g_metalView setWantsLayer:YES];
+    g_metalView.layer.contentsScale = g_window.backingScaleFactor;
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_metalView];
 
