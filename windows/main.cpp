@@ -2325,8 +2325,9 @@ struct PerformanceStats {
 //
 // The fps line above cannot answer "what did this cost": the session is
 // vsync-locked, so a change that eats real GPU time still reports a flat 16.67
-// ms right up until it blows the budget entirely. renderEye ends in
-// vkQueueWaitIdle, so its wall time IS that view's GPU pass - which makes this
+// ms right up until it blows the budget entirely. renderEye ends in a wait
+// on its own submit's fence (this leg never calls beginFrame/endFrame), so its
+// wall time IS that view's GPU pass - which makes this
 // the honest number for a before/after (MSAA, a new lobe) at a workload that
 // still fits in the frame. Published only under DXR_MODELVIEWER_PERF_LOG.
 static std::atomic<double> g_sceneMsAccum{0.0};

@@ -324,6 +324,7 @@ bool ModelRenderer::init(VkInstance instance,
     if (!createPipeline()) return false;
     if (!createSamplerAndDefaults()) return false;
     if (!createIbl()) return false;
+    if (!createFrameRing()) return false;
 
     {
         // Set 1 now binds MTEX_COUNT samplers and set 2 binds 5, so the fragment
@@ -2427,6 +2428,11 @@ void ModelRenderer::updateAnimation(float dtSeconds) {
     // Static fast-path: no clip → primitives keep their once-baked modelMatrix.
     if (activeAnim_ < 0 || activeAnim_ >= (int)animations_.size()) return;
     const Animation& anim = animations_[activeAnim_];
+    // Skinning (joint SSBO) and morph targets (vertex buffer) are rewritten
+    // from the host below, and both are shared by every in-flight frame (#168
+    // frame ring). Node-only animation is safe without this: model matrices
+    // reach the GPU as push constants, captured at record time.
+    if (!skins_.empty() || hasMorph_) waitAllInFlight();
 
     // Advance + loop the playhead within the clip duration (frozen when paused;
     // the pose below is still recomputed so the held frame stays correct).
@@ -3190,6 +3196,157 @@ const uint8_t* ModelRenderer::contentMaskCoverage() const {
     return maskCoverage_.data();
 }
 
+// ── Frame ring (#168) ────────────────────────────────────────────────────────
+
+bool ModelRenderer::createFrameRing() {
+    VkDescriptorPoolSize ps[2] = {
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight * kMaxViewsPerSlot},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight * kMaxViewsPerSlot}};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = kFramesInFlight * kMaxViewsPerSlot;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(device_, &dpci, nullptr, &ringPool_) != VK_SUCCESS) return false;
+
+    for (FrameSlot& s : slots_) {
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = cmdPool_;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device_, &ai, &s.cmd) != VK_SUCCESS) return false;
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(device_, &fci, nullptr, &s.fence) != VK_SUCCESS) return false;
+        s.pending = false;
+    }
+    return true;
+}
+
+void ModelRenderer::destroyFrameRing() {
+    for (FrameSlot& s : slots_) {
+        for (ViewUbo& v : s.views) {
+            if (v.buf.buffer != VK_NULL_HANDLE) modelDestroyBuffer(device_, v.buf);
+            v.set = VK_NULL_HANDLE;   // freed with ringPool_
+        }
+        if (s.fence != VK_NULL_HANDLE) { vkDestroyFence(device_, s.fence, nullptr); s.fence = VK_NULL_HANDLE; }
+        if (s.cmd != VK_NULL_HANDLE) { vkFreeCommandBuffers(device_, cmdPool_, 1, &s.cmd); s.cmd = VK_NULL_HANDLE; }
+        s.pending = false;
+    }
+    if (ringPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, ringPool_, nullptr); ringPool_ = VK_NULL_HANDLE; }
+    slotOpen_ = slotRecorded_ = false;
+}
+
+bool ModelRenderer::openSlot() {
+    FrameSlot& s = slots_[slotIdx_];
+    if (s.cmd == VK_NULL_HANDLE) return false;
+    if (s.pending) {
+        // The frame that last used this slot was kFramesInFlight frames ago;
+        // normally long finished, so this rarely blocks. It is the bound on how
+        // far the CPU may run ahead of the GPU.
+        vkWaitForFences(device_, 1, &s.fence, VK_TRUE, UINT64_MAX);
+        s.pending = false;
+    }
+    vkResetCommandBuffer(s.cmd, 0);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(s.cmd, &bi) != VK_SUCCESS) return false;
+    slotOpen_ = true;
+    slotView_ = 0;
+    slotRecorded_ = false;
+    return true;
+}
+
+void ModelRenderer::submitSlot(bool wait) {
+    if (!slotOpen_) return;
+    FrameSlot& s = slots_[slotIdx_];
+    vkEndCommandBuffer(s.cmd);
+    slotOpen_ = false;
+    vkResetFences(device_, 1, &s.fence);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &s.cmd;
+    if (vkQueueSubmit(queue_, 1, &si, s.fence) != VK_SUCCESS) {
+        // Nothing was queued, so there is nothing to wait for — and waiting on
+        // an unsignalled, unsubmitted fence would hang forever.
+        s.pending = false;
+        return;
+    }
+    s.pending = true;
+    if (wait) {
+        vkWaitForFences(device_, 1, &s.fence, VK_TRUE, UINT64_MAX);
+        s.pending = false;
+    }
+}
+
+void ModelRenderer::waitAllInFlight() {
+    for (FrameSlot& s : slots_) {
+        if (s.pending) {
+            vkWaitForFences(device_, 1, &s.fence, VK_TRUE, UINT64_MAX);
+            s.pending = false;
+        }
+    }
+}
+
+ModelRenderer::ViewUbo* ModelRenderer::nextViewUbo() {
+    if (slotView_ >= kMaxViewsPerSlot) {
+        // More views than the ring holds per frame: flush what is recorded and
+        // keep going in the same slot (its UBOs are free once the wait returns).
+        submitSlot(true);
+        if (!openSlot()) return nullptr;
+    }
+    ViewUbo& v = slots_[slotIdx_].views[slotView_];
+    if (v.buf.buffer == VK_NULL_HANDLE) {
+        v.buf = modelCreateBuffer(device_, physDevice_, sizeof(UniformBlock),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (v.buf.buffer == VK_NULL_HANDLE) return nullptr;
+        VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsai.descriptorPool = ringPool_;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &dsLayout_;
+        if (vkAllocateDescriptorSets(device_, &dsai, &v.set) != VK_SUCCESS) {
+            modelDestroyBuffer(device_, v.buf);
+            v.set = VK_NULL_HANDLE;
+            return nullptr;
+        }
+        VkDescriptorBufferInfo dbi = {v.buf.buffer, 0, sizeof(UniformBlock)};
+        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = v.set;
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w.pBufferInfo = &dbi;
+        vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+    }
+    // Binding 1 (material SSBO) follows descriptorSet_, which a model load
+    // repoints. Safe to update: this set's last use has completed (slot fence).
+    VkCopyDescriptorSet cp = {VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+    cp.srcSet = descriptorSet_;
+    cp.srcBinding = 1;
+    cp.dstSet = v.set;
+    cp.dstBinding = 1;
+    cp.descriptorCount = 1;
+    vkUpdateDescriptorSets(device_, 0, nullptr, 1, &cp);
+    ++slotView_;
+    return &v;
+}
+
+void ModelRenderer::beginFrame() {
+    if (!initialized_ || slotOpen_) return;
+    slotIdx_ = (slotIdx_ + 1) % kFramesInFlight;
+    openSlot();
+}
+
+void ModelRenderer::endFrame() {
+    if (!slotOpen_) return;
+    if (!slotRecorded_) {
+        // Nothing to draw this frame: close the recording without a submit.
+        vkEndCommandBuffer(slots_[slotIdx_].cmd);
+        slotOpen_ = false;
+        return;
+    }
+    submitSlot(false);
+}
+
 void ModelRenderer::renderEye(VkImage swapchainImage,
                               VkFormat swapchainFormat,
                               uint32_t imageWidth,
@@ -3228,17 +3385,50 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     const bool shadowPass = lightingMode_ == LightingMode::Scene && !sceneLights_.empty() &&
                             shadowsDirty_ && modelLoaded_ && ensureShadowResources();
 
-    updateUniforms(viewMatrix, projMatrix, clipFarViewSpace);
+    // #168: record into the frame ring. Outside beginFrame()/endFrame() this
+    // view opens its own slot and submits + waits at the end — the original
+    // one-round-trip-per-view behaviour, minus the per-view command-buffer
+    // allocate/free.
+    const bool implicitFrame = !slotOpen_;
+    if (implicitFrame) {
+        slotIdx_ = (slotIdx_ + 1) % kFramesInFlight;
+        if (!openSlot()) return;
+    }
+    ViewUbo* viewUbo = nextViewUbo();
+    if (!viewUbo) {
+        if (implicitFrame) submitSlot(true);
+        return;
+    }
+    // The shadow pass rewrites the per-light shadow UBOs from the host while
+    // recording; an earlier frame still on the GPU may be reading them.
+    if (shadowPass) waitAllInFlight();
 
+    updateUniforms(viewMatrix, projMatrix, clipFarViewSpace, &viewUbo->buf);
+    VkDescriptorSet viewSet = viewUbo->set;
+
+    // Kept for the mutation arm's second command buffer below (debug path).
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = cmdPool_;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device_, &ai, &cmd);
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+    VkCommandBuffer cmd = slots_[slotIdx_].cmd;
+    slotRecorded_ = true;
+
+    // Every resource below — the internal colour / scene-linear / depth / MSAA
+    // targets, the transmission copy, the mask target — is SHARED by all views
+    // and all in-flight frames. They used to be serialised by a CPU
+    // vkQueueWaitIdle after every view; now the previous view (this frame's, or
+    // an earlier frame's in submission order) may still be executing, so order
+    // against it on the GPU instead. A full memory barrier is exactly the old
+    // ordering, without the CPU in the loop.
+    {
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+    }
 
     // Scene-light shadow maps, before the first eye that needs them: on load, on
     // a lighting change, and per frame only while an animation plays.
@@ -3301,7 +3491,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // Set 0 (camera UBO) + set 2 (IBL): constant for the frame, shared by the
     // skybox and model pipelines (same layout).
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &viewSet, 0, nullptr);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
     // Set 3 (joint-matrix SSBO): one buffer for the whole model, bound once.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
@@ -3426,7 +3616,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         vkCmdBeginRenderPass(cmd, &rp2, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdSetViewport(cmd, 0, 1, &vpRect);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &viewSet, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &iblSet_, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 3, 1, &jointSet_, 0, nullptr);
         boundPipe = VK_NULL_HANDLE;   // new render pass: drawPrimitive rebinds
@@ -3492,6 +3682,9 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         // both this and uniformBuffer_ at submit, so they cannot be the same
         // allocation. clipFar is 0 here on purpose — the value only feeds
         // pbr.frag's discard, and coverage.frag has no code.
+        // maskUniform_ / maskTestUniform_ are single buffers; no earlier
+        // frame may still be reading them when the host rewrites them.
+        waitAllInFlight();
         updateUniforms(viewMatrix, projCov, 0.0f, &maskUniform_);
         recordMaskPass(cmd, maskSet_);
 
@@ -3529,6 +3722,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // Swapchain → TRANSFER_DST. First eye (vpX==0): UNDEFINED ok. Second eye:
     // preserve the first by treating the prior contents as COLOR_ATTACHMENT.
+    // TODO: "first tile" should be viewportX == 0 && viewportY == 0 — in a 2x2
+    // layout tile 2 at (0, tile_h) takes UNDEFINED and may discard tiles 0-1.
     VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toDst.srcAccessMask = (viewportX == 0) ? 0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -3574,14 +3769,18 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &toColor);
 
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
-    // The wait above is this function's existing sync point, so the coverage
-    // readback is already complete here — no fence pipeline, no extra stall.
+    // Submit + wait only when this view has to be finished before we return:
+    // outside a beginFrame()/endFrame() bracket (the original contract), or
+    // when the CPU is about to read this view's results back. Otherwise the
+    // view stays in the frame's command buffer and endFrame() submits it.
+    const bool needReadback = probeThisFrame || maskThisView;
+    if (implicitFrame || needReadback) {
+        submitSlot(true);
+        // A batched frame keeps recording into the same (now idle) slot.
+        if (!implicitFrame) openSlot();
+    }
+    // The wait above is this function's sync point for the readbacks, so the
+    // coverage readback is already complete here.
     if (probeThisFrame) readFacingProbe();   // same sync point covers it
     if (maskThisView) {
         // This view's UNCLIPPED coverage, read before the union OR so the
@@ -3686,7 +3885,6 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
             std::fflush(stdout);
         }
     }
-    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
 }
 
 // Decode what pbr.frag's facing probe wrote (see its encoding comment) and log
@@ -4131,6 +4329,7 @@ void ModelRenderer::cleanup() {
     if (depthImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, depthImage_);
     if (colorMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorMsaa_);
     if (sceneLinearMsaa_.image != VK_NULL_HANDLE) modelDestroyImage(device_, sceneLinearMsaa_);
+    destroyFrameRing();   // before cmdPool_ — its command buffers come from it
     if (cmdPool_ != VK_NULL_HANDLE) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
 
     initialized_ = false;
