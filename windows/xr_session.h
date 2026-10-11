@@ -27,6 +27,9 @@
 // flag (displayxr::common's XrSessionManager carries no app-named fields,
 // #396 W4); set by InitializeOpenXR.
 extern bool g_hasViewRigExt;
+//! XR_DXR_cursor_depth spec version when ENABLED at xrCreateInstance, else 0
+//! (absent, or opted out with DISPLAYXR_CURSOR_DEPTH=0).
+extern uint32_t g_cursorDepthSpecVersion;
 // XR_DXR_depth_budget (#116): optional — older runtimes (incl. today's on
 // this box) don't advertise it, and the app must run unchanged there.
 // Enabling is a pure opt-in; when absent dxr::ResolveClipPlanes(nullptr, ...)

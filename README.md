@@ -503,6 +503,13 @@ calibration, brightness, gamut and 3D cross-talk are separate concerns.
 | Ctrl+T | Toggle transparent background (desktop see-through; Windows only) |
 | Esc | Quit |
 
+**Depth-aware cursor.** Where the model pops out of the glass under the
+pointer, the runtime draws the cursor just in front of it (runtime ≥ v2.36,
+`XR_DXR_cursor_depth`; macOS and Linux today, Windows once the runtime's
+D3D compositors draw it). Elsewhere the OS cursor is unchanged.
+`DISPLAYXR_CURSOR_DEPTH=0` turns it off. How it is wired, and how another demo
+can adopt it: [docs/depth-cursor.md](docs/depth-cursor.md).
+
 ## Undocking the viewer (launch flags + `displayxr-view:` links)
 
 The viewer can be started by a web page, by a CAD app, or from a shell tile as

@@ -145,6 +145,7 @@
 #include "recenter_control.h"  // dynamic-recenter per-axis pins (P then X/Y/Z, or DXR_RECENTER_PIN)
 #include "auto_fit.h"          // dxr::AutoFitVHeight — shared width-aware load-time framing
 #include "model_fit.h"         // modelviewer::FitVHeight — the page-parity framing rule
+#include "model_cursor_depth.h" // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, model ray cast
 #include "model_loader.h"
 #include "mode_switch.h"       // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (V / 0-8)
 #include "rig_mode.h"          // dxr::RigResetToInitial / RigToggleMode — SPACE + C
@@ -209,6 +210,14 @@ static bool g_launchTransparent = false; //!< --transparent on the command line
 // displayxr-common's displayxr::linux_window. Destroyed LAST (the runtime's
 // VkSurfaceKHR borrows its connection).
 static DxrLinuxWindow g_window;
+// Depth-aware cursor (XR_DXR_cursor_depth): the runtime draws it in front of the
+// model where the model pops out of the glass; the app supplies the depth
+// (ModelRenderer::raycast). displayxr::linux_window is X11 OR Wayland, so this
+// leg feeds the pointer by hand (setPointerUV from Motion events) and hides the
+// OS cursor with the window's own set_cursor() - the helper's manual path.
+// Declared after g_window: destroyed BEFORE it.
+static dxr::CursorDepth g_cursor;
+static modelviewer::CursorDepthAdoption g_cursorAdopt;
 //! Title last pushed to the window (the header bar shows the loaded file).
 static std::string g_windowTitle;
 
@@ -603,6 +612,7 @@ struct AppXrSession {
 
     bool hasDisplayInfoExt = false;
     bool hasViewRigExt = false;
+    uint32_t cursorDepthSpecVersion = 0; //!< XR_DXR_cursor_depth, 0 = not enabled
     bool hasXlibBindingExt = false;   //!< XR_DXR_xlib_window_binding (handle app, X11)
     bool hasWaylandBindingExt = false;//!< XR_DXR_wayland_surface_binding (handle app, Wayland)
     //! The window platform resolved before xrCreateInstance (only its binding
@@ -676,6 +686,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            modelviewer::CursorDepthWanted())
+            xr.cursorDepthSpecVersion = e.extensionVersion;
         if (strcmp(e.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasXlibBindingExt = true;
         if (strcmp(e.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) xr.hasWaylandBindingExt = true;
         if (strcmp(e.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
@@ -691,6 +704,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    if (xr.cursorDepthSpecVersion > 0) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
+             xr.cursorDepthSpecVersion);
     // Handle app: resolve the window platform BEFORE xrCreateInstance, so
     // exactly the binding extension the session will chain gets ENABLED.
     // Capability-probed (a connection attempt + what the server advertises),
@@ -2017,6 +2033,8 @@ static void HandleWindowEvent(const DxrWindowEvent& ev) {
     case DxrWindowEvent::Type::Motion:
         g_input.mouseX = ev.x;
         g_input.mouseY = ev.y;
+        if (!g_cursorAdopt.scripted() && g_windowW > 0 && g_windowH > 0)
+            g_cursor.setPointerUV((float)ev.x / (float)g_windowW, (float)ev.y / (float)g_windowH);
         if (g_input.dragging) {
             MarkUserInput(g_input);
             const int dx = g_input.mouseX - g_input.dragStartX;
@@ -2028,6 +2046,10 @@ static void HandleWindowEvent(const DxrWindowEvent& ev) {
             g_input.dragStartX = g_input.mouseX;
             g_input.dragStartY = g_input.mouseY;
         }
+        break;
+
+    case DxrWindowEvent::Type::PointerLeave:
+        if (!g_cursorAdopt.scripted()) g_cursor.clearPointerUV();   // off the canvas: no hint
         break;
 
     case DxrWindowEvent::Type::Resize:
@@ -2456,6 +2478,11 @@ int main(int argc, char** argv) {
         TryAutoLoadBundledScene();
     }
 
+    g_cursorAdopt.setup(g_cursor, g_modelRenderer, xr.cursorDepthSpecVersion);
+    g_cursor.onDepthCursorShownChanged([](bool shown) {
+        g_window.set_cursor(shown ? DxrCursor::Hidden : DxrCursor::Default);
+    });
+
     LOG_INFO("=== Entering main loop ===");
     auto lastTime = std::chrono::high_resolution_clock::now();
     bool modeAsserted = false;
@@ -2581,6 +2608,7 @@ int main(int argc, char** argv) {
             const bool useDepthBudget = xr.hasDepthBudgetExt && useRig;
             if (useDepthBudget) dxr::ChainRearDepthBudget(viewState, rearBudget);
 
+            g_cursor.chain(locateInfo, viewState);
             XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState,
                                         runtimeViewCount, &runtimeViewCount, views);
             if (XR_SUCCEEDED(lr) &&
@@ -2631,6 +2659,8 @@ int main(int argc, char** argv) {
                 uint32_t tileColumns = (xr.renderingModeCount > 0 && xr.renderingModeTileColumns[m] > 0)
                     ? xr.renderingModeTileColumns[m] : (monoMode ? 1u : 2u);
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
+                g_cursor.afterLocate(views, (uint32_t)eyeCount);
+                if (g_cursorAdopt.endFrame(g_cursor)) LOG_INFO("%s", g_cursorAdopt.summary());
 
                 float scaleX = (xr.renderingModeCount > 0 && m < xr.renderingModeCount) ? xr.renderingModeScaleX[m] : 1.0f;
                 float scaleY = (xr.renderingModeCount > 0 && m < xr.renderingModeCount) ? xr.renderingModeScaleY[m] : 1.0f;
@@ -3016,6 +3046,7 @@ int main(int argc, char** argv) {
     CleanupOpenXR(xr);
     if (vkDevice) vkDestroyDevice(vkDevice, nullptr);
     if (vkInstance) vkDestroyInstance(vkInstance, nullptr);
+    g_cursor.enable(0);   // restores the OS cursor while the window still exists
     g_window.destroy();   // LAST: the runtime's VkSurfaceKHR borrowed this connection
     LOG_INFO("Clean exit");
     return 0;

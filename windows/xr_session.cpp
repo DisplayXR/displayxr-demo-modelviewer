@@ -7,10 +7,12 @@
 
 #include "xr_session.h"
 #include "logging.h"
+#include "model_cursor_depth.h" // modelviewer::CursorDepthWanted (XR_DXR_cursor_depth)
 #include <cstring>
 #include <vector>
 
 bool g_hasViewRigExt = false;
+uint32_t g_cursorDepthSpecVersion = 0;
 bool g_hasDisplayZonesExt = false;   // display_zones AND local_3d_zone (#63)
 bool g_hasDepthBudgetExt = false;    // XR_DXR_depth_budget (#116), optional
 uint32_t g_depthBudgetExtVersion = 0; // extensionVersion reported alongside it (0 = absent)
@@ -97,6 +99,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
             g_hasMcpToolsExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            modelviewer::CursorDepthWanted()) {
+            g_cursorDepthSpecVersion = ext.extensionVersion;
+        }
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
             g_hasDisplayZonesExt = true;   // AND-ed with local_3d_zone below
         }
@@ -126,6 +132,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_mcp_tools: %s", g_hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", g_cursorDepthSpecVersion ? "ENABLED" : "off",
+        g_cursorDepthSpecVersion);
     LOG_INFO("XR_DXR_display_zones(+local_3d_zone): %s", g_hasDisplayZonesExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_depth_budget: %s (v%u)", g_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
         g_depthBudgetExtVersion);
@@ -159,6 +167,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasMcpToolsExt) {
         enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
+    }
+    if (g_cursorDepthSpecVersion > 0) {
+        enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
     }
     if (g_hasDisplayZonesExt) {
         enabledExtensions.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
