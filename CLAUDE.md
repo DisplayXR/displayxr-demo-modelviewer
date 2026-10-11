@@ -49,6 +49,11 @@ model_common/                     — the renderer (vendor-neutral, analog of
   model_renderer.{h,cpp}          — metallic-roughness GGX raster pass into an
                                     internal colour image, blitted into the
                                     per-eye swapchain viewport; IBL generation
+  model_raycast.{h,cpp}           — CPU ray cast (BVH per rigid cluster,
+                                    follows node anim + rigid skinning): the
+                                    depth source of the depth-aware cursor
+                                    (common/model_cursor_depth.h,
+                                    docs/depth-cursor.md)
   model_vulkan_utils.{h,cpp}      — VkBuffer/VkImage helpers
   shaders/                        — pbr.{vert,frag}; skybox.frag; IBL gen:
                                     fullscreen.vert, brdf_lut/irradiance/

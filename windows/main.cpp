@@ -45,6 +45,7 @@
 #include "auto_fit.h"          // dxr::AutoFitVHeight / FitTransition — shared width-aware framing
 #include "auto_fit_canvas.h"   // dxr::AutoFitCanvas — the runtime-resolved viewport (shell tile)
 #include "model_fit.h"         // modelviewer::FitVHeight — the page-parity framing rule
+#include "model_cursor_depth.h" // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, model ray cast
 // ── The undock launch contract (displayxr-common v2.9.0) ──────────────────
 // One grammar + one security policy shared with the splat viewer: a web page
 // or a CAD app spawns this viewer transparent, borderless and topmost at a
@@ -2445,6 +2446,15 @@ static void RenderThreadFunc(
 {
     LOG_INFO("[RenderThread] Started");
 
+    // Depth-aware cursor: the runtime draws it in front of the model where the
+    // model pops out of the glass; the app supplies the depth
+    // (ModelRenderer::raycast). Until the D3D11/D3D12 compositors draw it
+    // (runtime #1944) willDraw stays false here and the OS cursor stays: inert.
+    dxr::CursorDepth cursor;
+    modelviewer::CursorDepthAdoption cursorAdopt;
+    cursorAdopt.setup(cursor, g_modelRenderer, g_cursorDepthSpecVersion);
+    if (!cursorAdopt.scripted()) cursor.setWindowWin32(hwnd);
+
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
@@ -2909,6 +2919,7 @@ static void RenderThreadFunc(
                         uint32_t viewCount = 8;
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
+                        cursor.chain(locateInfo, viewState);
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
                         // A runtime that recognizes the chained struct always overwrites
@@ -2990,6 +3001,8 @@ static void RenderThreadFunc(
                         }
                         const int eyeCount = monoMode ? 1 : (int)activeViewCount;
                         submittedViewCount = (uint32_t)eyeCount;
+                        cursor.afterLocate(rawViews, (uint32_t)eyeCount);
+                        if (cursorAdopt.endFrame(cursor)) LOG_INFO("%s", cursorAdopt.summary());
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims

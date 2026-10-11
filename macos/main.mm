@@ -62,6 +62,7 @@
 #include "atlas_capture.h"
 #include "auto_fit.h"    // dxr::AutoFitVHeight — shared width-aware load-time framing
 #include "model_fit.h"   // modelviewer::FitVHeight — the page-parity framing rule
+#include "model_cursor_depth.h" // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, model ray cast
 
 // ============================================================================
 // Logging
@@ -1079,6 +1080,10 @@ struct AppXrSession {
     // render-ready XrView{pose, fov}; the app deletes its own.
     bool hasViewRigExt = false;
 
+    // XR_DXR_cursor_depth (runtime ADR-046): the runtime draws a depth cursor
+    // in front of content that pops out under the pointer. 0 = not enabled.
+    uint32_t cursorDepthSpecVersion = 0;
+
     // XR_DXR_mcp_tools (#22): app-defined agent tools on the runtime-hosted
     // per-process MCP server. The whole path is inert when the extension or
     // the MCP capability gate is absent — never load-bearing.
@@ -1240,6 +1245,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            modelviewer::CursorDepthWanted())
+            xr.cursorDepthSpecVersion = ext.extensionVersion;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
@@ -1252,6 +1260,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasMcpToolsExt) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    if (xr.cursorDepthSpecVersion > 0) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
+             xr.cursorDepthSpecVersion);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -2412,6 +2423,14 @@ int main() {
     LOG_INFO("          [/]=Exposure  G=Tone curve  (drop an .hdr to change the environment)");
     LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.glb/.gltf also accept drag-and-drop)");
 
+    // Depth-aware cursor: the runtime draws it (default look) in front of the
+    // model where the model pops out of the glass; the app supplies the depth
+    // (ModelRenderer::raycast). Inert when the extension is off / opted out.
+    dxr::CursorDepth cursor;
+    modelviewer::CursorDepthAdoption cursorAdopt;
+    cursorAdopt.setup(cursor, g_modelRenderer, xr.cursorDepthSpecVersion);
+    if (!cursorAdopt.scripted()) cursor.setWindowCocoa((__bridge void*)g_metalView);
+
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (g_running && !xr.exitRequested) {
@@ -2567,6 +2586,7 @@ int main() {
                     XrView views[8] = {};
                     for (uint32_t v = 0; v < runtimeViewCount; v++) views[v].type = XR_TYPE_VIEW;
 
+                    cursor.chain(locateInfo, viewState);
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState,
                         runtimeViewCount, &runtimeViewCount, views);
                     if (XR_SUCCEEDED(locResult) &&
@@ -2615,6 +2635,8 @@ int main() {
                             : 1u;
 
                         int eyeCount = monoMode ? 1 : (int)modeViewCount;
+                        cursor.afterLocate(views, (uint32_t)eyeCount);
+                        if (cursorAdopt.endFrame(cursor)) LOG_INFO("%s", cursorAdopt.summary());
 
                         // HUD eye readout. Under the rig, views[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel

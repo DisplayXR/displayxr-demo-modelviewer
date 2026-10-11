@@ -25,6 +25,7 @@
 #include <vector>
 #include "model_vulkan_utils.h"
 #include "model_loader.h"
+#include "model_raycast.h"
 // MV_TEX_SLOTS / MV_MAT_VEC4S. A GLSL file, included here on purpose: it holds
 // nothing but #defines, and shaders/pbr.frag includes the same bytes. The
 // material SSBO's stride is a function of both numbers, so they cannot be
@@ -177,6 +178,14 @@ struct ModelRenderer {
     bool getAnimatedAnchor(float out[3]) const;
     bool pickSurface(const float rayOrigin[3], const float rayDir[3],
                      float hitPos[3], float maxDistance = 100.0f) const;
+    //! Nearest surface along origin + t * dir (world space = the locate space
+    //! under XR_DXR_view_rig), following the CURRENT animated pose: node
+    //! animation exactly, skinning rigidly per dominant joint, morph targets
+    //! not at all (model_raycast.h). The depth source of the depth-aware
+    //! cursor (XR_DXR_cursor_depth). Cheap: per-cluster BVH, no allocation.
+    bool raycast(const float origin[3], const float dir[3], float& tOut) const {
+        return raycaster_.raycast(origin, dir, tOut);
+    }
     float findBestYaw(const float displayCenter[3],
                       const float viewerOffsetLocal[3],
                       uint32_t numCandidates = 8) const;
@@ -869,4 +878,10 @@ private:
     float bboxMin_[3] = {0, 0, 0};
     float bboxMax_[3] = {0, 0, 0};
     bool  hasBBox_ = false;
+
+    // CPU ray cast (depth-aware cursor). Built in finalizeModel; its cluster
+    // transforms follow primitives_[].modelMatrix and a CPU copy of the joint
+    // matrices (jointMatsCpu_, empty = the identity bind pose).
+    ModelRaycaster     raycaster_;
+    std::vector<float> jointMatsCpu_;
 };

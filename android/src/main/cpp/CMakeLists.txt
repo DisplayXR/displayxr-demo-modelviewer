@@ -106,6 +106,7 @@ add_library(model_viewer_vk_android SHARED
     stb_impl.cpp
     # ── SHARED renderer (model_common/), gltf-only subset ──
     ${MODEL_COMMON}/model_renderer.cpp
+    ${MODEL_COMMON}/model_raycast.cpp
     ${MODEL_COMMON}/model_loader.cpp
     ${MODEL_COMMON}/model_loader_gltf.cpp
     ${MODEL_COMMON}/model_loader_material.cpp
