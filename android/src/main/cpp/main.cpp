@@ -957,6 +957,15 @@ create_swapchains()
 	// debug button-bar swapchain (hud_bar) takes this same format; its CPU
 	// display-referred bytes land via vkCmdCopyBufferToImage (no conversion),
 	// so they are now honestly declared as encoded. UNORM stays the fallback.
+	//
+	// Cost note (#168): on the runtime's in-process Vulkan compositor an
+	// `_SRGB` swapchain is composed through a per-frame vkCmdCopyImage into an
+	// UNORM scratch (runtime #1559), and on Adreno 740 that copy makes the
+	// driver allocate + zero fresh GPU memory every frame: ~20-35 ms of CPU
+	// inside xrEndFrame, growing over a run. Measured with this app's frame
+	// ring: ~22 fps `_SRGB` vs ~30 fps flat on R8G8B8A8_UNORM holding linear
+	// values. The format stays `_SRGB` (INV-4.6); the copy is the runtime's to
+	// make cheap, not something to route around here.
 	const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB,
 	                             VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
 	for (int64_t pref : preferred) {
@@ -1055,13 +1064,19 @@ gs_init()
 		LOGE("ModelRenderer::init failed");
 		return false;
 	}
-	// Full quality: all 177k gaussians at full resolution. The fps is capped
-	// by the runtime weave/present (~14 fps), not app compute — render-scale,
-	// fewer gaussians, and removing the CPU-readback round-trips all left fps
-	// unchanged — so there's no perf reason to subsample. (setGaussianStride /
-	// setRenderScale knobs remain for future tuning.)
+	// Frame cost (#168, measured on an Adreno 740 phone). An earlier comment
+	// here said fps was "capped by the runtime weave/present (~14 fps), not app
+	// compute". That was wrong, and it was a gaussian-splat comment besides:
+	// this renderer draws a glTF mesh, there are no gaussians. simpleperf put
+	// ~80% of this thread's CPU inside xrEndFrame, in the Adreno driver
+	// allocating and zeroing fresh GPU memory for the runtime's per-frame
+	// sRGB->UNORM staging copy (see the note at the swapchain format choice),
+	// and the rest of the frame was this app's own per-tile submit +
+	// vkQueueWaitIdle, which alternated CPU and GPU so the GPU governor
+	// settled at its lowest clock. Tiles are now one non-waited submit per
+	// frame (beginFrame / endFrame); #168 has the before/after numbers.
 	g_model_ready = true;
-	LOGI("ModelRenderer initialized (%ux%u/eye, full quality 177k)", g_views[0].width, g_views[0].height);
+	LOGI("ModelRenderer initialized (atlas %ux%u)", g_views[0].width, g_views[0].height);
 	return true;
 }
 
@@ -1534,6 +1549,13 @@ render_frame()
 				res = xrWaitSwapchainImage(g_views[0].swapchain, &wait_img);
 			}
 			if (res == XR_SUCCESS) {
+				// #168: all of this frame's tiles go into ONE command buffer,
+				// submitted at endFrame() without a CPU wait, so the GPU draws
+				// this frame while the CPU moves on (and up to two more frames
+				// may queue behind it). Before, every tile was its own
+				// submit + vkQueueWaitIdle: CPU and GPU took turns, neither was
+				// ever busy enough for DVFS to raise the GPU clock.
+				g_model.beginFrame();
 				for (uint32_t i = 0; i < view_count; ++i) {
 					const uint32_t tile_x = (i % cols) * tile_w;
 					const uint32_t tile_y = (i / cols) * tile_h;
@@ -1580,6 +1602,10 @@ render_frame()
 					if (located_n > submitted_view_count)
 						submitted_view_count = located_n;
 				}
+				// Submit BEFORE the release: the runtime composes on this same
+				// VkQueue, so it is submission order — not a CPU wait — that
+				// puts the tiles ahead of its read of the image.
+				g_model.endFrame();
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
 				res = xrReleaseSwapchainImage(g_views[0].swapchain, &rel);

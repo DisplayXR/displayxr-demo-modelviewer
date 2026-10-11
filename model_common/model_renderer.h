@@ -181,6 +181,30 @@ struct ModelRenderer {
                       const float viewerOffsetLocal[3],
                       uint32_t numCandidates = 8) const;
 
+    // ── Frame-batched submission (#168) ──────────────────────────────────────
+    //
+    // By default every renderEye() records into a command buffer, submits it
+    // and waits for it — one CPU<->GPU round trip per view, with the CPU idle
+    // while the GPU draws and the GPU idle while the CPU records. That is the
+    // behaviour the desktop legs still get.
+    //
+    // A caller that brackets its views with beginFrame()/endFrame() instead
+    // gets ONE command buffer for all of the frame's views, submitted once at
+    // endFrame() and NOT waited on: up to kFramesInFlight frames may be on the
+    // GPU while the CPU builds the next one. Command buffers, fences and the
+    // per-view camera UBOs are a fixed ring reused frame after frame (no
+    // per-view vkAllocateCommandBuffers/vkFreeCommandBuffers, which on Adreno
+    // allocates and zeroes fresh GPU memory every time). Call endFrame() BEFORE
+    // releasing the swapchain image: the runtime composes on the same queue,
+    // so submission order is what makes the views visible to it.
+    //
+    // Paths that read GPU results back on the CPU (the facing probe, the
+    // coverage mask) or rewrite a model-wide host-visible buffer (skinning,
+    // morph targets, scene-light shadow UBOs) still wait, exactly where they
+    // need to — so they stay correct, they just do not pipeline.
+    void beginFrame();
+    void endFrame();
+
     void renderEye(VkImage swapchainImage,
                    VkFormat swapchainFormat,
                    uint32_t imageWidth,
@@ -656,6 +680,36 @@ private:
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
     ModelBuffer uniformBuffer_;   // host-visible UniformBlock
+
+    // ── Frame ring (#168, see beginFrame) ──────────────────────────────────
+    // Each view of each in-flight frame owns its camera UBO + a set-0
+    // descriptor set pointing at it (binding 1, the material SSBO, is copied
+    // from descriptorSet_ at use, so it always tracks the current model).
+    static constexpr uint32_t kFramesInFlight = 3;
+    static constexpr uint32_t kMaxViewsPerSlot = 16;
+    struct ViewUbo {
+        ModelBuffer buf;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
+    struct FrameSlot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        bool pending = false;   // submitted, fence not yet observed
+        ViewUbo views[kMaxViewsPerSlot];
+    };
+    FrameSlot slots_[kFramesInFlight];
+    VkDescriptorPool ringPool_ = VK_NULL_HANDLE;
+    uint32_t slotIdx_ = 0;
+    uint32_t slotView_ = 0;       // next ViewUbo in the open slot
+    bool slotOpen_ = false;       // slots_[slotIdx_].cmd is recording
+    bool frameBatched_ = false;   // opened by beginFrame(), not by renderEye
+    bool slotRecorded_ = false;   // anything recorded since the slot opened
+    bool createFrameRing();
+    void destroyFrameRing();
+    bool openSlot();              // wait its fence, reset, begin recording
+    void submitSlot(bool wait);   // end + submit (+ wait) the open slot
+    void waitAllInFlight();       // before host writes to model-wide buffers
+    ViewUbo* nextViewUbo();
     // Host-visible MaterialExtGpu[]; rebuilt per model load. Always holds at
     // least one (all-default) entry so the binding is valid even for a model
     // with no materials at all.
