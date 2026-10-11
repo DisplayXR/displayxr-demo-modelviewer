@@ -1550,11 +1550,14 @@ render_frame()
 			}
 			if (res == XR_SUCCESS) {
 				// #168: all of this frame's tiles go into ONE command buffer,
-				// submitted at endFrame() without a CPU wait, so the GPU draws
-				// this frame while the CPU moves on (and up to two more frames
-				// may queue behind it). Before, every tile was its own
-				// submit + vkQueueWaitIdle: CPU and GPU took turns, neither was
-				// ever busy enough for DVFS to raise the GPU clock.
+				// submitted at endFrame() without a CPU wait between tiles.
+				// Before, every tile was its own allocate + submit +
+				// vkQueueWaitIdle + free: CPU and GPU took turns, and each
+				// allocate/free cost the Adreno driver a fresh zeroed
+				// allocation. The ring ALLOWS up to 3 frames in flight, but
+				// today the runtime ends every xrEndFrame with vkQueueWaitIdle
+				// on this queue, so at most one is ever pending; the overlap
+				// arrives for free once the runtime stops draining the queue.
 				g_model.beginFrame();
 				for (uint32_t i = 0; i < view_count; ++i) {
 					const uint32_t tile_x = (i % cols) * tile_w;
@@ -1603,8 +1606,10 @@ render_frame()
 						submitted_view_count = located_n;
 				}
 				// Submit BEFORE the release: the runtime composes on this same
-				// VkQueue, so it is submission order — not a CPU wait — that
-				// puts the tiles ahead of its read of the image.
+				// VkQueue. Submission order alone does not order memory; what
+				// does is the barrier chain — each tile's blit ends with a
+				// TRANSFER_WRITE -> COLOR_ATTACHMENT_OUTPUT barrier, which the
+				// runtime's own barriers on the image chain onto.
 				g_model.endFrame();
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;

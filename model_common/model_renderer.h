@@ -190,13 +190,16 @@ struct ModelRenderer {
     //
     // A caller that brackets its views with beginFrame()/endFrame() instead
     // gets ONE command buffer for all of the frame's views, submitted once at
-    // endFrame() and NOT waited on: up to kFramesInFlight frames may be on the
-    // GPU while the CPU builds the next one. Command buffers, fences and the
+    // endFrame() and NOT waited on. The ring allows up to kFramesInFlight
+    // frames on the GPU while the CPU builds the next one — once the runtime
+    // stops ending xrEndFrame with vkQueueWaitIdle on the app queue; until
+    // then at most one slot is ever pending. Command buffers, fences and the
     // per-view camera UBOs are a fixed ring reused frame after frame (no
     // per-view vkAllocateCommandBuffers/vkFreeCommandBuffers, which on Adreno
     // allocates and zeroes fresh GPU memory every time). Call endFrame() BEFORE
     // releasing the swapchain image: the runtime composes on the same queue,
-    // so submission order is what makes the views visible to it.
+    // and the barriers each view records on the swapchain image (chained with
+    // the runtime's) are what make its writes visible to that read.
     //
     // Paths that read GPU results back on the CPU (the facing probe, the
     // coverage mask) or rewrite a model-wide host-visible buffer (skinning,
@@ -702,7 +705,6 @@ private:
     uint32_t slotIdx_ = 0;
     uint32_t slotView_ = 0;       // next ViewUbo in the open slot
     bool slotOpen_ = false;       // slots_[slotIdx_].cmd is recording
-    bool frameBatched_ = false;   // opened by beginFrame(), not by renderEye
     bool slotRecorded_ = false;   // anything recorded since the slot opened
     bool createFrameRing();
     void destroyFrameRing();

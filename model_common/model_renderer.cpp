@@ -3232,7 +3232,7 @@ void ModelRenderer::destroyFrameRing() {
         s.pending = false;
     }
     if (ringPool_ != VK_NULL_HANDLE) { vkDestroyDescriptorPool(device_, ringPool_, nullptr); ringPool_ = VK_NULL_HANDLE; }
-    slotOpen_ = frameBatched_ = slotRecorded_ = false;
+    slotOpen_ = slotRecorded_ = false;
 }
 
 bool ModelRenderer::openSlot() {
@@ -3333,12 +3333,11 @@ ModelRenderer::ViewUbo* ModelRenderer::nextViewUbo() {
 void ModelRenderer::beginFrame() {
     if (!initialized_ || slotOpen_) return;
     slotIdx_ = (slotIdx_ + 1) % kFramesInFlight;
-    frameBatched_ = openSlot();
+    openSlot();
 }
 
 void ModelRenderer::endFrame() {
-    if (!slotOpen_) { frameBatched_ = false; return; }
-    frameBatched_ = false;
+    if (!slotOpen_) return;
     if (!slotRecorded_) {
         // Nothing to draw this frame: close the recording without a submit.
         vkEndCommandBuffer(slots_[slotIdx_].cmd);
@@ -3723,6 +3722,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     // Swapchain → TRANSFER_DST. First eye (vpX==0): UNDEFINED ok. Second eye:
     // preserve the first by treating the prior contents as COLOR_ATTACHMENT.
+    // TODO: "first tile" should be viewportX == 0 && viewportY == 0 — in a 2x2
+    // layout tile 2 at (0, tile_h) takes UNDEFINED and may discard tiles 0-1.
     VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toDst.srcAccessMask = (viewportX == 0) ? 0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
