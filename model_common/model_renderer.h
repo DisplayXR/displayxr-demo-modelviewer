@@ -339,6 +339,7 @@ private:
         float p9[4];   // coatColor.rgb, hasCoat (0/1)   (KHR_materials_coat)
         // KHR_texture_transform, one entry per MaterialTexSlot:
         //   uvXf[i] = (offset.x, offset.y, scale.x, scale.y),  uvRot[i].x = radians
+        //   uvRot[i].y = 1 when a real texture is bound in slot i (pbr.frag slotBound)
         // Identity (0,0,1,1 / 0) unless the asset supplied a transform.
         // MV_TEX_SLOTS, not MTS_COUNT/MTEX_COUNT: the shader spells the length
         // the same way, out of the same file. The enums are asserted equal to it
@@ -373,7 +374,8 @@ private:
         //   tone.w       = probe SELECT (0 none, 1 transmission #75, 2 facing #98)
         //   viewport.zw  = DXR_MODELVIEWER_KULLA_CONTY / _COAT_SPEC_HEMI
         //   studio.xyzw, studioFill.w, studioRim.w = the Studio rig
-        //   hemiSky.w, hemiGround.w = unused (ub{} zeroes them; the only free lanes)
+        //   hemiSky.w    = 1 forces every material texture tap (DXR_MODELVIEWER_EXTTEX)
+        //   hemiGround.w = unused (ub{} zeroes it; the only free lane)
         float tone[4];         // x=exposure (2^EV), y=curve id, z=directional-light scale,
                                // w=probe select (0 = normal shading; see above)
         // The internal colour target is the size of the whole SWAPCHAIN IMAGE,
@@ -531,6 +533,27 @@ private:
     // desktop stays hard however many samples are taken. Internal edges and
     // texture detail are what improve.
     VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;
+    // ── Tile-memory store discipline (perf/android-gpu-cost) ─────────────────
+    // renderPassFast_ is a COMPATIBLE twin of renderPass_ (same formats, same
+    // sample counts, same framebuffer and pipelines) whose only difference is
+    // the store ops: the multisampled colour pair, the depth buffer and the
+    // scene-linear resolve are DONT_CARE, so only colorImage_ (the image the
+    // per-view blit reads) is written out. renderPass_ must STORE them only
+    // because the transmissive second pass (renderPassLoad_) LOADs them back;
+    // a frame without that pass never reads them again. On a tiler (Adreno,
+    // Mali, Apple) a STORE writes the whole attachment from tile memory to
+    // DRAM — at 4x MSAA that is 4 x (RGBA8 + RGBA16F + D32) = 64 bytes per
+    // pixel per view, every frame, for data nobody reads. Measured on the
+    // Lume phone at a pinned 680 MHz: 15.5 -> 10.5 ms of GPU per frame, no
+    // pixel changes. DXR_MODELVIEWER_TILESTORE=0 / debug.dxr.mv.tilestore 0
+    // restores the always-STORE pass (A/B only).
+    VkRenderPass renderPassFast_ = VK_NULL_HANDLE;
+    bool  fastStore_ = true;
+    // Material slots without a texture are bound to white (the multiplicative
+    // identity), so pbr.frag skips their taps (MatExt.uvRot[].y = bound flag).
+    // DXR_MODELVIEWER_EXTTEX=1 / debug.dxr.mv.exttex 1 forces every tap (A/B
+    // only; rides UniformBlock::hemiSky.w).
+    bool  extTexAll_ = false;
     ModelImage colorMsaa_;         // only when samples_ > 1
     ModelImage sceneLinearMsaa_;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;

@@ -91,7 +91,7 @@ struct MatExt {
     // MV_TEX_SLOTS, never a literal: this length IS the struct's stride, and
     // C++ derives its own from the same define (#81).
     vec4 uvXf[MV_TEX_SLOTS];   // offset.xy, scale.xy
-    vec4 uvRot[MV_TEX_SLOTS];  // .x = rotation (radians)
+    vec4 uvRot[MV_TEX_SLOTS];  // .x = rotation (radians), .y = texture bound (0/1)
 };
 layout(set = 0, binding = 1, std430) readonly buffer MatExtBuf {
     MatExt materials[];
@@ -488,6 +488,13 @@ vec3 studioDiffuseLobe(vec3 N, vec3 V, vec3 L, vec3 albedo, vec3 f0, vec3 f90,
     return kd * albedo / PI * dr * ndotl;
 }
 
+// A KHR_materials_* texture slot holds a real texture. Absent slots are bound
+// to white, the multiplicative identity, so skipping the tap is exact. The
+// condition is dynamically uniform (push-constant material index + UBO), so
+// the implicit-LOD taps inside it keep their derivatives. hemiSky.w = 1
+// (DXR_MODELVIEWER_EXTTEX=1) forces every tap, for A/B only.
+bool slotBound(int s) { return ubo.hemiSky.w > 0.5 || MAT.uvRot[s].y > 0.5; }
+
 void main() {
     // Foreground-only clip (transparent mode): drop geometry behind the
     // display plane. 0 = disabled (opaque path unaffected).
@@ -597,27 +604,27 @@ void main() {
     // Fold the texture variants into the factors. sheenColor/specularColor are
     // sRGB-encoded per spec and arrive decoded (_SRGB views); the rest are
     // linear single channels.
-    clearcoatFactor    *= texture(clearcoatTex, xfUV(XF_CLEARCOAT, inUV)).r;
-    clearcoatRoughness  = clamp(clearcoatRoughness * texture(clearcoatRoughTex, xfUV(XF_CLEARCOAT_ROUGH, inUV)).g, 0.03, 1.0);
-    sheenColor         *= texture(sheenColorTex, xfUV(XF_SHEEN_COLOR, inUV)).rgb;
-    sheenRoughness      = clamp(sheenRoughness * texture(sheenRoughTex, xfUV(XF_SHEEN_ROUGH, inUV)).a, 0.05, 1.0);
-    specularFactor     *= texture(specularTex, xfUV(XF_SPECULAR, inUV)).a;
-    specularColor      *= texture(specularColorTex, xfUV(XF_SPECULAR_COLOR, inUV)).rgb;
-    transmissionFactor  = clamp(transmissionFactor * texture(transmissionTex, xfUV(XF_TRANSMISSION, inUV)).r, 0.0, 1.0);
-    volumeThickness    *= texture(thicknessTex, xfUV(XF_THICKNESS, inUV)).g;
+    clearcoatFactor    *= (slotBound(XF_CLEARCOAT) ? texture(clearcoatTex, xfUV(XF_CLEARCOAT, inUV)).r : 1.0);
+    clearcoatRoughness  = clamp(clearcoatRoughness * (slotBound(XF_CLEARCOAT_ROUGH) ? texture(clearcoatRoughTex, xfUV(XF_CLEARCOAT_ROUGH, inUV)).g : 1.0), 0.03, 1.0);
+    sheenColor         *= (slotBound(XF_SHEEN_COLOR) ? texture(sheenColorTex, xfUV(XF_SHEEN_COLOR, inUV)).rgb : vec3(1.0));
+    sheenRoughness      = clamp(sheenRoughness * (slotBound(XF_SHEEN_ROUGH) ? texture(sheenRoughTex, xfUV(XF_SHEEN_ROUGH, inUV)).a : 1.0), 0.05, 1.0);
+    specularFactor     *= (slotBound(XF_SPECULAR) ? texture(specularTex, xfUV(XF_SPECULAR, inUV)).a : 1.0);
+    specularColor      *= (slotBound(XF_SPECULAR_COLOR) ? texture(specularColorTex, xfUV(XF_SPECULAR_COLOR, inUV)).rgb : vec3(1.0));
+    transmissionFactor  = clamp(transmissionFactor * (slotBound(XF_TRANSMISSION) ? texture(transmissionTex, xfUV(XF_TRANSMISSION, inUV)).r : 1.0), 0.0, 1.0);
+    volumeThickness    *= (slotBound(XF_THICKNESS) ? texture(thicknessTex, xfUV(XF_THICKNESS, inUV)).g : 1.0);
     // KHR_materials_scatter (draft; issue #79). Strength rides the texture's
     // ALPHA channel, the multi-scatter colour its RGB (sRGB-encoded), per spec.
-    float scatterStrength = clamp(MAT.p6.x * texture(scatterStrengthTex, xfUV(XF_SCATTER_STRENGTH, inUV)).a, 0.0, 1.0);
+    float scatterStrength = clamp(MAT.p6.x * (slotBound(XF_SCATTER_STRENGTH) ? texture(scatterStrengthTex, xfUV(XF_SCATTER_STRENGTH, inUV)).a : 1.0), 0.0, 1.0);
     float scatterG        = clamp(MAT.p6.y, -0.99, 0.99);
-    vec3  multiscatterColor = MAT.p7.rgb * texture(multiscatterColorTex, xfUV(XF_MULTISCATTER_COLOR, inUV)).rgb;
+    vec3  multiscatterColor = MAT.p7.rgb * (slotBound(XF_MULTISCATTER_COLOR) ? texture(multiscatterColorTex, xfUV(XF_MULTISCATTER_COLOR, inUV)).rgb : vec3(1.0));
     // KHR_materials_diffuse_roughness (draft; issue #84). R channel, per spec.
-    float diffuseRoughness = clamp(MAT.p6.z * texture(diffuseRoughTex, xfUV(XF_DIFFUSE_ROUGHNESS, inUV)).r, 0.0, 1.0);
+    float diffuseRoughness = clamp(MAT.p6.z * (slotBound(XF_DIFFUSE_ROUGHNESS) ? texture(diffuseRoughTex, xfUV(XF_DIFFUSE_ROUGHNESS, inUV)).r : 1.0), 0.0, 1.0);
     // KHR_materials_fuzz (draft; issue #84). Weight on R; the colour and
     // roughness ride the SHEEN lanes read above, because they are the same
     // quantity from the same channels. hasFuzz picks which of the two
     // extensions those lanes belong to, and where in the stack the lobe goes.
     bool  hasFuzz    = MAT.p7.w > 0.5;
-    float fuzzFactor = clamp(MAT.p6.w * texture(fuzzTex, xfUV(XF_FUZZ, inUV)).r, 0.0, 1.0);
+    float fuzzFactor = clamp(MAT.p6.w * (slotBound(XF_FUZZ) ? texture(fuzzTex, xfUV(XF_FUZZ, inUV)).r : 1.0), 0.0, 1.0);
 
 
     // ── KHR_materials_ior + KHR_materials_specular ───────────────────────────

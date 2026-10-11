@@ -126,6 +126,20 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   product visibly changes size as it leaves the page. Only a DEEP subject
   notices (`D > W / aspect`); `--vh` still overrides the whole thing.
 
+- **Tile-memory stores (perf/android-gpu-cost).** Every non-transmissive frame
+  renders through `renderPassFast_`, a compatible twin of `renderPass_` that
+  stores only `colorImage_`; MSAA colour, depth and scene-linear are
+  `DONT_CARE`. `renderPass_` (all STORE) is used only when the transmissive
+  second pass LOADs them back. Pbr.frag skips `KHR_materials_*` taps for slots
+  bound to white (`MatExt.uvRot[].y` = bound flag). A/B switches:
+  `debug.dxr.mv.tilestore 0`, `debug.dxr.mv.exttex 1`, `debug.dxr.mv.msaa <n>`
+  (desktop: `DXR_MODELVIEWER_TILESTORE/_EXTTEX/_MSAA`). **Android fps is NOT
+  app-GPU-bound on runtime v2.35.0**: the app spends <1 ms of CPU per frame and
+  blocks 31-48 ms in `xrEndFrame`; even at 9% GPU busy (680 MHz pinned) the
+  phone stays at 30.0 fps and the tablet at ~21. Cutting app GPU work just lets
+  the msm-adreno-tz governor drop the clock (it targets ~80% busy), which slows
+  the runtime's own GPU work and can cost 2-4% fps. Measure GPU cost at a
+  pinned clock (busy% x frame time at min_freq=max), never by fps.
 - **IBL** is generated once at init from a procedural analytic sky (`sky.glsl`):
   BRDF LUT + irradiance cube + roughness-mipped prefiltered cube; split-sum in
   `pbr.frag`. The **skybox** samples the prefiltered cube at a high mip
