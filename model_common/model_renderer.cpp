@@ -52,6 +52,19 @@
 #include <glm/gtc/quaternion.hpp>      // glm::quat, slerp, mat4_cast
 #include <glm/gtc/matrix_transform.hpp>
 
+// A switch read once: the desktop env var, else (Android, where a NativeActivity
+// has no environment) the debug.dxr.mv.* system property. Empty = unset.
+static std::string mvKnob(const char* env, const char* prop) {
+    if (const char* e = std::getenv(env)) if (*e) return e;
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(prop, v) > 0 && v[0]) return v;
+#else
+    (void)prop;
+#endif
+    return std::string();
+}
+
 // Standard sRGB EOTF: display-referred [0,1] → scene-linear [0,1].
 //
 // The PBR pass renders into an internal UNORM colour image (colorFormat_,
@@ -320,6 +333,18 @@ bool ModelRenderer::init(VkInstance instance,
         }
     }
 
+    {
+        // GPU-cost A/B switches; defaults are the shipping behaviour. See
+        // fastStore_ / extTexAll_ in the header.
+        std::string k = mvKnob("DXR_MODELVIEWER_TILESTORE", "debug.dxr.mv.tilestore");
+        if (!k.empty()) fastStore_ = k[0] != '0';
+        k = mvKnob("DXR_MODELVIEWER_EXTTEX", "debug.dxr.mv.exttex");
+        if (!k.empty()) extTexAll_ = k[0] == '1';
+        if (!fastStore_ || extTexAll_)
+            MV_LOG("ModelRenderer: A/B override — tile stores %s, material taps %s\n",
+                   fastStore_ ? "minimal" : "ALL (tilestore=0)",
+                   extTexAll_ ? "ALL (exttex=1)" : "bound only");
+    }
     chooseSampleCount();
     if (!createRenderTargets()) return false;
     if (!createPipeline()) return false;
@@ -387,8 +412,9 @@ void ModelRenderer::chooseSampleCount() {
     VkSampleCountFlagBits want = VK_SAMPLE_COUNT_4_BIT;
     // DXR_MODELVIEWER_MSAA=<n> makes the 1-vs-4 comparison runnable without a
     // rebuild, which is what an aliasing claim has to be settled with.
-    if (const char* e = std::getenv("DXR_MODELVIEWER_MSAA")) {
-        const int n = std::atoi(e);
+    const std::string msaaKnob = mvKnob("DXR_MODELVIEWER_MSAA", "debug.dxr.mv.msaa");
+    if (!msaaKnob.empty()) {
+        const int n = std::atoi(msaaKnob.c_str());
         want = (n >= 8) ? VK_SAMPLE_COUNT_8_BIT
              : (n >= 4) ? VK_SAMPLE_COUNT_4_BIT
              : (n >= 2) ? VK_SAMPLE_COUNT_2_BIT
@@ -535,6 +561,20 @@ bool ModelRenderer::createRenderTargets() {
     rpci.dependencyCount = 2;
     rpci.pDependencies = deps;
     if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPass_) != VK_SUCCESS) return false;
+
+    {
+        // renderPassFast_: compatible twin for frames with no transmissive
+        // second pass. Only the image the blit reads is stored; see the header.
+        VkAttachmentDescription f[5];
+        std::memcpy(f, atts, sizeof(f));
+        if (msaa) f[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        f[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        f[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        f[4].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        VkRenderPassCreateInfo fci = rpci;
+        fci.pAttachments = f;
+        if (vkCreateRenderPass(device_, &fci, nullptr, &renderPassFast_) != VK_SUCCESS) return false;
+    }
 
     // The transmissive pass runs after the scene-colour capture, so it must LOAD
     // what the opaque pass wrote rather than clear it, and it starts from
@@ -1071,6 +1111,22 @@ bool ModelRenderer::uploadMaterialExtensions(const std::vector<ModelMaterial>& m
             g.uvXf[t][2] = m.uvXf[t].scale[0];
             g.uvXf[t][3] = m.uvXf[t].scale[1];
             g.uvRot[t][0] = m.uvXf[t].rotation;
+        }
+        // uvRot[].y = "a real texture is bound in this slot". Absent slots are
+        // bound to the multiplicative identity (white), so the shader may skip
+        // the tap and use 1.0 instead.
+        const int texIdx[MTEX_COUNT] = {
+            m.baseColorTex, m.metallicRoughnessTex, m.normalTex, m.occlusionTex, m.emissiveTex,
+            m.clearcoatTex, m.clearcoatRoughnessTex, m.sheenColorTex, m.sheenRoughnessTex,
+            m.specularTex, m.specularColorTex, m.transmissionTex, m.thicknessTex,
+            m.scatterStrengthTex, m.multiscatterColorTex, m.coatColorTex, m.coatAnisotropyTex,
+            m.diffuseRoughnessTex, m.fuzzTex, m.coatNormalTex};
+        for (int t = 0; t < (int)MTEX_COUNT; ++t) {
+            const int i = texIdx[t];
+            const bool bound = i >= 0 &&
+                ((i < (int)modelTextures_.size() && modelTextures_[i].view != VK_NULL_HANDLE) ||
+                 (i < (int)modelTexturesSrgb_.size() && modelTexturesSrgb_[i].view != VK_NULL_HANDLE));
+            g.uvRot[t][1] = bound ? 1.0f : 0.0f;
         }
         gpu.push_back(g);
     }
@@ -2281,6 +2337,7 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     ub.hemiSky[0]    = kStudioHemiSky[0];
     ub.hemiSky[1]    = kStudioHemiSky[1];
     ub.hemiSky[2]    = kStudioHemiSky[2];
+    ub.hemiSky[3]    = extTexAll_ ? 1.0f : 0.0f;   // DXR_MODELVIEWER_EXTTEX=1: every material tap
     ub.hemiGround[0] = kStudioHemiGround[0];
     ub.hemiGround[1] = kStudioHemiGround[1];
     ub.hemiGround[2] = kStudioHemiGround[2];
@@ -3490,8 +3547,9 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     clears[1].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
     clears[2].depthStencil = {1.0f, 0};
 
+    const bool twoPass = hasTransmissive_ && !transparentBg;
     VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rpbi.renderPass = renderPass_;
+    rpbi.renderPass = (fastStore_ && !twoPass) ? renderPassFast_ : renderPass_;
     rpbi.framebuffer = framebuffer_;
     rpbi.renderArea.offset = {0, 0};
     rpbi.renderArea.extent = {viewportWidth, viewportHeight};
@@ -3601,7 +3659,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
 
     for (const auto& p : primitives_) if (!transmits(p)) drawPrimitive(p);
 
-    if (hasTransmissive_ && !transparentBg) {
+    if (twoPass) {
         vkCmdEndRenderPass(cmd);
         // sceneLinearImage_ is in TRANSFER_SRC_OPTIMAL here (pass-1
         // finalLayout), which is exactly what the copy wants.
@@ -4343,6 +4401,7 @@ void ModelRenderer::cleanup() {
     if (framebuffer_ != VK_NULL_HANDLE) { vkDestroyFramebuffer(device_, framebuffer_, nullptr); framebuffer_ = VK_NULL_HANDLE; }
     if (renderPass_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
     if (renderPassLoad_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, renderPassLoad_, nullptr); renderPassLoad_ = VK_NULL_HANDLE; }
+    if (renderPassFast_ != VK_NULL_HANDLE) { vkDestroyRenderPass(device_, renderPassFast_, nullptr); renderPassFast_ = VK_NULL_HANDLE; }
     if (transmissionImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, transmissionImage_);
     if (transmissionSampler_ != VK_NULL_HANDLE) { vkDestroySampler(device_, transmissionSampler_, nullptr); transmissionSampler_ = VK_NULL_HANDLE; }
     if (colorImage_.image != VK_NULL_HANDLE) modelDestroyImage(device_, colorImage_);

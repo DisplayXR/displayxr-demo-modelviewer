@@ -421,8 +421,20 @@ this rig exists to match declare none of them.
 **Anti-aliasing.** The internal colour and depth targets are **4× MSAA**,
 resolved into the single-sample image the per-eye blit reads (falls back to
 2× or 1× if the device cannot do 4× for all three attachment formats).
-`DXR_MODELVIEWER_MSAA=<1|2|4|8>` overrides it, which is how a before/after is
-measured without a rebuild. Note the panel's own limit: the display processor
+`DXR_MODELVIEWER_MSAA=<1|2|4|8>` (Android: `setprop debug.dxr.mv.msaa <n>`)
+overrides it, which is how a before/after is measured without a rebuild.
+Only the resolved image is written to memory: the multisampled attachments,
+depth and the scene-linear twin stay in tile memory (`DONT_CARE` stores) except
+when a transmissive model needs its second pass to load them back.
+
+**GPU-cost A/B switches** (read once at startup; defaults are the shipping
+behaviour, set a value only to compare):
+
+| Desktop env | Android property | Effect |
+|---|---|---|
+| `DXR_MODELVIEWER_TILESTORE=0` | `debug.dxr.mv.tilestore 0` | Store every attachment every frame (the behaviour before #172). |
+| `DXR_MODELVIEWER_EXTTEX=1` | `debug.dxr.mv.exttex 1` | Sample every `KHR_materials_*` texture slot, including the 1x1 white defaults the shader otherwise skips. |
+| `DXR_MODELVIEWER_MSAA=<n>` | `debug.dxr.mv.msaa <n>` | Sample count (above). | Note the panel's own limit: the display processor
 hard-masks the **silhouette** alpha to 0/1, so a transparent window's outline
 against the desktop cannot be fully smooth — internal edges and texture
 detail are what improve.
