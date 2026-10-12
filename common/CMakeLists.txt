@@ -59,7 +59,9 @@ FetchContent_Declare(
     # runtime-drawn depth cursor (XR_DXR_cursor_depth v5+, runtime ADR-046
     # Amendment 2); needs openxr_includes' XR_DXR_cursor_depth.h (spec >= 5).
     # v2.28.0 in between added the shared Vulkan frame ring (unused here).
-    GIT_TAG v2.29.0
+    # v2.30.1: the Wayland geometry payload is read by structure, in any key order
+    # (displayxr-common#76; a sorted-key KWin publisher crashed the old parser).
+    GIT_TAG v2.30.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
