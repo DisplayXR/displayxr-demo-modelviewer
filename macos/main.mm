@@ -470,7 +470,7 @@ static HudOverlayView   *g_hudView = nil;      // text view
 static NSVisualEffectView *g_hudBackdrop = nil;  // frosted wrapper sized to hudView
 
 // ============================================================================
-// Top-bar overlay (Open / Auto-Orbit / Mode buttons) + reticle
+// Top-bar overlay (Open / Auto-Orbit / Mode buttons)
 // ============================================================================
 
 static NSView   *g_topBar = nil;
@@ -478,7 +478,6 @@ static NSButton *g_openButton = nil;
 static NSButton *g_modeButton = nil;
 static NSButton *g_animButton = nil;   // right-justified clip button; hidden w/o clips
 static NSView   *g_animButtonBackdrop = nil;
-static NSView   *g_reticleView = nil;
 
 // Translucent dark background view used behind the top bar.
 @interface TopBarBackdropView : NSView
@@ -491,28 +490,6 @@ static NSView   *g_reticleView = nil;
     [[NSColor colorWithCalibratedWhite:1.0 alpha:0.08] set];
     NSRect hr = NSMakeRect(0, 0, self.bounds.size.width, 1);
     NSRectFill(hr);
-}
-@end
-
-// Non-interactive crosshair at the center of the window (aim reference for double-click).
-// Drawn as a dark outline + bright core so it reads against any background.
-@interface ReticleView : NSView
-@end
-@implementation ReticleView
-- (BOOL)isFlipped { return NO; }
-- (NSView*)hitTest:(NSPoint)p { (void)p; return nil; } // never steal clicks
-- (void)drawRect:(NSRect)r {
-    (void)r;
-    NSRect b = self.bounds;
-    CGFloat cx = b.size.width * 0.5f, cy = b.size.height * 0.5f;
-    // Dark outline for contrast on light backgrounds
-    [[NSColor colorWithCalibratedWhite:0.0 alpha:0.75] set];
-    NSRectFill(NSMakeRect(cx - 5.5, cy - 0.75, 11, 1.5));
-    NSRectFill(NSMakeRect(cx - 0.75, cy - 5.5, 1.5, 11));
-    // Bright core for contrast on dark backgrounds
-    [[NSColor colorWithCalibratedWhite:1.0 alpha:0.95] set];
-    NSRectFill(NSMakeRect(cx - 4.5, cy, 9, 1));
-    NSRectFill(NSMakeRect(cx, cy - 4.5, 1, 9));
 }
 @end
 
@@ -934,33 +911,24 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
     g_animButtonBackdrop = animBd;
     [g_topBar addSubview:animBd];
 
-    // --- Reticle (non-interactive center crosshair) ---
-    const CGFloat retSize = 20.0;
-    NSRect retFrame = NSMakeRect((width - retSize) * 0.5f, (height - retSize) * 0.5f, retSize, retSize);
-    g_reticleView = [[ReticleView alloc] initWithFrame:retFrame];
-    [g_reticleView setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin];
-    [g_metalView addSubview:g_reticleView];
-
     // A/B knob (diagnostic): DISPLAYXR_MV_OVERLAYS=0 removes every AppKit view
-    // stacked over the CAMetalLayer (frosted HUD + top-bar NSVisualEffectViews,
-    // reticle). Overlapping AppKit/vibrancy views make WindowServer composite
-    // the Metal layer instead of presenting it directly, which can resample a
-    // lenticular weave. Controls stay on the keyboard.
+    // stacked over the CAMetalLayer (frosted HUD + top-bar NSVisualEffectViews).
+    // Overlapping AppKit/vibrancy views make WindowServer composite the Metal
+    // layer instead of presenting it directly, which can resample a lenticular
+    // weave. Controls stay on the keyboard.
     {
         const char *ov = getenv("DISPLAYXR_MV_OVERLAYS");
         if (ov != nullptr && strcmp(ov, "0") == 0) {
             [g_hudBackdrop removeFromSuperview];
             [g_topBar removeFromSuperview];
-            [g_reticleView removeFromSuperview];
             g_hudBackdrop = nil;
             g_hudView = nil;
             g_topBar = nil;
-            g_reticleView = nil;
             g_openButton = nil;
             g_modeButton = nil;
             g_animButton = nil;
             g_animButtonBackdrop = nil;
-            LOG_INFO("DISPLAYXR_MV_OVERLAYS=0: HUD, top bar and reticle removed (nothing over the Metal layer)");
+            LOG_INFO("DISPLAYXR_MV_OVERLAYS=0: HUD and top bar removed (nothing over the Metal layer)");
         }
     }
 
