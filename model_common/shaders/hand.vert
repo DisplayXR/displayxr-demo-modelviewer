@@ -4,9 +4,9 @@
 // body, outline — see hand_renderer.cpp. Clean +Y-up world coordinates; the
 // renderer's negative-height viewport does the Vulkan Y flip, as for pbr.vert.
 //
-// Look modelled on the Ultraleap Ghost Hand material (LeiaViewer,
-// Assets/ThirdParty/Ultraleap/Tracking/Hands/Runtime/Models/GenericHand/
-// GenericHandShader.shader + "Ghost Hand.mat"): the outline pass extrudes
+// Look modelled on the Ultraleap Ghost Hand material (the Ultraleap Unity
+// plugin's Ultraleap/Tracking/Hands/Runtime/Models/GenericHand/
+// GenericHandShader.shader + "Ghost Hand.mat", Apache-2.0): the outline pass extrudes
 // the mesh along its normals and is drawn back-face-only (inverted hull).
 
 layout(location = 0) in vec3 inPos;
