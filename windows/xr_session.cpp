@@ -12,6 +12,7 @@
 #include <vector>
 
 bool g_hasViewRigExt = false;
+bool g_hasHandTrackingExt = false;
 uint32_t g_cursorDepthSpecVersion = 0;
 bool g_hasDisplayZonesExt = false;   // display_zones AND local_3d_zone (#63)
 bool g_hasDepthBudgetExt = false;    // XR_DXR_depth_budget (#116), optional
@@ -96,6 +97,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0) {
+            g_hasHandTrackingExt = true;
+        }
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
             g_hasMcpToolsExt = true;
         }
@@ -131,6 +135,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_hand_tracking: %s", g_hasHandTrackingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_mcp_tools: %s", g_hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", g_cursorDepthSpecVersion ? "ENABLED" : "off",
         g_cursorDepthSpecVersion);
@@ -164,6 +169,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasViewRigExt) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_hasHandTrackingExt) {
+        enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
     }
     if (g_hasMcpToolsExt) {
         enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);

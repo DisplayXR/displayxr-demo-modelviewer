@@ -146,6 +146,10 @@
 #include "auto_fit.h"          // dxr::AutoFitVHeight — shared width-aware load-time framing
 #include "model_fit.h"         // modelviewer::FitVHeight — the page-parity framing rule
 #include "model_cursor_depth.h" // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, model ray cast
+#include "hand_tracking.h"      // XR_EXT_hand_tracking consumer + display->world joint map
+#include "hand_gestures.h"      // pinch gestures -> orbit deltas (pure math, unit-tested)
+#include "hand_renderer.h"      // translucent hand mesh via ModelRenderer's overlay hook
+#include "model_orbit.h"        // turntable: orbit state -> model transform, rig stays fixed
 #include "model_loader.h"
 #include "mode_switch.h"       // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (V / 0-8)
 #include "rig_mode.h"          // dxr::RigResetToInitial / RigToggleMode — SPACE + C
@@ -181,6 +185,17 @@
 
 static volatile bool g_running = true;
 static ModelRenderer g_modelRenderer;
+
+// Hand tracking (XR_EXT_hand_tracking): joints -> pinch gestures -> orbit
+// deltas, plus a translucent hand mesh drawn through the renderer's overlay
+// hook. All of it is inert when the runtime has no hand-tracking provider.
+static modelviewer::HandTracking          g_handTracking;
+static modelviewer::HandGestureController g_handGestures;
+static modelviewer::HandRenderer          g_handRenderer;
+static float g_handRoll = 0.0f;          // model roll (two-hand twist); SPACE levels it
+static bool  g_handsEverSeen = false;
+static const float kHandColorLeft[3]  = {0.30f, 0.75f, 1.00f};   // cyan
+static const float kHandColorRight[3] = {1.00f, 0.62f, 0.28f};   // amber
 static std::string g_loadedFileName;
 static uint32_t g_windowW = 1280, g_windowH = 720;
 
@@ -437,6 +452,23 @@ static void quat_from_yaw_pitch(float yaw, float pitch, XrQuaternionf* out) {
     float cy = cosf(yaw/2), sy = sinf(yaw/2), cp = cosf(pitch/2), sp = sinf(pitch/2);
     out->w = cy*cp; out->x = cy*sp; out->y = sy*cp; out->z = -sy*sp;
 }
+//! q = a * b (apply b, then a).
+static XrQuaternionf quat_mul(XrQuaternionf a, XrQuaternionf b) {
+    XrQuaternionf r;
+    r.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z;
+    r.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y;
+    r.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x;
+    r.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w;
+    return r;
+}
+//! Yaw/pitch (mouse, WASD) then a roll about the view axis (two-hand pinch
+//! twist). Roll last so it never leaks into the yaw/pitch read back elsewhere.
+static void quat_from_yaw_pitch_roll(float yaw, float pitch, float roll, XrQuaternionf* out) {
+    XrQuaternionf yp;
+    quat_from_yaw_pitch(yaw, pitch, &yp);
+    XrQuaternionf r = {0.0f, 0.0f, sinf(roll/2), cosf(roll/2)};
+    *out = quat_mul(yp, r);
+}
 static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
                              float* ox, float* oy, float* oz) {
     float tx = 2.0f*(q.y*vz - q.z*vy), ty = 2.0f*(q.z*vx - q.x*vz), tz = 2.0f*(q.x*vy - q.y*vx);
@@ -479,6 +511,8 @@ static void UpdateCameraMovement(InputState& state, float deltaTime, float displ
     // pose the auto-fit produced (windows/main.cpp:2670).
     if (state.resetViewRequested) {
         state.resetViewRequested = false;
+        g_handRoll = 0.0f;        // SPACE also levels the two-hand roll
+        g_handGestures.reset();
         float pos[3] = {state.cameraPosX, state.cameraPosY, state.cameraPosZ};
         dxr::RigResetToInitial(state.viewParams, state.cameraMode, pos, state.yaw, state.pitch,
                                state.initialVirtualDisplayHeight);
@@ -612,6 +646,9 @@ struct AppXrSession {
 
     bool hasDisplayInfoExt = false;
     bool hasViewRigExt = false;
+    // XR_EXT_hand_tracking advertised; provider presence is a SYSTEM property
+    // (modelviewer::HandTracking::init checks it).
+    bool hasHandTrackingExt = false;
     uint32_t cursorDepthSpecVersion = 0; //!< XR_DXR_cursor_depth, 0 = not enabled
     bool hasXlibBindingExt = false;   //!< XR_DXR_xlib_window_binding (handle app, X11)
     bool hasWaylandBindingExt = false;//!< XR_DXR_wayland_surface_binding (handle app, Wayland)
@@ -686,6 +723,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(e.extensionName, modelviewer::HandTracking::kExtensionName) == 0) xr.hasHandTrackingExt = true;
         if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
             modelviewer::CursorDepthWanted())
             xr.cursorDepthSpecVersion = e.extensionVersion;
@@ -704,6 +742,8 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    if (xr.hasHandTrackingExt) enabled.push_back(modelviewer::HandTracking::kExtensionName);
+    LOG_INFO("XR_EXT_hand_tracking: %s", xr.hasHandTrackingExt ? "AVAILABLE" : "NOT FOUND");
     if (xr.cursorDepthSpecVersion > 0) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
     LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
              xr.cursorDepthSpecVersion);
@@ -2435,6 +2475,24 @@ int main(int argc, char** argv) {
                               queueFamilyIndex, xr.swapchain.width, xr.swapchain.height))
         LOG_WARN("model renderer init failed");
 
+    // Hand tracking: trackers on the session (inert without a provider) and
+    // the hand mesh pipeline against the renderer's own render pass, so the
+    // overlay hook draws it inside every view's tile after the opaque model.
+    g_handTracking.init(xr.instance, xr.systemId, xr.session, xr.hasHandTrackingExt);
+    if (g_handTracking.enabled()) {
+        modelviewer::HandGestureConfig gcfg;
+        gcfg.applyEnvironment();
+        g_handGestures.setConfig(gcfg);
+        if (g_handRenderer.init(vkDevice, physDevice, g_modelRenderer.renderPass(),
+                                g_modelRenderer.sampleCountFlag(),
+                                ModelRenderer::overlayColorAttachmentCount())) {
+            g_modelRenderer.setOverlayDraw(
+                [](VkCommandBuffer cmd, const float view[16], const float proj[16], bool encodeSrgb) {
+                    g_handRenderer.draw(cmd, view, proj, encodeSrgb);
+                });
+        }
+    }
+
 
     // Tile basis: the app window when we own one (window×scaleXY, #729-style);
     // else the full panel (hosted-NULL renders display-sized).
@@ -2579,11 +2637,53 @@ int main(int argc, char** argv) {
             locateInfo.displayTime = frameState.predictedDisplayTime;
             locateInfo.space = xr.localSpace;
 
-            XrPosef cameraPose;
-            quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
+            // Hands (XR_EXT_hand_tracking): locate both hands at display time
+            // in the view locate space, turn the pinches into orbit deltas and
+            // apply them exactly where the mouse drag would. The joints are
+            // physical display metres; the gesture math runs on them
+            // untransformed, only the RENDERED hand is rebased below.
+            if (g_handTracking.enabled()) {
+                g_handTracking.locate(xr.localSpace, frameState.predictedDisplayTime);
+                modelviewer::HandGestureFrame hf;
+                hf.timeSec = NowSec();
+                for (int h = 0; h < 2; h++)
+                    modelviewer::HandTracking::toGestureSample(g_handTracking.hand(h), hf.hand[h]);
+                const modelviewer::HandGestureDelta hg = g_handGestures.update(hf);
+                if (hg.any()) {
+                    MarkUserInput(g_input);   // a pinch is user input: parks auto-orbit
+                    g_input.yaw += hg.yaw;
+                    g_input.pitch += hg.pitch;
+                    if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
+                    if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
+                    g_handRoll += hg.roll;
+                    float sf = g_input.viewParams.scaleFactor * hg.zoom;
+                    if (sf < 0.1f) sf = 0.1f;
+                    if (sf > 10.0f) sf = 10.0f;
+                    g_input.viewParams.scaleFactor = sf;
+                }
+                if (g_handTracking.anyActive() && !g_handsEverSeen) {
+                    g_handsEverSeen = true;   // no HUD on this leg: the log is the hint
+                    LOG_INFO("Hands detected: pinch+drag rotates, two-hand pinch zooms/rolls");
+                }
+            }
+
+            // Turntable (common/model_orbit.h): the orbit state — the point
+            // under the display centre, yaw/pitch/roll, zoom — is a MODEL
+            // transform about its pivot. The rig the runtime sees stays a fixed
+            // identity pose at the locate origin with the fit's vH, so the
+            // display plane, convergence, depth budget and the hand space never
+            // move; only the model does.
+            XrPosef orbitPose;
+            quat_from_yaw_pitch_roll(g_input.yaw, g_input.pitch, g_handRoll, &orbitPose.orientation);
             float rigPos[3]; ComputeRigPosition(rigPos);
-            cameraPose.position = {rigPos[0], rigPos[1], rigPos[2]};
-            const float rigVH = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
+            orbitPose.position = {rigPos[0], rigPos[1], rigPos[2]};
+            {
+                float sceneXf[16];
+                modelviewer::BuildSceneTransform(sceneXf, orbitPose, g_input.viewParams.scaleFactor);
+                g_modelRenderer.setSceneTransform(sceneXf);
+            }
+            const XrPosef cameraPose = modelviewer::OrbitRigPose();
+            const float rigVH = g_input.viewParams.virtualDisplayHeight;
 
             const bool useRig = xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
             XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
@@ -2607,6 +2707,13 @@ int main(int argc, char** argv) {
             XrRearDepthBudgetDXR rearBudget = {};
             const bool useDepthBudget = xr.hasDepthBudgetExt && useRig;
             if (useDepthBudget) dxr::ChainRearDepthBudget(viewState, rearBudget);
+            // The rig's raw channel: display plane + canvas, which is what
+            // places the rendered hands (prepended, like the budget above).
+            XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+            if (useRig) {
+                viewRigRaw.next = viewState.next;
+                viewState.next = &viewRigRaw;
+            }
 
             g_cursor.chain(locateInfo, viewState);
             XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState,
@@ -2623,6 +2730,34 @@ int main(int argc, char** argv) {
                     (useDepthBudget && rearBudget.type == (XrStructureType)XR_TYPE_REAR_DEPTH_BUDGET_DXR)
                         ? &rearBudget : nullptr;
                 const bool standalone = IsStandaloneSession(xr);
+
+                // Hand mesh for this frame: joints (physical metres, locate
+                // space) -> the model's world through the FIXED rig (display
+                // plane -> canvas -> m2v -> rig pose). Never through the scene
+                // transform: the hands live in the reference space, the model
+                // turns under them.
+                if (g_handRenderer.initialized()) {
+                    const modelviewer::HandRigMap map = modelviewer::MakeHandRigMap(
+                        (useRig && viewRigRaw.eyeCountOutput > 0) ? &viewRigRaw : nullptr,
+                        xr.displayPixelWidth, xr.displayPixelHeight,
+                        xr.displayWidthM, xr.displayHeightM, cameraPose, rigVH);
+                    modelviewer::HandRenderHand hands[2];
+                    for (int h = 0; h < 2; h++) {
+                        const modelviewer::HandJointSet& js = g_handTracking.hand(h);
+                        hands[h].active = js.active;
+                        memcpy(hands[h].color, h == 0 ? kHandColorLeft : kHandColorRight, sizeof(hands[h].color));
+                        for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+                            const XrHandJointLocationEXT& jl = js.joints[j];
+                            modelviewer::HandRenderJoint& rj = hands[h].joints[j];
+                            rj.valid = js.active && (jl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+                            if (!rj.valid) continue;
+                            const XrVector3f w = modelviewer::HandRigMapPoint(map, jl.pose.position);
+                            rj.pos[0] = w.x; rj.pos[1] = w.y; rj.pos[2] = w.z;
+                            rj.radius = modelviewer::HandRigMapRadius(map, jl.radius > 0.002f ? jl.radius : 0.008f);
+                        }
+                    }
+                    g_handRenderer.update(hands, dt);
+                }
 
                 uint32_t m = xr.currentRenderingMode;
                 uint32_t modeViewCount = (xr.renderingModeCount > 0 && m < xr.renderingModeCount)
@@ -2771,12 +2906,16 @@ int main(int argc, char** argv) {
                     float rayDir[3]    = {rayDirV.x, rayDirV.y, rayDirV.z};
                     float hitPos[3];
                     if (g_modelRenderer.pickSurface(rayOrigin, rayDir, hitPos)) {
+                        // The hit is in locate space; the orbit state (the point
+                        // under the display centre) lives in MODEL space.
+                        float hitModel[3];
+                        g_modelRenderer.sceneToModelPoint(hitPos, hitModel);
                         XrPosef fromWorld;
-                        fromWorld.orientation = cameraPose.orientation;
+                        fromWorld.orientation = orbitPose.orientation;
                         fromWorld.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
                         XrPosef target;
-                        target.position = {hitPos[0], hitPos[1], hitPos[2]};
-                        target.orientation = cameraPose.orientation;
+                        target.position = {hitModel[0], hitModel[1], hitModel[2]};
+                        target.orientation = orbitPose.orientation;
                         g_input.transitionFrom = fromWorld;
                         g_input.transitionTo = target;
                         g_input.transitionT = 0.0f;
@@ -3037,7 +3176,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    g_modelRenderer.cleanup();
+    g_modelRenderer.setOverlayDraw(nullptr);
+    g_modelRenderer.cleanup();      // waits for the device: the hand buffers are idle after this
+    g_handRenderer.destroy();
+    g_handTracking.destroy();       // trackers before the session
     if (vkDevice) vkDeviceWaitIdle(vkDevice);
     if (vkDevice) {
         ClickthroughDestroy(vkDevice);
