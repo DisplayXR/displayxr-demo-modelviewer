@@ -181,6 +181,12 @@ add_library(model_renderer STATIC
     model_loader_mtlx.cpp      # MaterialX OpenPBR -> ModelMaterial for .mtlx-bound USD looks
     model_vulkan_utils.h
     model_vulkan_utils.cpp
+    hand_gestures.h
+    hand_gestures.cpp         # pinch-gesture math (pure; tests/hand_gestures_tests.cpp)
+    hand_tracking.h
+    hand_tracking.cpp         # XR_EXT_hand_tracking consumer + display->world joint map
+    hand_renderer.h
+    hand_renderer.cpp         # translucent joint/capsule hand mesh (overlay hook)
     ${SHADER_HEADERS}
 )
 
@@ -193,6 +199,7 @@ target_include_directories(model_renderer PUBLIC
 target_include_directories(model_renderer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
     ${tinyusdz_SOURCE_DIR}/src        # tinyusdz.hh + tydra/render-data.hh
+    ${CMAKE_CURRENT_SOURCE_DIR}/../openxr_includes   # hand_tracking.cpp: XR_EXT_hand_tracking + XR_DXR_view_rig headers only
 )
 
 target_link_libraries(model_renderer PUBLIC
@@ -224,4 +231,14 @@ if(MODELVIEWER_BUILD_TESTS)
         target_compile_options(gltf_uri_tests PRIVATE /utf-8)
     endif()
     add_test(NAME gltf_uri_tests COMMAND gltf_uri_tests)
+
+    # The pinch-gesture math behind the hand controls: pinch hysteresis,
+    # one-hand orbit, two-hand zoom/roll, tracking-loss re-anchoring and the
+    # EMA. Pure C++ (no OpenXR, no Vulkan), so it runs on every CI leg.
+    add_executable(hand_gestures_tests
+        tests/hand_gestures_tests.cpp
+        hand_gestures.cpp
+    )
+    target_include_directories(hand_gestures_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME hand_gestures_tests COMMAND hand_gestures_tests)
 endif()
