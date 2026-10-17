@@ -29,12 +29,45 @@ if(NOT Vulkan_FOUND)
 endif()
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
-# OpenXR loader — CONFIG pkg first, then a user-specified OpenXR_ROOT fallback.
+# ── OpenXR loader ──────────────────────────────────────────────────────────
+# Dev-build dependency rule (runtime CLAUDE.md § "Demo-repo dev-build rule"):
+# a fresh clone must configure with only VS 2022 + Ninja + the Vulkan SDK, so
+# the loader is self-provisioned here, never taken from a hardcoded SDK path.
+# Resolution order:
+#   1. find_package(OpenXR CONFIG): -DOpenXR_ROOT=<dir> / -DOpenXR_DIR=<dir> /
+#      CMAKE_PREFIX_PATH. CI (build-windows.yml) takes this path with its own
+#      download of the SAME pinned zip.
+#   2. -DOpenXR_ROOT=<dir> laid out as lib/ + bin/ without a CMake config.
+#   3. FetchContent of the pinned prebuilt Khronos loader zip (offline:
+#      -DFETCHCONTENT_SOURCE_DIR_OPENXR_LOADER=<extracted zip dir>).
+# Three pins must stay equal: this one == build-windows.yml's $openxrVersion
+# == XR_CURRENT_API_VERSION in openxr_includes/openxr/openxr.h (checked below).
+set(MODELVIEWER_OPENXR_LOADER_VERSION "1.1.51")
+set(MODELVIEWER_OPENXR_LOADER_SHA256
+    "01f1efbe1ff72da8dca2366c7ee2bc1d23f5bb00df3bedafd9337e55ba32521a")
+
+file(STRINGS "${CMAKE_SOURCE_DIR}/openxr_includes/openxr/openxr.h" _xr_ver_line
+    REGEX "^#define XR_CURRENT_API_VERSION XR_MAKE_VERSION")
+string(REGEX MATCH "XR_MAKE_VERSION\\(([0-9]+), *([0-9]+), *([0-9]+)\\)" _ "${_xr_ver_line}")
+set(_xr_header_ver "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
+if(NOT _xr_header_ver STREQUAL MODELVIEWER_OPENXR_LOADER_VERSION)
+    message(FATAL_ERROR
+        "OpenXR loader pin (${MODELVIEWER_OPENXR_LOADER_VERSION}) != vendored "
+        "openxr_includes header rev (${_xr_header_ver}). Bump "
+        "MODELVIEWER_OPENXR_LOADER_VERSION + _SHA256 here AND $openxrVersion in "
+        ".github/workflows/build-windows.yml together with the headers.")
+endif()
+
 set(OPENXR_FOUND FALSE)
 find_package(OpenXR QUIET CONFIG)
 if(OpenXR_FOUND)
     set(OPENXR_FOUND TRUE)
-    message(STATUS "Found OpenXR via find_package")
+    message(STATUS "OpenXR loader: find_package (${OpenXR_DIR}, version ${OpenXR_VERSION})")
+    if(DEFINED OpenXR_VERSION AND NOT OpenXR_VERSION VERSION_EQUAL MODELVIEWER_OPENXR_LOADER_VERSION)
+        message(WARNING "OpenXR loader ${OpenXR_VERSION} found at ${OpenXR_DIR}, but this "
+            "repo pins ${MODELVIEWER_OPENXR_LOADER_VERSION}. Drop -DOpenXR_ROOT/-DOpenXR_DIR "
+            "to let the build provision the pinned loader itself.")
+    endif()
 endif()
 
 if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
@@ -61,11 +94,39 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
                 IMPORTED_IMPLIB "${OPENXR_LOADER_LIB}"
             )
         endif()
+        message(STATUS "OpenXR loader: OpenXR_ROOT (${OPENXR_LOADER_LIB})")
     endif()
 endif()
 
 if(NOT OPENXR_FOUND)
-    message(FATAL_ERROR "OpenXR not found. Provide -DOpenXR_ROOT=<path> or install via vcpkg.")
+    # The Khronos release zip (x64 / Win32 / ARM64 + UWP variants) carries a
+    # top-level OpenXRConfig.cmake that dispatches to the matching arch's
+    # lib/cmake/openxr. No CMakeLists.txt at its root, so MakeAvailable only
+    # downloads + extracts (into build/_deps, reused by every later configure).
+    include(FetchContent)
+    set(_oxr_url "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-${MODELVIEWER_OPENXR_LOADER_VERSION}/openxr_loader_windows-${MODELVIEWER_OPENXR_LOADER_VERSION}.zip")
+    message(STATUS "OpenXR loader: provisioning ${MODELVIEWER_OPENXR_LOADER_VERSION} via FetchContent")
+    FetchContent_Declare(openxr_loader
+        URL      "${_oxr_url}"
+        URL_HASH SHA256=${MODELVIEWER_OPENXR_LOADER_SHA256}
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(openxr_loader)
+    find_package(OpenXR CONFIG
+        PATHS "${openxr_loader_SOURCE_DIR}"
+        NO_DEFAULT_PATH
+    )
+    if(OpenXR_FOUND)
+        set(OPENXR_FOUND TRUE)
+        message(STATUS "OpenXR loader: ${openxr_loader_SOURCE_DIR}")
+    endif()
+endif()
+
+if(NOT OPENXR_FOUND)
+    message(FATAL_ERROR
+        "OpenXR loader not found and could not be provisioned. Offline: extract "
+        "openxr_loader_windows-${MODELVIEWER_OPENXR_LOADER_VERSION}.zip somewhere and "
+        "pass -DFETCHCONTENT_SOURCE_DIR_OPENXR_LOADER=<that dir> (or -DOpenXR_ROOT=<that dir>).")
 endif()
 
 add_executable(model_viewer_handle_vk_win WIN32
