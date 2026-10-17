@@ -141,8 +141,16 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   `displayPlanePose` + `canvasRectPx`/`canvasSizeMeters`, `m2v = rigVH /
   canvasHeight`, the fixed rig pose) -> `HandRenderer::update()` once per frame
   -> drawn by the overlay hook inside the renderer's render pass after the last
-  model primitive (depth test on, write off, straight-alpha blend, back-face
-  culled closed meshes). The hand pipeline rasterises with its **own near plane
+  model primitive in THREE passes, the Ultraleap Ghost Hand order (reference:
+  `/Users/david.fattal/Documents/GitHub/LeiaViewer`, `Assets/ThirdParty/Ultraleap/
+  Tracking/Hands/Runtime/Models/GenericHand/GenericHandShader.shader` + `Ghost
+  Hand.mat`): depth prime (front faces, depth write, colour masked — one blend
+  per pixel instead of one per overlapping capsule), body (unlit dark glass,
+  colour = tinted fresnel rim; the reference's 22x-HDR `_FresnelPower` 0.629 rim
+  needs bloom, so the falloff is tightened here), outline (back faces extruded
+  along the normals, 8 % of the smallest joint radius). Gestures mirror
+  `Assets/App/Scripts/Ultraleap/UltraleapScaleRotate.cs` (model, not camera;
+  `MaxDistance` guard -> `maxHandSeparationM`; baseline reset on release). The hand pipeline rasterises with its **own near plane
   (2 % of the model's)** and writes `gl_FragDepth` remapped into the model
   projection's [0,1] range: the model clips at `ez − vH`, one display height in
   front of the glass, which is where hands live, and a hand straddling that

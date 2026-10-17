@@ -545,12 +545,18 @@ not used.
 | Both hands pinched, spread / close | Zoom: the separation ratio is the scale ratio |
 | Both hands pinched, twist | Roll the model about the view axis (the model follows the hands) |
 | Both hands pinched, drag | Rotate, like one hand |
+| Both hands pinched but more than 1 m apart | Ignored (tracking-glitch guard); the gesture re-anchors when they come back |
 
 A pinch counts as user input (it parks the auto-orbit), a hand that is not
 tracked contributes nothing, and the frame it comes back re-anchors the
 gesture rather than jumping. The pinch point is smoothed with a 50 ms EMA. The
 first time hands are seen a short hint appears (HUD chip on macOS, toast on
 Windows, log line on Linux).
+
+The look follows the Ultraleap "Ghost Hand" (LeiaViewer's
+`Assets/ThirdParty/Ultraleap/Tracking/Hands/Runtime/Models/GenericHand/`): a
+depth-prime pass so each pixel of a hand is blended once, a dark glass body
+whose colour is its fresnel rim, and a hairline inverted-hull outline.
 
 The hands are rendered in the app's reference space through the *fixed* rig —
 a hand 20 cm in front of the panel floats 20 cm in front of the virtual
