@@ -32,6 +32,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 cameraPos;
     vec4 lightDir;     // .xyz = light dir, .w = clipFar (view-space; 0=off)
     mat4 invViewProj;  // (skybox only)
+    mat4 scene;        // turntable: model -> world for geometry only (see UniformBlock)
     vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale,
                        // w=probe SELECT: 0 = normal shading, 1 = transmission
                        //   probe (#75), 2 = facing probe (#98)
@@ -1059,7 +1060,8 @@ void main() {
         // exception. Scale is the length of the model matrix's basis columns.
         vec3 modelScale = vec3(length(pc.model[0].xyz),
                                length(pc.model[1].xyz),
-                               length(pc.model[2].xyz));
+                               length(pc.model[2].xyz))
+                        * length(ubo.scene[0].xyz);   // turntable scale (uniform)
         float worldThickness = volumeThickness
                              * max(max(modelScale.x, modelScale.y), modelScale.z);
         vec3 refracted = refract(-V, N, 1.0 / max(ior, 1.0001));

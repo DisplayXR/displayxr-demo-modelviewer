@@ -22,6 +22,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 cameraPos;    // world-space, .w unused
     vec4 lightDir;     // .xyz = world dir TO light, .w = clipFar (view-space; 0=off)
     mat4 invViewProj;  // (skybox only)
+    mat4 scene;        // turntable: model -> world for geometry only (see UniformBlock)
 } ubo;
 
 layout(push_constant) uniform Push {
@@ -54,6 +55,8 @@ void main() {
           + inWeights0.z * jointMat[base + int(inJoints0.z)]
           + inWeights0.w * jointMat[base + int(inJoints0.w)];
     }
+    // Turntable: the model turns inside a fixed world (sky, IBL, lights).
+    m = ubo.scene * m;
     vec4 world = m * vec4(inPos, 1.0);
     outWorldPos = world.xyz;
     outNormal = normalize(mat3(m) * inNormal);
