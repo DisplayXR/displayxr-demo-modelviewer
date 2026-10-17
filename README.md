@@ -760,7 +760,9 @@ dependency. The first configure builds tinyusdz from source, so it is slower.
 
 ### macOS
 ```bash
-brew install cmake ninja vulkan-sdk openxr-loader
+# No Homebrew openxr-loader formula exists: build_macos.sh builds the pinned
+# loader from source into /tmp/openxr-install-<ver> on first run.
+brew install cmake ninja vulkan-sdk
 ./scripts/build_macos.sh
 # Run against an installed DisplayXR runtime (handles the Vulkan-loader setup):
 ./scripts/run_macos_dev.sh
@@ -774,13 +776,33 @@ brew install cmake ninja vulkan-sdk openxr-loader
 
 ### Windows
 ```bat
-REM Sets vcvars64 + OpenXR_ROOT + Vulkan SDK, then configures + builds.
+REM Sets vcvars64 + the Vulkan SDK PATH, then configures + builds. Needs only
+REM VS 2022, Ninja and the Vulkan SDK: the OpenXR loader (pinned to the vendored
+REM headers' rev) is downloaded by CMake on first configure.
 scripts\build-with-deps.bat
 REM Run
 build\windows\model_viewer_handle_vk_win.exe
 ```
-> Use `build-with-deps.bat`, not the bare `build_windows.bat` — the latter
-> assumes you are already inside a VS developer environment.
+> `build_windows.bat` does the same from inside a VS developer prompt, and hands
+> off to `build-with-deps.bat` from a plain one. Both forward extra arguments to
+> the CMake configure step.
+
+### Offline / flaky-network builds
+The first configure downloads the OpenXR loader and clones tinyusdz, tinygltf,
+glm and displayxr-common. Point any of them at a local copy (at the pinned tag)
+with `FETCHCONTENT_SOURCE_DIR_<NAME>`:
+
+```bat
+scripts\build-with-deps.bat -DFETCHCONTENT_SOURCE_DIR_OPENXR_LOADER=C:/deps/openxr_loader_windows-1.1.51 -DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=C:/deps/tinyusdz
+```
+
+`OPENXR_LOADER` is the extracted `openxr_loader_windows-1.1.51.zip` (the folder
+holding `OpenXRConfig.cmake`); `TINYUSDZ` a checkout at `v0.9.9-rc7`. `TINYGLTF`,
+`GLM` and `DISPLAYXR_COMMON` work the same way. After one successful configure,
+`-DFETCHCONTENT_FULLY_DISCONNECTED=ON` rebuilds with no network. On macOS,
+`OPENXR_SDK_SRC=<OpenXR-SDK-Source checkout> ./scripts/build_macos.sh` skips the
+loader clone, and `build_macos.sh` forwards `-D…` arguments to CMake the same way
+(`./scripts/build_macos.sh -DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=$HOME/deps/tinyusdz`).
 
 ## Repo layout
 

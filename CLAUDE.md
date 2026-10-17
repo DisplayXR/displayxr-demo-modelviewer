@@ -245,13 +245,15 @@ See **PORTING.md** for the phased roadmap.
 ## Build
 
 ### Windows (local dev)
-Use **`scripts\build-with-deps.bat`** — it sets vcvars64 + `OpenXR_ROOT` +
-Vulkan SDK then runs cmake. The bare `scripts\build_windows.bat` assumes you're
-already in a VS dev environment and will fail otherwise. Output:
+Use **`scripts\build-with-deps.bat`** — it sets vcvars64 + the Vulkan SDK
+`PATH` then runs cmake. The bare `scripts\build_windows.bat` configures directly
+when it is already inside a VS dev environment (`cl` on `PATH`) and hands off to
+`build-with-deps.bat` otherwise. Neither script stages the OpenXR loader: CMake
+does (`windows/CMakeLists.txt`, below). Output:
 `build\windows\model_viewer_handle_vk_win.exe` (+ bundled openxr_loader.dll +
 sample.glb copied next to it). `model_common` FetchContents tinygltf + glm.
 
-**Dev-build dependency rule (don't regress).** The Windows + macOS dev scripts
+**Dev-build dependency rule (don't regress).** The Windows + macOS dev builds
 **auto-provision the OpenXR loader**, pinned to the same spec rev as the vendored
 `openxr_includes/` headers (`XR_CURRENT_API_VERSION`, currently 1.1.51) — never
 hardcode an SDK path (`C:/dev/openxr_sdk`, `C:/VulkanSDK/<ver>`); Vulkan comes
@@ -261,6 +263,37 @@ the Vulkan SDK. Keep all three pins equal: CI (`build-windows.yml`) == dev scrip
 installer always provisioned the loader via CI and bundles `openxr_loader.dll`
 next to the exe, so it was never affected. (This repo is the bootstrap template
 new demos are cloned from, so this script is the one to keep clean.)
+
+How each leg does it. **Windows:** `windows/CMakeLists.txt` takes
+`find_package(OpenXR CONFIG)` (`-DOpenXR_ROOT` / `-DOpenXR_DIR`, which is what CI
+uses), else `FetchContent`s the prebuilt Khronos `openxr_loader_windows-<ver>.zip`
+(`MODELVIEWER_OPENXR_LOADER_VERSION` + SHA256) into `build/_deps` — so ANY entry
+point (either script, a bare `cmake`, VS Open-Folder) builds from a fresh clone.
+Configure FAILS if that pin differs from the header rev, and `lint.yml` fails a PR
+whose `build-windows.yml` pin differs from it, so the three pins cannot drift
+silently. (The 2026-10-18 Windows box needed `-DOpenXR_DIR=C:/dev/openxr_sdk`
+because the bare `build_windows.bat` had no provisioning at all.) **macOS:**
+`build_macos.sh` builds the loader from source at the pin into
+`/tmp/openxr-install-<ver>` (version-keyed, like the runtime's, so another
+checkout's loader in `/tmp` is never picked up) and warns if the pin differs from
+the headers. Linux deliberately stays on 1.1.43 (below).
+
+**Offline / flaky-network builds.** A fresh configure downloads the OpenXR
+loader zip plus four git deps (`displayxr_common`, `tinygltf`, `glm`, `tinyusdz`
+— the big one — and, on macOS, the OpenXR-SDK source). Each `FetchContent` name
+takes a local copy instead, so a VPN that drops clones need not block a build:
+`-DFETCHCONTENT_SOURCE_DIR_OPENXR_LOADER=<extracted openxr_loader_windows-1.1.51.zip>`
+(the dir holding the top-level `OpenXRConfig.cmake`; `-DOpenXR_ROOT=<same dir>`
+also works), `-DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=<tinyusdz checkout at v0.9.9-rc7>`,
+likewise `_TINYGLTF` (v2.9.3), `_GLM` (1.0.1), `_DISPLAYXR_COMMON` (the tag in
+`common/CMakeLists.txt`). The local copy must be at the pinned tag — CMake does
+not check. Both Windows scripts forward extra arguments to the configure step
+(`scripts\build_windows.bat -DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=C:/deps/tinyusdz`).
+Once a `build/` tree has populated everything, `-DFETCHCONTENT_FULLY_DISCONNECTED=ON`
+reconfigures with no network at all. macOS: `OPENXR_SDK_SRC=<OpenXR-SDK-Source
+checkout> ./scripts/build_macos.sh` skips the loader clone, and `build_macos.sh`
+forwards any `-D…` argument to its configure step too. (displayxr-common may
+also fetch the Khronos headers as `OPENXR_SDK_HEADERS`; same override.)
 
 ### macOS (local dev)
 `./scripts/build_macos.sh` (builds the OpenXR loader from source, pulls

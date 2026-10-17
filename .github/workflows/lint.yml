@@ -51,6 +51,21 @@ jobs:
           # header to a full runtime commit SHA; this proves the bytes match.
           python3 scripts/check_vendored_headers.py --drift
 
+      - name: OpenXR loader pins agree (CI == dev build == headers)
+        run: |
+          # Demo-repo dev-build rule (runtime CLAUDE.md): the Windows CI loader,
+          # the dev build's FetchContent pin and the vendored header rev must be
+          # equal. windows/CMakeLists.txt checks itself against the header at
+          # configure time; this closes the CI leg on every PR, hardware-free.
+          hdr=$(sed -nE 's/^#define XR_CURRENT_API_VERSION XR_MAKE_VERSION\(([0-9]+), *([0-9]+), *([0-9]+)\).*/\1.\2.\3/p' openxr_includes/openxr/openxr.h)
+          dev=$(sed -nE 's/^set\(MODELVIEWER_OPENXR_LOADER_VERSION "([0-9.]+)"\).*/\1/p' windows/CMakeLists.txt)
+          ci=$(sed -nE 's/^ *\$openxrVersion = "([0-9.]+)".*/\1/p' .github/workflows/build-windows.yml)
+          echo "header=$hdr dev(windows/CMakeLists.txt)=$dev ci(build-windows.yml)=$ci"
+          if [ -z "$hdr" ] || [ "$hdr" != "$dev" ] || [ "$dev" != "$ci" ]; then
+            echo "::error::OpenXR loader pins disagree -- bump all three together."
+            exit 1
+          fi
+
       - name: Workflow YAML is valid
         run: |
           python3 -m pip install --quiet pyyaml

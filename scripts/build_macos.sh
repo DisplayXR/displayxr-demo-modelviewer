@@ -7,13 +7,19 @@
 #   ./scripts/build_macos.sh                run cmake build only
 #   ./scripts/build_macos.sh --installer    also stage artifacts and build
 #                                            _package/DisplayXRModelViewer-*.pkg
+#   ./scripts/build_macos.sh -DFOO=bar      any -D argument is forwarded to the
+#                                            configure step (offline overrides:
+#                                            -DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=...)
 #
 # Env:
 #   DISPLAYXR_VERSION   version string baked into the .pkg + .app Info.plist
 #                       (defaults to 0.0.0-dev if unset). CI sets this from
 #                       the v* git tag.
 #   OPENXR_VERSION      OpenXR-SDK release tag to build the loader from
-#                       (defaults to 1.1.43, mirroring the runtime repo).
+#                       (defaults to 1.1.51 == XR_CURRENT_API_VERSION of the
+#                       vendored openxr_includes/ headers; checked below).
+#   OPENXR_SDK_SRC      offline: an existing OpenXR-SDK-Source checkout at
+#                       release-$OPENXR_VERSION, used instead of git clone.
 
 set -euo pipefail
 
@@ -21,11 +27,13 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 BUILD_INSTALLER=false
+CMAKE_EXTRA_ARGS=()
 for arg in "${@}"; do
     case "$arg" in
         --installer) BUILD_INSTALLER=true ;;
+        -D*) CMAKE_EXTRA_ARGS+=("$arg") ;;   # forwarded to the configure step
         -h|--help)
-            sed -n '1,17p' "$0"
+            sed -n '1,23p' "$0"
             exit 0
             ;;
         *)
@@ -37,31 +45,49 @@ done
 
 # --- 0. Build OpenXR loader from source -----------------------------------
 # Homebrew has no `openxr-loader` formula, so we build the loader from the
-# Khronos SDK and install it under /tmp/openxr-install. This mirrors the
-# DisplayXR runtime repo's approach (scripts/build_macos.sh:56–91). The
+# Khronos SDK and install it under /tmp/openxr-install-<version>. This mirrors
+# the DisplayXR runtime repo's approach (its scripts/build_macos.sh). The
 # BUILD_WITH_SYSTEM_JSONCPP=OFF + jsoncpp include-order patch are required
 # to avoid baking a Homebrew jsoncpp path into the redistributable dylib
 # (runtime repo issue #205).
+#
+# The cache dir is keyed by version: other DisplayXR checkouts on the same Mac
+# build their loader into /tmp too, and an unversioned /tmp/openxr-install would
+# silently hand this build whatever release was built there first.
 OPENXR_VERSION="${OPENXR_VERSION:-1.1.51}"
-OPENXR_DIR="/tmp/openxr-install"
+HEADER_VERSION="$(sed -nE 's/^#define XR_CURRENT_API_VERSION XR_MAKE_VERSION\(([0-9]+), *([0-9]+), *([0-9]+)\).*/\1.\2.\3/p' \
+    "$REPO_ROOT/openxr_includes/openxr/openxr.h")"
+if [ "$OPENXR_VERSION" != "$HEADER_VERSION" ]; then
+    echo "Warning: OpenXR loader $OPENXR_VERSION != vendored header rev $HEADER_VERSION" >&2
+    echo "         (bump the default above with the headers; keep it == build-windows.yml)" >&2
+fi
+OPENXR_DIR="/tmp/openxr-install-$OPENXR_VERSION"
 if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.dylib" ]; then
     echo "==> Building OpenXR loader $OPENXR_VERSION → $OPENXR_DIR"
-    rm -rf /tmp/openxr-sdk
-    git clone --depth 1 --branch "release-$OPENXR_VERSION" \
-        https://github.com/KhronosGroup/OpenXR-SDK-Source.git /tmp/openxr-sdk
+    OPENXR_SRC=/tmp/openxr-sdk-$OPENXR_VERSION
+    rm -rf "$OPENXR_SRC"
+    if [ -n "${OPENXR_SDK_SRC:-}" ]; then
+        cp -R "$OPENXR_SDK_SRC" "$OPENXR_SRC"
+        rm -rf "$OPENXR_SRC/build"   # a copied CMakeCache points at the original dir
+    else
+        git clone --depth 1 --branch "release-$OPENXR_VERSION" \
+            https://github.com/KhronosGroup/OpenXR-SDK-Source.git "$OPENXR_SRC"
+    fi
 
+    # Idempotent (the address skips an already-patched line): an OPENXR_SDK_SRC
+    # checkout reused from an earlier build may already carry the patch.
     /usr/bin/sed -i '' \
-        's|PRIVATE "${PROJECT_SOURCE_DIR}/src/external/jsoncpp/include"|BEFORE PRIVATE "${PROJECT_SOURCE_DIR}/src/external/jsoncpp/include"|' \
-        /tmp/openxr-sdk/src/loader/CMakeLists.txt
+        '/BEFORE PRIVATE/!s|PRIVATE "${PROJECT_SOURCE_DIR}/src/external/jsoncpp/include"|BEFORE PRIVATE "${PROJECT_SOURCE_DIR}/src/external/jsoncpp/include"|' \
+        "$OPENXR_SRC/src/loader/CMakeLists.txt"
 
-    cmake -B /tmp/openxr-sdk/build -S /tmp/openxr-sdk -G Ninja \
+    cmake -B "$OPENXR_SRC/build" -S "$OPENXR_SRC" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$OPENXR_DIR" \
         -DBUILD_TESTS=OFF -DBUILD_CONFORMANCE_TESTS=OFF \
         -DBUILD_WITH_SYSTEM_JSONCPP=OFF \
         -DCMAKE_MAP_IMPORTED_CONFIG_RELEASE="Release;None;"
-    cmake --build /tmp/openxr-sdk/build
-    cmake --install /tmp/openxr-sdk/build
+    cmake --build "$OPENXR_SRC/build"
+    cmake --install "$OPENXR_SRC/build"
 else
     echo "==> OpenXR loader cached at $OPENXR_DIR"
 fi
@@ -69,7 +95,8 @@ fi
 # --- 1. cmake build -------------------------------------------------------
 cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+    -DCMAKE_PREFIX_PATH="$OPENXR_DIR" \
+    ${CMAKE_EXTRA_ARGS[@]+"${CMAKE_EXTRA_ARGS[@]}"}
 cmake --build build
 
 BIN="$REPO_ROOT/build/macos/model_viewer_handle_vk_macos"

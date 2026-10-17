@@ -41,7 +41,9 @@ if(NOT OPENXR_FOUND)
 endif()
 
 if(NOT OPENXR_FOUND)
-    message(FATAL_ERROR "OpenXR not found. Install via: brew install openxr-loader")
+    message(FATAL_ERROR "OpenXR loader not found. Build with ./scripts/build_macos.sh "
+        "(it builds the pinned loader into /tmp/openxr-install-<ver>), or pass "
+        "-DCMAKE_PREFIX_PATH=<loader install prefix>. Homebrew has no openxr-loader formula.")
 endif()
 
 add_executable(model_viewer_handle_vk_macos
