@@ -291,7 +291,9 @@ not check. Both Windows scripts forward extra arguments to the configure step
 (`scripts\build_windows.bat -DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=C:/deps/tinyusdz`).
 Once a `build/` tree has populated everything, `-DFETCHCONTENT_FULLY_DISCONNECTED=ON`
 reconfigures with no network at all. macOS: `OPENXR_SDK_SRC=<OpenXR-SDK-Source
-checkout> ./scripts/build_macos.sh` skips the loader clone.
+checkout> ./scripts/build_macos.sh` skips the loader clone, and `build_macos.sh`
+forwards any `-D…` argument to its configure step too. (displayxr-common may
+also fetch the Khronos headers as `OPENXR_SDK_HEADERS`; same override.)
 
 ### macOS (local dev)
 `./scripts/build_macos.sh` (builds the OpenXR loader from source, pulls

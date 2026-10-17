@@ -801,7 +801,8 @@ holding `OpenXRConfig.cmake`); `TINYUSDZ` a checkout at `v0.9.9-rc7`. `TINYGLTF`
 `GLM` and `DISPLAYXR_COMMON` work the same way. After one successful configure,
 `-DFETCHCONTENT_FULLY_DISCONNECTED=ON` rebuilds with no network. On macOS,
 `OPENXR_SDK_SRC=<OpenXR-SDK-Source checkout> ./scripts/build_macos.sh` skips the
-loader clone.
+loader clone, and `build_macos.sh` forwards `-D…` arguments to CMake the same way
+(`./scripts/build_macos.sh -DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=$HOME/deps/tinyusdz`).
 
 ## Repo layout
 

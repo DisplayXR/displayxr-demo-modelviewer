@@ -7,6 +7,9 @@
 #   ./scripts/build_macos.sh                run cmake build only
 #   ./scripts/build_macos.sh --installer    also stage artifacts and build
 #                                            _package/DisplayXRModelViewer-*.pkg
+#   ./scripts/build_macos.sh -DFOO=bar      any -D argument is forwarded to the
+#                                            configure step (offline overrides:
+#                                            -DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=...)
 #
 # Env:
 #   DISPLAYXR_VERSION   version string baked into the .pkg + .app Info.plist
@@ -24,11 +27,13 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 BUILD_INSTALLER=false
+CMAKE_EXTRA_ARGS=()
 for arg in "${@}"; do
     case "$arg" in
         --installer) BUILD_INSTALLER=true ;;
+        -D*) CMAKE_EXTRA_ARGS+=("$arg") ;;   # forwarded to the configure step
         -h|--help)
-            sed -n '1,20p' "$0"
+            sed -n '1,23p' "$0"
             exit 0
             ;;
         *)
@@ -90,7 +95,8 @@ fi
 # --- 1. cmake build -------------------------------------------------------
 cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+    -DCMAKE_PREFIX_PATH="$OPENXR_DIR" \
+    ${CMAKE_EXTRA_ARGS[@]+"${CMAKE_EXTRA_ARGS[@]}"}
 cmake --build build
 
 BIN="$REPO_ROOT/build/macos/model_viewer_handle_vk_macos"
