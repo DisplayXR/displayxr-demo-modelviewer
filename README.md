@@ -497,11 +497,19 @@ calibration, brightness, gamut and 3D cross-talk are separate concerns.
 
 ## Controls
 
+Every control moves the **model**, never the display: on a 3D display the
+camera is the physical viewer, so the display plane, the convergence distance,
+the rear depth budget and the space your tracked hands live in all stay put
+while the model turns, scales and slides in front of them (a turntable, see
+*Hand tracking* below). Mouse, keys and hands feed the same state and agree.
+
 | Input | Action |
 |---|---|
-| WASD / Q / E | Strafe the virtual display in 3D |
-| Left-click drag | Rotate the virtual display |
-| Scroll / trackpad | Zoom (virtual display height) |
+| WASD / Q / E | Slide the model (moves the point that sits on the display plane) |
+| Left-click drag | Rotate the model about its centre — yaw about world up, pitch about the display's right axis |
+| Scroll / trackpad | Zoom: uniform scale about the model's centre, which stays on the convergence plane |
+| Pinch + drag (hand tracking) | Rotate the model, same feel as the mouse drag |
+| Two-hand pinch: spread / twist / drag | Zoom / roll about the view axis / rotate |
 | `-` / `=` | Decrease / increase depth + IPD together (10 %–100 %) |
 | `M` | Auto-orbit: slow turntable rotation when idle |
 | `V` | Cycle rendering modes advertised by the display runtime |
@@ -510,7 +518,7 @@ calibration, brightness, gamut and 3D cross-talk are separate concerns.
 | `[` / `]` | Exposure down / up, in quarter stops |
 | `G` | Cycle the tone curve (PBR Neutral → ACES → none) |
 | `L` | Cycle the lighting mode (sky → studio → room → none → scene, the last only for a model that carries lights) — see *Environment and grading* |
-| Space | Reset pose, zoom, depth |
+| Space | Reset pose, zoom, depth (and the two-hand roll) |
 | Tab | Toggle HUD |
 | Ctrl+T | Toggle transparent background (desktop see-through; Windows only) |
 | Esc | Quit |
@@ -521,6 +529,57 @@ pointer, the runtime draws the cursor just in front of it (runtime ≥ v2.36,
 D3D compositors draw it). Elsewhere the OS cursor is unchanged.
 `DISPLAYXR_CURSOR_DEPTH=0` turns it off. How it is wired, and how another demo
 can adopt it: [docs/depth-cursor.md](docs/depth-cursor.md).
+
+### Hand tracking
+
+When the runtime serves `XR_EXT_hand_tracking` from a hand-tracking input
+provider (an Ultraleap camera, or the runtime's `sim_input` test provider), the
+viewer draws both hands as translucent joint-and-bone meshes — cyan left, amber
+right — exactly where they are in front of the panel, in every view, and reads
+pinches off them. Without a provider nothing changes: the extension is simply
+not used.
+
+| Gesture | Action |
+|---|---|
+| Pinch (thumb tip to index tip under 2.5 cm; released above 4 cm) + drag | Rotate the model: 10 cm of drag ≈ 57° |
+| Both hands pinched, spread / close | Zoom: the separation ratio is the scale ratio |
+| Both hands pinched, twist | Roll the model about the view axis (the model follows the hands) |
+| Both hands pinched, drag | Rotate, like one hand |
+
+A pinch counts as user input (it parks the auto-orbit), a hand that is not
+tracked contributes nothing, and the frame it comes back re-anchors the
+gesture rather than jumping. The pinch point is smoothed with a 50 ms EMA. The
+first time hands are seen a short hint appears (HUD chip on macOS, toast on
+Windows, log line on Linux).
+
+The hands are rendered in the app's reference space through the *fixed* rig —
+a hand 20 cm in front of the panel floats 20 cm in front of the virtual
+display, at life size — and are never multiplied by the model transform. They
+get their own near plane (50× nearer than the model's), so a hand between the
+glass and your face is not sliced off.
+
+Tuning (environment, desktop legs):
+
+| Variable | Effect |
+|---|---|
+| `DXR_MODELVIEWER_PINCH_M=<m>` | Pinch-enter distance (exit = 1.6×). Default 0.025 |
+| `DXR_MODELVIEWER_ORBIT_RAD_PER_M=<r>` | Drag sensitivity, radians per metre. Default 10 |
+| `DXR_MODELVIEWER_HANDS_OFFSET_M=x,y,z` | Constant offset added to every joint (metres, reference space) — a mounting/test aid |
+
+**Trying it without a camera.** The runtime's `sim_input` provider scripts two
+hands that circle and curl (the curl brings the thumb and index tips to ~1 cm,
+so they pinch). Enable it for the process that loads the runtime, e.g. on a
+macOS dev box against the runtime's dev package:
+
+```bash
+DXR_SIM_INPUT=1 DXR_INPUT_SIM_INPUT_ENABLE=1 ./scripts/run_macos_dev.sh
+```
+
+(`DXR_INPUT_SIM_INPUT_ENABLE=1` is the current gate, `DXR_SIM_INPUT=1` the
+older alias; on Windows, `displayxr-cli input set sim-input ENABLE 1` after
+`register_dev_plugin.bat input sim`.) Note that `sim_input` scripts its hands
+in root space, about 1.45 m below the display plane; `DXR_MODELVIEWER_HANDS_OFFSET_M=0,1.45,-0.6`
+brings them in front of the panel.
 
 ## Undocking the viewer (launch flags + `displayxr-view:` links)
 

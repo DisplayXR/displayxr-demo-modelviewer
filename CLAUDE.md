@@ -55,12 +55,20 @@ model_common/                     — the renderer (vendor-neutral, analog of
                                     (common/model_cursor_depth.h,
                                     docs/depth-cursor.md)
   model_vulkan_utils.{h,cpp}      — VkBuffer/VkImage helpers
+  hand_gestures.{h,cpp}           — pinch-gesture math (pure C++; tests/
+                                    hand_gestures_tests.cpp, ctest, no runtime)
+  hand_tracking.{h,cpp}           — XR_EXT_hand_tracking consumer + HandRigMap
+                                    (display metres -> the model's world through
+                                    the FIXED rig; never the model transform)
+  hand_renderer.{h,cpp}           — translucent joint/capsule hand mesh through
+                                    ModelRenderer's overlay hook (shaders/hand.*)
   shaders/                        — pbr.{vert,frag}; skybox.frag; IBL gen:
                                     fullscreen.vert, brdf_lut/irradiance/
                                     prefilter.frag, sky.glsl + ibl_common.glsl
 common/                           — fallback Kooima view math (display3d_view.*,
                                     used only when XR_DXR_view_rig is absent),
-                                    camera3d_view (unused), input, HUD, stb.
+                                    camera3d_view (unused), input, HUD, stb;
+                                    model_orbit.h = the turntable rule (below).
                                     dxr_view_config.h is NOT here: it comes from
                                     displayxr-common (displayxr::rules)
 openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
@@ -102,6 +110,46 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   and Android** — gated on `useRig = g_hasViewRigExt && displayWidthM > 0`
   (`windows/main.cpp`). Under the rig, `rawViews[]` carries the render-ready
   per-eye pose/FOV and `XrViewDisplayRawDXR.rawEyes[]` feeds the HUD eye readout.
+- **Turntable, not camera orbit — `common/model_orbit.h`.** Every leg still keeps
+  the familiar orbit state (`cameraPos` = the point under the display centre,
+  yaw/pitch (+ the two-hand roll), `viewParams.scaleFactor`), but it is
+  interpreted as a MODEL transform, `S = Scale(sf) · R(Q)⁻¹ · T(−C)`, handed to
+  `ModelRenderer::setSceneTransform()` each frame. The rig declared through
+  `XR_DXR_view_rig` is the **fixed identity pose at the locate origin with the
+  fit's `virtualDisplayHeight`** (`OrbitRigPose()`, `rigVH = vH`, no `/ scaleFactor`).
+  Reason: on a 3D display the camera is the physical viewer; orbiting it spins
+  the display plane, the convergence distance, the depth budget and the hand
+  space along with the model. S reproduces the old picture exactly, so mouse,
+  keys, double-click focus, auto-orbit and hands all agree by construction. The
+  renderer applies S to the model draws, the skybox and `raycast()`
+  (locate-space rays in, `t` in locate units out); the overlay hook gets the
+  caller's untouched view. `pickSurface()` hits come back in locate space —
+  convert with `sceneToModelPoint()` before storing them in the orbit state
+  (the teleport does). Windows keeps the app-side camera fallback untouched
+  when the rig extension is absent (`turntable` gate); macOS/Linux apply S
+  always.
+- **Hands — `XR_EXT_hand_tracking`.** Each leg enables the extension when
+  advertised, `HandTracking::init()` checks `supportsHandTracking` and creates
+  two trackers (inert otherwise — the demo runs exactly as before), and every
+  frame after `xrWaitFrame` locates 26 joints per hand in `localSpace` at
+  `predictedDisplayTime`. The gesture math (`hand_gestures.h`: pinch with
+  enter/exit hysteresis, one-hand drag = yaw/pitch, two-hand = zoom ratio +
+  roll about the view axis + midpoint drag, 50 ms EMA, re-anchor on tracking
+  loss) runs on the raw joints and adds to the SAME orbit state the mouse
+  drives (`yaw -= dx`, `pitch += dy_up`, `scaleFactor *= ratio`, rig roll
+  `-= dAngle`). Rendering: joints -> `HandRigMap` (`XrViewDisplayRawDXR`'s
+  `displayPlanePose` + `canvasRectPx`/`canvasSizeMeters`, `m2v = rigVH /
+  canvasHeight`, the fixed rig pose) -> `HandRenderer::update()` once per frame
+  -> drawn by the overlay hook inside the renderer's render pass after the last
+  model primitive (depth test on, write off, straight-alpha blend, back-face
+  culled closed meshes). The hand pipeline rasterises with its **own near plane
+  (2 % of the model's)** and writes `gl_FragDepth` remapped into the model
+  projection's [0,1] range: the model clips at `ez − vH`, one display height in
+  front of the glass, which is where hands live, and a hand straddling that
+  plane also hit a MoltenVK resolve artefact (magenta block, right tile) that
+  the own-near-plane removes. Knobs: `DXR_MODELVIEWER_PINCH_M`,
+  `DXR_MODELVIEWER_ORBIT_RAD_PER_M`, `DXR_MODELVIEWER_HANDS_OFFSET_M=x,y,z`.
+  Android is not wired (its leg inlines its own loop).
 - **App-side Kooima (fallback only, when `XR_DXR_view_rig` is absent).**
   `display3d_compute_view/_views` (in `common/display3d_view.*`) take
   `(near_offset, far_offset)` — **absolute** offsets in virtual-display-height
@@ -350,6 +398,27 @@ the sphere row (the spheres this asset exists to measure are the invisible ones)
 and never against a full-row median (on the sphere row the spheres span >50% of
 the plate, so that reference is contaminated — the trap that produced every
 wrong number in #75). Always capture with `DXR_MODELVIEWER_DETERMINISTIC=1`.
+
+**Hands without hardware (`sim_input`).** The runtime's `sim_input` provider
+serves scripted 26-joint hands (circle + curl wave; the curl pinches, tips reach
+~1 cm). macOS dev recipe against the runtime's dev package:
+
+```bash
+DXR_SIM_INPUT=1 DXR_INPUT_SIM_INPUT_ENABLE=1 \
+DXR_MODELVIEWER_HANDS_OFFSET_M=0,1.45,-0.6 ./scripts/run_macos_dev.sh
+# then, for the vk_native compositor:
+touch "$TMPDIR/displayxr_atlas_trigger"; sleep 3; open "$TMPDIR/displayxr_atlas.png"
+```
+
+Expect `hands: XR_EXT_hand_tracking live`, `HandRenderer: ready`, `Hands
+detected`, and a `hands: L … tips=NNmm PINCH|open …` trace every ~5 s in the
+log. TRAP: `sim_input` scripts its circles in ROOT space, ~1.45 m below the
+display plane (runtime LOCAL = root + 1.6 m, ADR-024), so without the offset
+the hands are 1.45 m under the panel and never in any view; the offset is a
+test aid, not a product setting. `DXR_MODELVIEWER_PINCH_M=0.001` disables
+pinches so auto-orbit can show the model turning under stationary hands.
+`displayPlanePose` in LOCAL varies between sessions (seen at z = 0 and
+z = −0.19); `HandRigMap` reads it every frame, so nothing depends on it.
 
 Pass a model path as the first CLI arg to skip auto-load
 (`model_viewer_handle_vk_win.exe <path.glb>`), then press **`I`** to dump the
