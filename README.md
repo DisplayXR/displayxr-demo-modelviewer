@@ -553,8 +553,8 @@ gesture rather than jumping. The pinch point is smoothed with a 50 ms EMA. The
 first time hands are seen a short hint appears (HUD chip on macOS, toast on
 Windows, log line on Linux).
 
-The look follows the Ultraleap "Ghost Hand" (LeiaViewer's
-`Assets/ThirdParty/Ultraleap/Tracking/Hands/Runtime/Models/GenericHand/`): a
+The look follows the Ultraleap "Ghost Hand" (the Ultraleap Unity plugin's
+`Ultraleap/Tracking/Hands/Runtime/Models/GenericHand/`, Apache-2.0): a
 depth-prime pass so each pixel of a hand is blended once, a dark glass body
 whose colour is its fresnel rim, and a hairline inverted-hull outline.
 

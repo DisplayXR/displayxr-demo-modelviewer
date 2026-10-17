@@ -67,7 +67,7 @@ struct HandGestureConfig {
     float maxZoomStep = 1.25f;       //!< per-frame zoom ratio clamp (both ways)
     //! Two-hand gestures are ignored (and their baseline dropped) while the
     //! hands are further apart than this — a tracking glitch guard, the
-    //! LeiaViewer UltraleapScaleRotate `MaxDistance` idea at a hand scale.
+    //! reference viewer app's UltraleapScaleRotate `MaxDistance` at hand scale.
     float maxHandSeparationM = 1.0f;
 
     //! Apply DXR_MODELVIEWER_PINCH_M=<metres> (pinch-enter distance; exit =

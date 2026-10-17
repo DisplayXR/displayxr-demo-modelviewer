@@ -5,8 +5,8 @@
 // prime pass runs this same shader with every colour channel masked off, so
 // gl_FragDepth below is what it primes.
 //
-// Look (Ultraleap Ghost Hand, LeiaViewer GenericHandShader.shader + "Ghost
-// Hand.mat"): unlit dark translucent body whose colour is the fresnel term
+// Look (Ultraleap Ghost Hand: the Ultraleap Unity plugin's
+// GenericHandShader.shader + "Ghost Hand.mat", Apache-2.0): unlit dark translucent body whose colour is the fresnel term
 // (there: 22x white * fresnel^0.629 * alpha 0.098), i.e. nearly black facing
 // the viewer and glowing at the silhouette, plus a hairline inverted-hull
 // outline. Here the rim carries the left/right tint so the hands stay
