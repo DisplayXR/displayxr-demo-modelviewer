@@ -2253,6 +2253,31 @@ static float sceneAmbientScale() {
     return v;
 }
 
+void ModelRenderer::setSceneTransform(const float m[16]) {
+    std::memcpy(sceneXf_, m, sizeof(sceneXf_));
+    const glm::mat4 inv = glm::inverse(glm::make_mat4(m));
+    std::memcpy(sceneInv_, glm::value_ptr(inv), sizeof(sceneInv_));
+    sceneXfSet_ = true;
+}
+
+void ModelRenderer::sceneToModelPoint(const float in[3], float out[3]) const {
+    if (!sceneXfSet_) { out[0] = in[0]; out[1] = in[1]; out[2] = in[2]; return; }
+    const float* m = sceneInv_;
+    const float x = in[0], y = in[1], z = in[2];
+    out[0] = m[0] * x + m[4] * y + m[8] * z + m[12];
+    out[1] = m[1] * x + m[5] * y + m[9] * z + m[13];
+    out[2] = m[2] * x + m[6] * y + m[10] * z + m[14];
+}
+
+void ModelRenderer::sceneToModelVector(const float in[3], float out[3]) const {
+    if (!sceneXfSet_) { out[0] = in[0]; out[1] = in[1]; out[2] = in[2]; return; }
+    const float* m = sceneInv_;
+    const float x = in[0], y = in[1], z = in[2];
+    out[0] = m[0] * x + m[4] * y + m[8] * z;
+    out[1] = m[1] * x + m[5] * y + m[9] * z;
+    out[2] = m[2] * x + m[6] * y + m[10] * z;
+}
+
 void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                                    float clipFar, ModelBuffer *dst) {
     // W7 (#396): consume a plain clean +Y-up-world view matrix (the render-ready
@@ -3479,7 +3504,14 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // recording; an earlier frame still on the GPU may be reading them.
     if (shadowPass) waitAllInFlight();
 
-    updateUniforms(viewMatrix, projMatrix, clipFarViewSpace, &viewUbo->buf);
+    // Turntable orbit (common/model_orbit.h): the model is drawn through the
+    // scene transform, i.e. with view·S, so the camera the shaders see is the
+    // model-space camera. The overlay hook below keeps the caller's view.
+    float viewModel[16];
+    if (sceneXfSet_) mat4Mul(viewMatrix, sceneXf_, viewModel);
+    else std::memcpy(viewModel, viewMatrix, sizeof(viewModel));
+
+    updateUniforms(viewModel, projMatrix, clipFarViewSpace, &viewUbo->buf);
     VkDescriptorSet viewSet = viewUbo->set;
 
     // Kept for the mutation arm's second command buffer below (debug path).
@@ -3706,6 +3738,11 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         for (const auto& p : primitives_) if (transmits(p)) drawPrimitive(p);
     }
 
+    // Overlay (translucent hand mesh): last draw of the pass, after every
+    // model primitive. Skipped under the facing probe, which measures the
+    // model's own pixels.
+    if (overlayDraw_ && !facingProbe_) overlayDraw_(cmd, viewMatrix, projMatrix, !swapchainIsSrgb_);
+
     vkCmdEndRenderPass(cmd);
     // colorImage_ is now in TRANSFER_SRC_OPTIMAL (render-pass finalLayout).
 
@@ -3762,7 +3799,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         // maskUniform_ / maskTestUniform_ are single buffers; no earlier
         // frame may still be reading them when the host rewrites them.
         waitAllInFlight();
-        updateUniforms(viewMatrix, projCov, 0.0f, &maskUniform_);
+        updateUniforms(viewModel, projCov, 0.0f, &maskUniform_);
         recordMaskPass(cmd, maskSet_);
 
         // Mutation arm of the self-test: the SAME coverage draw through a
@@ -3778,8 +3815,8 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
                 const float px = (c & 1) ? bboxMax_[0] : bboxMin_[0];
                 const float py = (c & 2) ? bboxMax_[1] : bboxMin_[1];
                 const float pz = (c & 4) ? bboxMax_[2] : bboxMin_[2];
-                const float fwd = -(viewMatrix[2] * px + viewMatrix[6] * py +
-                                    viewMatrix[10] * pz + viewMatrix[14]);
+                const float fwd = -(viewModel[2] * px + viewModel[6] * py +
+                                    viewModel[10] * pz + viewModel[14]);
                 if (fwd < fwdMin) fwdMin = fwd;
                 if (fwd > fwdMax) fwdMax = fwd;
             }
@@ -3791,7 +3828,7 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
             // only mean the far plane never reached the rasterizer.
             const float slice = fwdMin + 0.25f * (fwdMax - fwdMin);
             if (ProjRefarZeroToOne(projCov, slice, projTest)) {
-                updateUniforms(viewMatrix, projTest, 0.0f, &maskTestUniform_);
+                updateUniforms(viewModel, projTest, 0.0f, &maskTestUniform_);
                 haveProjTest = true;
             }
         }

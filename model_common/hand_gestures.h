@@ -65,6 +65,11 @@ struct HandGestureConfig {
     float orbitRadPerM = 10.0f;      //!< 10 cm of pinch drag ~= 57 degrees
     float smoothTauS = 0.05f;        //!< EMA time constant on the pinch point; 0 = off
     float maxZoomStep = 1.25f;       //!< per-frame zoom ratio clamp (both ways)
+
+    //! Apply DXR_MODELVIEWER_PINCH_M=<metres> (pinch-enter distance; exit =
+    //! 1.6x) and DXR_MODELVIEWER_ORBIT_RAD_PER_M=<rad/m> when set. Desktop
+    //! tuning aids for a given tracker / hand size; defaults otherwise.
+    void applyEnvironment();
 };
 
 //! Two-threshold pinch state. `update` returns the new state.
