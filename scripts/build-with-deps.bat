@@ -24,25 +24,19 @@ REM searches PATH — and some installs set VULKAN_SDK without adding Bin to PAT
 set "PATH=%VULKAN_SDK%\Bin;%PATH%"
 
 REM --- OpenXR loader -------------------------------------------------------------
-REM Auto-provision the prebuilt Khronos loader, pinned to the same spec revision as
-REM the vendored openxr_includes/ headers (XR_CURRENT_API_VERSION = 1.1.51). Cached
-REM under build\openxr_sdk so a fresh clone builds with no manually-staged SDK.
-REM (Mirrors what .github/workflows/build-windows.yml does in CI.)
-set "OPENXR_VER=1.1.51"
-set "OPENXR_DIR=%CD%\build\openxr_sdk"
-if not exist "%OPENXR_DIR%\x64\lib\openxr_loader.lib" (
-    echo === Provisioning OpenXR loader %OPENXR_VER% ===
-    if not exist build mkdir build
-    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-      "$ErrorActionPreference='Stop';" ^
-      "$u='https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-%OPENXR_VER%/openxr_loader_windows-%OPENXR_VER%.zip';" ^
-      "Invoke-WebRequest -Uri $u -OutFile 'build\openxr_loader.zip';" ^
-      "Expand-Archive -Path 'build\openxr_loader.zip' -DestinationPath 'build\openxr_sdk' -Force;" ^
-      "Remove-Item 'build\openxr_loader.zip' -Force" || exit /b 1
-)
+REM Provisioned by CMake itself (windows/CMakeLists.txt: FetchContent of the pinned
+REM prebuilt Khronos loader, == XR_CURRENT_API_VERSION of openxr_includes/ and the
+REM CI pin in .github/workflows/build-windows.yml). Nothing to stage here, so this
+REM script and the bare build_windows.bat configure identically.
+REM
+REM Extra arguments are forwarded to the configure step, e.g. for an offline build:
+REM   scripts\build-with-deps.bat -DFETCHCONTENT_SOURCE_DIR_OPENXR_LOADER=C:/deps/openxr_loader_windows-1.1.51
+REM                               -DFETCHCONTENT_SOURCE_DIR_TINYUSDZ=C:/deps/tinyusdz
+REM (all on one line).
+REM (see CLAUDE.md / README.md "Offline / flaky-network builds").
 
 echo === Configuring ===
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%CD:\=/%/build/openxr_sdk" || exit /b 1
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release %* || exit /b 1
 echo === Building ===
 cmake --build build || exit /b 1
 echo === DONE ===
