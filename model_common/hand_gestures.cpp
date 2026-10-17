@@ -109,18 +109,28 @@ HandGestureDelta HandGestureController::update(const HandGestureFrame& frame) {
         pointValid_[h] = true;
     }
 
-    const bool two = pinched[0] && pinched[1];
+    bool two = pinched[0] && pinched[1];
+    float mid[3] = {0.f, 0.f, 0.f}, v[3] = {0.f, 0.f, 0.f}, d = 0.f;
+    if (two) {
+        for (int i = 0; i < 3; ++i) {
+            mid[i] = 0.5f * (point_[0][i] + point_[1][i]);
+            v[i] = point_[1][i] - point_[0][i];
+        }
+        d = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        // Implausibly far apart: not a gesture. Drop the baseline so the
+        // next plausible frame re-anchors instead of integrating the glitch.
+        if (d > cfg_.maxHandSeparationM) {
+            two = false;
+            prevTwo_ = false;
+            prevOne_[0] = prevOne_[1] = false;
+            return out;
+        }
+    }
     const int one = (!two && pinched[0]) ? 0 : (!two && pinched[1]) ? 1 : -1;
     const float k = cfg_.orbitRadPerM;
 
     if (two) {
         out.twoHand = true;
-        float mid[3], v[3];
-        for (int i = 0; i < 3; ++i) {
-            mid[i] = 0.5f * (point_[0][i] + point_[1][i]);
-            v[i] = point_[1][i] - point_[0][i];
-        }
-        const float d = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
         // Roll is measured in the display plane (XY); the view axis is Z.
         const float angle = std::atan2(v[1], v[0]);
         if (prevTwo_) {

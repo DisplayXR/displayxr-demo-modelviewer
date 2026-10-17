@@ -42,9 +42,10 @@ struct PushBlock {
     float viewProj[16];
     float color[4];
     float eye[4];
-    float depth[4];   // model projection's m[10], m[14] (see hand.frag)
+    float depth[4];    // model projection's m[10], m[14] (see hand.frag)
+    float params[4];   // x = outline extrusion (world units), y = pass (0 body, 1 outline)
 };
-static_assert(sizeof(PushBlock) == 112, "push block must stay under the 128-byte minimum");
+static_assert(sizeof(PushBlock) == 128, "push block must stay within the 128-byte minimum");
 
 // The hand's near plane as a fraction of the model's. The model clips at
 // ez - vH (one virtual display height in front of the glass), which is where a
@@ -184,7 +185,7 @@ bool HandRenderer::init(VkDevice device, VkPhysicalDevice physDevice, VkRenderPa
             return false;
         }
     }
-    if (!createPipeline(renderPass, samples, colorAttachmentCount)) {
+    if (!createPipelines(renderPass, samples, colorAttachmentCount)) {
         destroy();
         return false;
     }
@@ -192,8 +193,8 @@ bool HandRenderer::init(VkDevice device, VkPhysicalDevice physDevice, VkRenderPa
     return true;
 }
 
-bool HandRenderer::createPipeline(VkRenderPass renderPass, VkSampleCountFlagBits samples,
-                                  uint32_t colorAttachmentCount) {
+bool HandRenderer::createPipelines(VkRenderPass renderPass, VkSampleCountFlagBits samples,
+                                   uint32_t colorAttachmentCount) {
     VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushBlock)};
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.pushConstantRangeCount = 1;
@@ -229,8 +230,8 @@ bool HandRenderer::createPipeline(VkRenderPass renderPass, VkSampleCountFlagBits
     vp.viewportCount = 1; vp.scissorCount = 1;   // dynamic, inherited from renderEye
 
     // Closed meshes with outward CCW winding (the renderer's Y flip keeps
-    // GL-style CCW front faces CCW, #98): cull the back so each pixel of a
-    // hand blends once, not twice.
+    // GL-style CCW front faces CCW, #98). Body + prime cull the back; the
+    // outline hull culls the FRONT (inverted hull).
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_BACK_BIT;
@@ -241,7 +242,9 @@ bool HandRenderer::createPipeline(VkRenderPass renderPass, VkSampleCountFlagBits
     ms.rasterizationSamples = samples;
 
     // Sorted after the opaque model by construction (the hook runs last in
-    // the pass): depth test against it, never write.
+    // the pass): depth test against it. Only the prime pass writes depth —
+    // the hand's own, so body/outline then pass only on the nearest hand
+    // surface (LESS_OR_EQUAL against the primed value).
     VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = VK_TRUE;
     ds.depthWriteEnable = VK_FALSE;
@@ -276,7 +279,29 @@ bool HandRenderer::createPipeline(VkRenderPass renderPass, VkSampleCountFlagBits
     gp.pRasterizationState = &rs; gp.pMultisampleState = &ms; gp.pDepthStencilState = &ds;
     gp.pColorBlendState = &cb; gp.pDynamicState = &dyn;
     gp.layout = layout_; gp.renderPass = renderPass; gp.subpass = 0;
-    const VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeline_);
+    VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeline_);
+
+    // Depth prime: same state, depth write on, every colour channel masked.
+    if (r == VK_SUCCESS) {
+        VkPipelineDepthStencilStateCreateInfo dsPrime = ds;
+        dsPrime.depthWriteEnable = VK_TRUE;
+        VkPipelineColorBlendAttachmentState cbaPrime[4] = {};
+        VkPipelineColorBlendStateCreateInfo cbPrime = cb;
+        cbPrime.pAttachments = cbaPrime;   // writeMask 0, blend off, everywhere
+        VkGraphicsPipelineCreateInfo gpPrime = gp;
+        gpPrime.pDepthStencilState = &dsPrime;
+        gpPrime.pColorBlendState = &cbPrime;
+        r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpPrime, nullptr, &pipelinePrime_);
+    }
+    // Outline hull: back faces only (the extrusion happens in the vertex shader).
+    if (r == VK_SUCCESS) {
+        VkPipelineRasterizationStateCreateInfo rsOut = rs;
+        rsOut.cullMode = VK_CULL_MODE_FRONT_BIT;
+        VkGraphicsPipelineCreateInfo gpOut = gp;
+        gpOut.pRasterizationState = &rsOut;
+        r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpOut, nullptr, &pipelineOutline_);
+    }
+
     vkDestroyShaderModule(device_, vs, nullptr);
     vkDestroyShaderModule(device_, fs, nullptr);
     if (r != VK_SUCCESS) {
@@ -289,6 +314,8 @@ bool HandRenderer::createPipeline(VkRenderPass renderPass, VkSampleCountFlagBits
 void HandRenderer::destroy() {
     if (device_ == VK_NULL_HANDLE) return;
     if (pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
+    if (pipelinePrime_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipelinePrime_, nullptr); pipelinePrime_ = VK_NULL_HANDLE; }
+    if (pipelineOutline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, pipelineOutline_, nullptr); pipelineOutline_ = VK_NULL_HANDLE; }
     if (layout_ != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device_, layout_, nullptr); layout_ = VK_NULL_HANDLE; }
     for (Slot& s : slots_) {
         if (s.vbMapped) { vkUnmapMemory(device_, s.vb.memory); s.vbMapped = nullptr; }
@@ -325,13 +352,16 @@ void HandRenderer::update(const HandRenderHand hands[2], float dtSeconds) {
     for (int h = 0; h < 2; ++h) {
         s.firstIndex[h] = w.icount;
         s.indexCount[h] = 0;
-        s.alpha[h] = kAlpha * fade_[h];
+        s.fade[h] = fade_[h];
+        s.outline[h] = 0.f;
         std::memcpy(s.color[h], hands[h].color, sizeof(s.color[h]));
         if (fade_[h] <= 0.f) continue;
         const HandRenderHand& hand = hands[h];
+        float minRadius = 0.f;
         for (int j = 0; j < 26; ++j) {
             const HandRenderJoint& jt = hand.joints[j];
             if (!jt.valid) continue;
+            if (minRadius <= 0.f || jt.radius < minRadius) minRadius = jt.radius;
             w.sphere(jt.pos, jt.radius);
             const int p = kParent[j];
             if (p >= 0 && hand.joints[p].valid) {
@@ -340,6 +370,7 @@ void HandRenderer::update(const HandRenderHand hands[2], float dtSeconds) {
             }
         }
         s.indexCount[h] = w.icount - s.firstIndex[h];
+        s.outline[h] = minRadius * kOutlineFraction;
         if (s.indexCount[h] > 0) visible_ = true;
     }
 }
@@ -371,17 +402,26 @@ void HandRenderer::draw(VkCommandBuffer cmd, const float view[16], const float p
     pb.depth[0] = m10;
     pb.depth[1] = m14;
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     const VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &s.vb.buffer, &off);
     vkCmdBindIndexBuffer(cmd, s.ib.buffer, 0, VK_INDEX_TYPE_UINT16);
-    for (int h = 0; h < 2; ++h) {
-        if (s.indexCount[h] == 0) continue;
-        pb.color[0] = s.color[h][0]; pb.color[1] = s.color[h][1]; pb.color[2] = s.color[h][2];
-        pb.color[3] = s.alpha[h];
-        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, sizeof(PushBlock), &pb);
-        vkCmdDrawIndexed(cmd, s.indexCount[h], 1, s.firstIndex[h], 0, 0);
+
+    // Three passes over both hands, in the Ghost Hand order: depth prime,
+    // body, outline. Priming BOTH hands first means two overlapping hands
+    // also resolve to one nearest surface per pixel.
+    const VkPipeline passes[3] = {pipelinePrime_, pipeline_, pipelineOutline_};
+    for (int pass = 0; pass < 3; ++pass) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, passes[pass]);
+        for (int h = 0; h < 2; ++h) {
+            if (s.indexCount[h] == 0) continue;
+            pb.color[0] = s.color[h][0]; pb.color[1] = s.color[h][1]; pb.color[2] = s.color[h][2];
+            pb.color[3] = s.fade[h];
+            pb.params[0] = pass == 2 ? s.outline[h] : 0.f;
+            pb.params[1] = pass == 2 ? 1.f : 0.f;
+            vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(PushBlock), &pb);
+            vkCmdDrawIndexed(cmd, s.indexCount[h], 1, s.firstIndex[h], 0, 0);
+        }
     }
 }
 

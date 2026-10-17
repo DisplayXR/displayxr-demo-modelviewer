@@ -60,8 +60,9 @@ public:
     //! Current fade of hand i (0 = gone, 1 = fully shown).
     float fade(int i) const { return fade_[i & 1]; }
 
-    //! Base alpha of a fully-faded-in hand.
-    static constexpr float kAlpha = 0.35f;
+    //! Outline hull extrusion as a fraction of the hand's smallest joint radius
+    //! (hairline: ~0.6 mm on an 8 mm fingertip).
+    static constexpr float kOutlineFraction = 0.08f;
 
 private:
     struct Vertex { float p[3]; float n[3]; };
@@ -71,7 +72,8 @@ private:
         void* ibMapped = nullptr;
         uint32_t indexCount[2] = {0, 0};
         uint32_t firstIndex[2] = {0, 0};
-        float alpha[2] = {0.f, 0.f};
+        float fade[2] = {0.f, 0.f};
+        float outline[2] = {0.f, 0.f};   // world units
         float color[2][3] = {{0.f, 0.f, 0.f}, {0.f, 0.f, 0.f}};
     };
     static constexpr uint32_t kSlots = 3;
@@ -81,12 +83,19 @@ private:
     static constexpr uint32_t kMaxVerts = 2 * (25 * 24 + 26 * 84);
     static constexpr uint32_t kMaxIndices = 2 * (25 * 66 + 26 * 396);
 
-    bool createPipeline(VkRenderPass renderPass, VkSampleCountFlagBits samples, uint32_t colorAttachmentCount);
+    bool createPipelines(VkRenderPass renderPass, VkSampleCountFlagBits samples, uint32_t colorAttachmentCount);
 
     VkDevice device_ = VK_NULL_HANDLE;
     VkPhysicalDevice physDevice_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    // Ghost-hand passes (Ultraleap GenericHandShader order): depth prime
+    // (front faces, depth write, no colour) so the translucent body is drawn
+    // once per pixel instead of once per overlapping capsule; body (front
+    // faces, depth test only, blend); outline (BACK faces extruded along the
+    // normals, blend) — the inverted hull that peeks past the primed silhouette.
+    VkPipeline pipeline_ = VK_NULL_HANDLE;        // body
+    VkPipeline pipelinePrime_ = VK_NULL_HANDLE;   // depth prime
+    VkPipeline pipelineOutline_ = VK_NULL_HANDLE; // outline hull
     Slot slots_[kSlots];
     uint32_t slot_ = 0;
     float fade_[2] = {0.f, 0.f};

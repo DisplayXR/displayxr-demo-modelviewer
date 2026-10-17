@@ -1,8 +1,16 @@
 #version 450
-// Translucent hand: a soft diffuse tint with a fresnel rim so the silhouette
-// reads at alpha ~0.35 over any model. Straight (unpremultiplied) alpha; the
+// Ghost hand body / outline fragment. Straight (unpremultiplied) alpha; the
 // pipeline blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA on attachment 0 and masks
-// attachment 1 (the scene-linear transmission copy) off entirely.
+// attachment 1 (the scene-linear transmission copy) off entirely. The depth
+// prime pass runs this same shader with every colour channel masked off, so
+// gl_FragDepth below is what it primes.
+//
+// Look (Ultraleap Ghost Hand, LeiaViewer GenericHandShader.shader + "Ghost
+// Hand.mat"): unlit dark translucent body whose colour is the fresnel term
+// (there: 22x white * fresnel^0.629 * alpha 0.098), i.e. nearly black facing
+// the viewer and glowing at the silhouette, plus a hairline inverted-hull
+// outline. Here the rim carries the left/right tint so the hands stay
+// colour-coded.
 //
 // Depth: the hand is rasterised with its OWN projection (same frustum, a far
 // nearer near plane — hands sit between the glass and the viewer, where the
@@ -20,6 +28,7 @@ layout(push_constant) uniform PushBlock {
     vec4 color;
     vec4 eye;
     vec4 depth;
+    vec4 params;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -36,20 +45,29 @@ void main() {
     // with z_v = -1 / gl_FragCoord.w  ->  -m10 + m14 * gl_FragCoord.w.
     gl_FragDepth = clamp(-pc.depth.x + pc.depth.y * gl_FragCoord.w, 0.0, 1.0);
 
-    vec3 N = normalize(vNormal);
-    vec3 V = normalize(vToEye);
-    float ndv = clamp(dot(N, V), 0.0, 1.0);
-    float fresnel = pow(1.0 - ndv, 3.0);
+    const float fade = pc.color.a;
+    vec3 rgb;
+    float a;
+    if (pc.params.y > 0.5) {
+        // Outline: the extruded back faces that peek past the primed silhouette.
+        rgb = vec3(0.0);
+        a = 0.55 * fade;
+    } else {
+        vec3 N = normalize(vNormal);
+        vec3 V = normalize(vToEye);
+        float ndv = clamp(dot(N, V), 0.0, 1.0);
+        // The reference's broad fresnel (_FresnelPower 0.629) relies on an
+        // HDR rim (22x) plus bloom; without bloom the same curve reads as a
+        // grey haze, so the falloff is tightened to keep a dark glass body
+        // with a bright tinted silhouette.
+        float f = 1.0 - ndv;
+        vec3 rim = mix(pc.color.rgb, vec3(1.0), 0.35);   // tinted white rim
+        rgb = pc.color.rgb * 0.05 + rim * min(1.0, 1.5 * pow(f, 1.8));
+        a = (0.10 + 0.60 * pow(f, 2.2)) * fade;
+    }
 
-    // One fixed key light from above-front plus a hemisphere-ish fill.
-    vec3 L = normalize(vec3(0.35, 0.8, 0.5));
-    float diffuse = 0.45 + 0.55 * max(dot(N, L), 0.0);
-    vec3 rgb = pc.color.rgb * diffuse + mix(pc.color.rgb, vec3(1.0), 0.5) * fresnel * 0.45;
-
-    // Base alpha from the push block (~0.35 * fade); the rim is more opaque.
-    float a = clamp(pc.color.a * (1.0 + 1.4 * fresnel), 0.0, 0.9);
-
-    if (pc.eye.w > 0.5) rgb = encodeSrgb(clamp(rgb, 0.0, 1.0));
-    outColor = vec4(rgb, a);
+    rgb = clamp(rgb, 0.0, 1.0);
+    if (pc.eye.w > 0.5) rgb = encodeSrgb(rgb);
+    outColor = vec4(rgb, clamp(a, 0.0, 1.0));
     outLinear = vec4(0.0);
 }

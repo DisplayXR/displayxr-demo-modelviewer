@@ -120,12 +120,10 @@ void TestTwoHand() {
     }
     Check(Near(zoom, 2.0f, 1e-3f), "doubling the separation doubles the zoom");
 
-    // Per-frame clamp: a single frame that jumps 10x is limited to maxZoomStep.
-    d = step(Hand(-2.0f, 0.f, 0.3f, 0.01f), Hand(2.0f, 0.f, 0.3f, 0.01f));
-    Check(Near(d.zoom, 1.25f, 1e-5f), "one-frame 10x jump clamps to maxZoomStep");
-    // Re-anchor at 0.40 m.
-    step(Hand(-0.20f, 0.f, 0.3f, 0.01f), Hand(0.20f, 0.f, 0.3f, 0.01f));
-    // (The clamp above moved the anchor to 4.0 m, so this frame shrinks; drain it.)
+    // Per-frame clamp: a single frame that jumps 2.25x (0.40 -> 0.90 m, still
+    // inside the separation guard) is limited to maxZoomStep.
+    d = step(Hand(-0.45f, 0.f, 0.3f, 0.01f), Hand(0.45f, 0.f, 0.3f, 0.01f));
+    Check(Near(d.zoom, 1.25f, 1e-5f), "one-frame 2.25x jump clamps to maxZoomStep");
 
     // Roll: rotate the pair CCW by 90 degrees in 9 steps of 10 degrees.
     HandGestureController c2(Deterministic());
@@ -200,6 +198,33 @@ void TestTrackingLoss() {
     Check(d.twoHand && d.yaw == 0.f && d.zoom == 1.f, "hand returns -> two-hand anchors with zero delta");
 }
 
+void TestSeparationGuard() {
+    std::printf("two-hand separation guard\n");
+    HandGestureConfig cfg = Deterministic();
+    cfg.maxHandSeparationM = 0.5f;
+    HandGestureController c(cfg);
+    HandGestureFrame f;
+    f.timeSec = 0.0;
+    f.hand[0] = Hand(-0.10f, 0.f, 0.3f, 0.01f);
+    f.hand[1] = Hand(0.10f, 0.f, 0.3f, 0.01f);
+    c.update(f);
+    // A glitch frame: hands 2 m apart. Nothing happens, baseline dropped.
+    f.timeSec = 1.0 / 60.0;
+    f.hand[1] = Hand(1.90f, 0.f, 0.3f, 0.01f);
+    HandGestureDelta d = c.update(f);
+    Check(!d.any() && d.zoom == 1.f, "implausible separation: no gesture at all");
+    // Back to plausible, moved: re-anchors with zero delta rather than
+    // integrating the glitch, then tracks again.
+    f.timeSec = 2.0 / 60.0;
+    f.hand[1] = Hand(0.20f, 0.f, 0.3f, 0.01f);
+    d = c.update(f);
+    Check(d.twoHand && d.zoom == 1.f && d.yaw == 0.f, "first plausible frame after a glitch re-anchors");
+    f.timeSec = 3.0 / 60.0;
+    f.hand[1] = Hand(0.25f, 0.f, 0.3f, 0.01f);
+    d = c.update(f);
+    Check(Near(d.zoom, 0.35f / 0.30f, 1e-4f), "then tracks from the new baseline");
+}
+
 void TestSmoothing() {
     std::printf("EMA smoothing\n");
     HandGestureConfig cfg = Deterministic();
@@ -235,6 +260,7 @@ int main() {
     TestOneHandOrbit();
     TestTwoHand();
     TestTrackingLoss();
+    TestSeparationGuard();
     TestSmoothing();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
