@@ -19,6 +19,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 cameraPos;
     vec4 lightDir;
     mat4 invViewProj;
+    mat4 scene;        // turntable: model -> world for geometry only (see UniformBlock)
     vec4 tone;         // x=exposure (2^EV), y=curve id, z=directional-light scale,
                        // w=probe select (unused here)
     vec4 viewport;     // xy = viewport/target ratio, z/w = pbr.frag switches (unused here)

@@ -2292,6 +2292,10 @@ void ModelRenderer::updateUniforms(const float viewMatrix[16], const float projM
     std::memcpy(vmFlipped, viewMatrix, sizeof(vmFlipped));
 
     UniformBlock ub{};
+    {
+        static const float kIdent[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        std::memcpy(ub.scene, turntableGeometry() ? sceneXf_ : kIdent, sizeof(ub.scene));
+    }
     mat4Mul(projMatrix, vmFlipped, ub.viewProj);
     // inverse(viewProj) for the skybox per-pixel ray reconstruction.
     glm::mat4 ivp = glm::inverse(glm::make_mat4(ub.viewProj));
@@ -3504,11 +3508,17 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     // recording; an earlier frame still on the GPU may be reading them.
     if (shadowPass) waitAllInFlight();
 
-    // Turntable orbit (common/model_orbit.h): the model is drawn through the
-    // scene transform, i.e. with view·S, so the camera the shaders see is the
-    // model-space camera. The overlay hook below keeps the caller's view.
+    // Turntable orbit (common/model_orbit.h): the scene transform S moves the
+    // GEOMETRY (UniformBlock::scene, applied in pbr.vert); the camera, sky, IBL
+    // and lights keep the caller's world view, so the environment stays put
+    // while the model turns. (Drawing everything with view·S instead turned
+    // the sky with the model — visually identical to the old camera orbit.)
+    // Exception: LightingMode::Scene lights are the ASSET's own (glTF
+    // KHR_lights_punctual, model-space positions, shadow cubes, J/d^2
+    // falloff) and belong to the model, so in that mode the whole scene still
+    // rides along (view·S) and they keep lighting the parts they were authored for.
     float viewModel[16];
-    if (sceneXfSet_) mat4Mul(viewMatrix, sceneXf_, viewModel);
+    if (sceneXfSet_ && !turntableGeometry()) mat4Mul(viewMatrix, sceneXf_, viewModel);
     else std::memcpy(viewModel, viewMatrix, sizeof(viewModel));
 
     updateUniforms(viewModel, projMatrix, clipFarViewSpace, &viewUbo->buf);
@@ -3812,9 +3822,17 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
             // pbr.vert's outViewZ (which reads the Z-negated view row).
             float fwdMin = 1.0e30f, fwdMax = -1.0e30f;
             for (int c = 0; c < 8; ++c) {
-                const float px = (c & 1) ? bboxMax_[0] : bboxMin_[0];
-                const float py = (c & 2) ? bboxMax_[1] : bboxMin_[1];
-                const float pz = (c & 4) ? bboxMax_[2] : bboxMin_[2];
+                const float px0 = (c & 1) ? bboxMax_[0] : bboxMin_[0];
+                const float py0 = (c & 2) ? bboxMax_[1] : bboxMin_[1];
+                const float pz0 = (c & 4) ? bboxMax_[2] : bboxMin_[2];
+                // The bbox is in model space; the view is the world view now.
+                float px = px0, py = py0, pz = pz0;
+                if (turntableGeometry()) {
+                    const float* S = sceneXf_;
+                    px = S[0] * px0 + S[4] * py0 + S[8] * pz0 + S[12];
+                    py = S[1] * px0 + S[5] * py0 + S[9] * pz0 + S[13];
+                    pz = S[2] * px0 + S[6] * py0 + S[10] * pz0 + S[14];
+                }
                 const float fwd = -(viewModel[2] * px + viewModel[6] * py +
                                     viewModel[10] * pz + viewModel[14]);
                 if (fwd < fwdMin) fwdMin = fwd;
@@ -4297,6 +4315,10 @@ void ModelRenderer::recordShadowPass(VkCommandBuffer cmd) {
             const glm::vec3 up(kShadowFaceUp[f][0], kShadowFaceUp[f][1], kShadowFaceUp[f][2]);
             const glm::mat4 view = glm::lookAt(pos, pos + fwd, up);
             UniformBlock ub{};
+        {
+                static const float kIdent[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                std::memcpy(ub.scene, kIdent, sizeof(ub.scene)); // Scene-mode lights live in model space
+            }
             const glm::mat4 vp = proj * view;
             std::memcpy(ub.viewProj, glm::value_ptr(vp), sizeof(ub.viewProj));
             std::memcpy(ub.view, glm::value_ptr(view), sizeof(ub.view));

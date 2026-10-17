@@ -202,6 +202,9 @@ struct ModelRenderer {
     void clearSceneTransform() { sceneXfSet_ = false; }
     bool hasSceneTransform() const { return sceneXfSet_; }
     const float* sceneTransform() const { return sceneXf_; }
+    //! Turntable with a world-fixed environment: S moves the geometry only
+    //! (every lighting mode but Scene, whose lights are the asset's own).
+    bool turntableGeometry() const { return sceneXfSet_ && lightingMode_ != LightingMode::Scene; }
     //! Locate-space point / vector -> model space (S⁻¹). Identity when unset.
     void sceneToModelPoint(const float in[3], float out[3]) const;
     void sceneToModelVector(const float in[3], float out[3]) const;
@@ -403,6 +406,11 @@ private:
         float cameraPos[4];
         float lightDir[4];     // .xyz = light direction, .w = clipFar (view-space; 0=off)
         float invViewProj[16]; // inverse(viewProj), for the skybox ray reconstruction
+        // Turntable (common/model_orbit.h): model -> world for the scene GEOMETRY
+        // only. The camera, the sky, the IBL and every light stay in the world
+        // frame, so turning the model never turns the environment. Identity
+        // when no scene transform is set.
+        float scene[16];
         // Every lane below has an owner. There are no spare lanes in this
         // block: #98 lost a device round to a probe that rode viewport.z on
         // the belief that it was padding — updateUniforms() overwrote it a few
