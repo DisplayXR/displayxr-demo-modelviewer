@@ -23,6 +23,8 @@ set(MV_SHADER_NAMES
     irradiance.frag
     prefilter.frag
     sheen_lut.frag
+    hand.vert
+    hand.frag
 )
 
 # Headers pulled in via #include. Listed so a change to one retriggers the

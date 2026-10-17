@@ -22,6 +22,7 @@
 #include <vulkan/vulkan.h>
 #include <string>
 #include <cstdint>
+#include <functional>
 #include <vector>
 #include "model_vulkan_utils.h"
 #include "model_loader.h"
@@ -184,8 +185,26 @@ struct ModelRenderer {
     //! not at all (model_raycast.h). The depth source of the depth-aware
     //! cursor (XR_DXR_cursor_depth). Cheap: per-cluster BVH, no allocation.
     bool raycast(const float origin[3], const float dir[3], float& tOut) const {
-        return raycaster_.raycast(origin, dir, tOut);
+        if (!sceneXfSet_) return raycaster_.raycast(origin, dir, tOut);
+        // Locate space -> model space through S⁻¹. `dir` is not renormalised,
+        // so t stays in the caller's (locate-space) units.
+        float o[3], d[3];
+        sceneToModelPoint(origin, o);
+        sceneToModelVector(dir, d);
+        return raycaster_.raycast(o, d, tOut);
     }
+
+    // ── Scene transform (turntable orbit + zoom; common/model_orbit.h) ───────
+    // Column-major 4x4 mapping MODEL space -> the locate space the views (and
+    // the overlay hook) are in. Applied to every model draw, the skybox and
+    // raycast(); never to the overlay. Identity until set.
+    void setSceneTransform(const float m[16]);
+    void clearSceneTransform() { sceneXfSet_ = false; }
+    bool hasSceneTransform() const { return sceneXfSet_; }
+    const float* sceneTransform() const { return sceneXf_; }
+    //! Locate-space point / vector -> model space (S⁻¹). Identity when unset.
+    void sceneToModelPoint(const float in[3], float out[3]) const;
+    void sceneToModelVector(const float in[3], float out[3]) const;
     float findBestYaw(const float displayCenter[3],
                       const float viewerOffsetLocal[3],
                       uint32_t numCandidates = 8) const;
@@ -299,10 +318,31 @@ struct ModelRenderer {
     //! into it yet. Valid until the next beginContentMaskFrame().
     const uint8_t* contentMaskCoverage() const;
 
+    // ── Overlay hook (hand mesh, …) ──────────────────────────────────────────
+    // Called by renderEye() for every view, INSIDE the renderer's render pass
+    // after the last model draw (so it sorts after the opaque model and can
+    // depth-test against it), with the view's matrices and whether the colour
+    // attachment holds sRGB-ENCODED bytes (a UNORM swapchain: the shader must
+    // encode, as pbr.frag does) or linear (an sRGB swapchain: the blit
+    // encodes). Dynamic viewport/scissor are already set for the view's tile.
+    // A pipeline for it is built against renderPass() with sampleCountFlag()
+    // samples and overlayColorAttachmentCount() colour attachments.
+    using OverlayDrawFn = std::function<void(VkCommandBuffer cmd, const float viewMatrix[16],
+                                             const float projMatrix[16], bool encodeSrgb)>;
+    void setOverlayDraw(OverlayDrawFn fn) { overlayDraw_ = std::move(fn); }
+    VkRenderPass renderPass() const { return renderPass_; }
+    VkSampleCountFlagBits sampleCountFlag() const { return samples_; }
+    static constexpr uint32_t overlayColorAttachmentCount() { return 2; }
+
     void cleanup();
     ~ModelRenderer();
 
 private:
+    OverlayDrawFn overlayDraw_;
+    float sceneXf_[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    float sceneInv_[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    bool  sceneXfSet_ = false;
+
     // Push-constant block (must match shaders/pbr.{vert,frag}). 112 bytes.
     struct PushBlock {
         float model[16];

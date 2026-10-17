@@ -8,6 +8,8 @@
 #include "hand_gestures.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace modelviewer {
 
@@ -28,6 +30,24 @@ float wrapAngle(float a) {
 }
 
 } // namespace
+
+void HandGestureConfig::applyEnvironment() {
+    if (const char* e = std::getenv("DXR_MODELVIEWER_PINCH_M")) {
+        float v = 0.f;
+        if (std::sscanf(e, "%f", &v) == 1 && v > 0.f) {
+            pinchEnterM = v;
+            pinchExitM = v * 1.6f;
+            std::printf("hands: DXR_MODELVIEWER_PINCH_M -> pinch enter %.3f m, exit %.3f m\n", pinchEnterM, pinchExitM);
+        }
+    }
+    if (const char* e = std::getenv("DXR_MODELVIEWER_ORBIT_RAD_PER_M")) {
+        float v = 0.f;
+        if (std::sscanf(e, "%f", &v) == 1 && v > 0.f) {
+            orbitRadPerM = v;
+            std::printf("hands: DXR_MODELVIEWER_ORBIT_RAD_PER_M -> %.2f rad/m\n", v);
+        }
+    }
+}
 
 bool PinchDetector::update(bool tracked, float tipDistanceM, float enterM, float exitM) {
     if (!tracked) {
