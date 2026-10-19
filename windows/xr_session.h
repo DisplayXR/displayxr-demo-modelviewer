@@ -27,6 +27,7 @@
 // flag (displayxr::common's XrSessionManager carries no app-named fields,
 // #396 W4); set by InitializeOpenXR.
 extern bool g_hasViewRigExt;
+extern uint32_t g_viewRigSpecVersion;
 // XR_EXT_hand_tracking advertised by the runtime. Whether a hand-tracking
 // provider is actually present is a SYSTEM property, checked by
 // modelviewer::HandTracking::init. Set by InitializeOpenXR.

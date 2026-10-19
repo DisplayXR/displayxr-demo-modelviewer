@@ -1084,6 +1084,7 @@ struct AppXrSession {
     // XR_DXR_view_rig (W7 of #396): runtime owns the off-axis Kooima and returns
     // render-ready XrView{pose, fov}; the app deletes its own.
     bool hasViewRigExt = false;
+    uint32_t viewRigSpecVersion = 0;
 
     // XR_EXT_hand_tracking: advertised by the runtime; whether a hand-tracking
     // provider is actually present is a SYSTEM property (HandTracking::init).
@@ -1253,7 +1254,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
-        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
+            xr.hasViewRigExt = true;
+            xr.viewRigSpecVersion = ext.extensionVersion;   // rig-scoped hand joints need >= 4
+        }
         if (strcmp(ext.extensionName, modelviewer::HandTracking::kExtensionName) == 0) xr.hasHandTrackingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
             modelviewer::CursorDepthWanted())
@@ -2399,6 +2403,7 @@ int main() {
     // the hand mesh pipeline against the renderer's own render pass so the
     // overlay hook draws it inside every view's tile after the opaque model.
     g_handTracking.init(xr.instance, xr.systemId, xr.session, xr.hasHandTrackingExt);
+    g_handTracking.setViewRigSpecVersion(xr.hasViewRigExt ? xr.viewRigSpecVersion : 0);
     if (g_handTracking.enabled()) {
         modelviewer::HandGestureConfig gcfg;
         gcfg.applyEnvironment();
@@ -2752,14 +2757,21 @@ int main() {
                         // hand 20 cm in front of the panel floats 20 cm x m2v in
                         // front of the virtual display, in every view. Without the
                         // rig the locate space IS the world and the map is identity.
+                        // Preferred (XR_DXR_view_rig spec >= 4): the runtime returns the
+                        // joints in the rig frame for the same descriptor the views
+                        // used (located after them); the map is then the identity.
                         if (g_handRenderer.initialized()) {
-                            const modelviewer::HandRigMap map = modelviewer::MakeHandRigMap(
+                            const bool rigScoped = useRig &&
+                                g_handTracking.locateRig(xr.localSpace, frameState.predictedDisplayTime, &displayRig);
+                            const modelviewer::HandRigMap map = rigScoped ? modelviewer::HandRigMap{}
+                                : modelviewer::MakeHandRigMap(
                                 useRig ? &viewRigRaw : nullptr,
                                 xr.displayPixelWidth, xr.displayPixelHeight,
                                 xr.displayWidthM, xr.displayHeightM, cameraPose, rigVH);
                             modelviewer::HandRenderHand hands[2];
                             for (int h = 0; h < 2; h++) {
-                                const modelviewer::HandJointSet& js = g_handTracking.hand(h);
+                                const modelviewer::HandJointSet& js =
+                                    rigScoped ? g_handTracking.rigHand(h) : g_handTracking.hand(h);
                                 hands[h].active = js.active;
                                 memcpy(hands[h].color, h == 0 ? kHandColorLeft : kHandColorRight, sizeof(hands[h].color));
                                 for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
@@ -2776,9 +2788,9 @@ int main() {
                             if (g_handTracking.locateCount() % 300 == 1 && g_handTracking.anyActive()) {
                                 const int h = g_handTracking.hand(0).active ? 0 : 1;
                                 const modelviewer::HandRenderJoint& w = hands[h].joints[XR_HAND_JOINT_WRIST_EXT];
-                                LOG_INFO("hands: map m2v=%.2f canvasOff=(%.3f,%.3f) plane=(%.2f,%.2f,%.2f) "
+                                LOG_INFO("hands: %s map m2v=%.2f canvasOff=(%.3f,%.3f) plane=(%.2f,%.2f,%.2f) "
                                          "%s wrist world=(%.2f,%.2f,%.2f) r=%.3f | rig=(%.2f,%.2f,%.2f) vH=%.2f eye0=(%.2f,%.2f,%.2f) mesh=%s",
-                                         map.m2v, map.canvasOffsetM.x, map.canvasOffsetM.y,
+                                         rigScoped ? "rig-scoped" : "HandRigMap", map.m2v, map.canvasOffsetM.x, map.canvasOffsetM.y,
                                          map.displayPlane.position.x, map.displayPlane.position.y, map.displayPlane.position.z,
                                          h == 0 ? "L" : "R", w.pos[0], w.pos[1], w.pos[2], w.radius,
                                          cameraPose.position.x, cameraPose.position.y, cameraPose.position.z, rigVH,

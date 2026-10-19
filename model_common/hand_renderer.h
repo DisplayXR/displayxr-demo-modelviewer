@@ -100,6 +100,12 @@ private:
     uint32_t slot_ = 0;
     float fade_[2] = {0.f, 0.f};
     bool visible_ = false;
+    // One-shot placement diagnostic: the first frame with a valid wrist logs
+    // it in world + view-0 clip space (draw()), so a field run proves whether
+    // the hand is inside the frustum and in front of the model's near plane.
+    float diagWrist_[3] = {0.f, 0.f, 0.f};
+    int diagHand_ = -1;
+    bool diagLogged_ = false;
 };
 
 } // namespace modelviewer
