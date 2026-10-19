@@ -12,6 +12,7 @@
 #include <vector>
 
 bool g_hasViewRigExt = false;
+uint32_t g_viewRigSpecVersion = 0;   // extensionVersion as advertised (rig-scoped hand joints need >= 4)
 bool g_hasHandTrackingExt = false;
 uint32_t g_cursorDepthSpecVersion = 0;
 bool g_hasDisplayZonesExt = false;   // display_zones AND local_3d_zone (#63)
@@ -96,6 +97,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
+            g_viewRigSpecVersion = ext.extensionVersion;
         }
         if (strcmp(ext.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0) {
             g_hasHandTrackingExt = true;

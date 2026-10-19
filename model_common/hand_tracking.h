@@ -23,6 +23,18 @@
  * plane -> canvas centre -> metres-to-virtual scale -> the chained rig pose.
  * Without the rig (no extension) the locate space IS the model's space and
  * the map is the identity.
+ *
+ * Rig-scoped joints (XR_DXR_view_rig spec >= 4, runtime #2189/#2197): the
+ * preferred path. After the frame's xrLocateViews, locateRig() locates the
+ * joints a second time with the SAME XrDisplayRigDXR chained on
+ * XrHandJointsLocateInfoEXT::next, and the runtime returns them in the rig
+ * frame -- exactly the frame its views are in -- so the leg renders them with
+ * an identity map and no app-side display->world maths ("declare the rig,
+ * consume runtime views"). HandRigMap stays as the fallback for an older
+ * runtime (a spec < 4 runtime silently ignores the chained rig, so the gate is
+ * the advertised extensionVersion, never the extension's presence). Gestures
+ * always read the base-space set from locate(): their thresholds are physical
+ * millimetres.
  */
 #pragma once
 
@@ -66,6 +78,22 @@ public:
     const XrVector3f& offset() const { return offset_; }
 
     const HandJointSet& hand(int i) const { return hands_[i & 1]; }
+
+    //! XR_DXR_view_rig's extensionVersion as xrEnumerateInstanceExtensionProperties
+    //! advertised it (0 = absent). Rig-scoped joints need >= kRigScopedSpecVersion.
+    static constexpr uint32_t kRigScopedSpecVersion = 4;
+    void setViewRigSpecVersion(uint32_t v) { viewRigSpec_ = v; }
+    uint32_t viewRigSpecVersion() const { return viewRigSpec_; }
+
+    //! Locate both hands in the RIG frame: `rig` (the XrDisplayRigDXR the
+    //! frame's xrLocateViews chained, same `base` space) goes on
+    //! XrHandJointsLocateInfoEXT::next. Call AFTER the frame's xrLocateViews
+    //! (the runtime uses that locate's canvas). Returns true when the result
+    //! in renderHand() is rig-frame (spec >= 4, rig non-null, no debug offset
+    //! set, and the locate succeeded); false means "use hand() + HandRigMap".
+    bool locateRig(XrSpace base, XrTime time, const XrDisplayRigDXR* rig);
+    //! The rig-frame set from the last successful locateRig().
+    const HandJointSet& rigHand(int i) const { return rigHands_[i & 1]; }
     bool anyActive() const { return hands_[0].active || hands_[1].active; }
     uint64_t locateCount() const { return locateCount_; }
 
@@ -80,6 +108,9 @@ private:
     XrHandTrackerEXT tracker_[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     HandJointSet hands_[2];
     bool supported_ = false;
+    HandJointSet rigHands_[2];
+    uint32_t viewRigSpec_ = 0;
+    bool rigLogged_ = false;
     XrVector3f offset_ = {0.f, 0.f, 0.f};
     uint64_t locateCount_ = 0;
     uint64_t failLogged_ = 0;

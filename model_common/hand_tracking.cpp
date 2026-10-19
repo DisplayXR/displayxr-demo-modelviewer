@@ -124,6 +124,47 @@ void HandTracking::locate(XrSpace base, XrTime time) {
     }
 }
 
+bool HandTracking::locateRig(XrSpace base, XrTime time, const XrDisplayRigDXR* rig) {
+    const bool offsetSet = offset_.x != 0.f || offset_.y != 0.f || offset_.z != 0.f;
+    const bool want = enabled() && base != XR_NULL_HANDLE && rig != nullptr &&
+                      viewRigSpec_ >= kRigScopedSpecVersion && !offsetSet;
+    if (!rigLogged_ && enabled() && rig != nullptr) {
+        rigLogged_ = true;
+        if (want) {
+            MV_LOG("hands: rig-scoped joints (XR_DXR_view_rig spec %u >= %u) - the runtime maps "
+                   "them into the rig frame; HandRigMap unused\n", viewRigSpec_, kRigScopedSpecVersion);
+        } else if (offsetSet) {
+            MV_LOG("hands: DXR_MODELVIEWER_HANDS_OFFSET_M set - app-side HandRigMap path "
+                   "(the offset is in locate-space metres)\n");
+        } else {
+            MV_LOG("hands: XR_DXR_view_rig spec %u < %u - runtime cannot scope joints to the rig; "
+                   "app-side HandRigMap fallback\n", viewRigSpec_, kRigScopedSpecVersion);
+        }
+    }
+    if (!want) return false;
+    bool ok = true;
+    for (int h = 0; h < 2; ++h) {
+        XrDisplayRigDXR r = *rig;   // the views' descriptor, alone on this chain
+        r.next = nullptr;
+        XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+        li.next = &r;
+        li.baseSpace = base;
+        li.time = time;
+        XrHandJointLocationsEXT loc = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+        loc.jointCount = XR_HAND_JOINT_COUNT_EXT;
+        loc.jointLocations = rigHands_[h].joints;
+        const XrResult res = pfnLocate_(tracker_[h], &li, &loc);
+        if (XR_FAILED(res)) {
+            rigHands_[h].active = false;
+            if (failLogged_++ < 3) MV_ERR("hands: rig-scoped xrLocateHandJointsEXT(%d) failed: %d\n", h, (int)res);
+            ok = false;
+            continue;
+        }
+        rigHands_[h].active = loc.isActive == XR_TRUE;
+    }
+    return ok;
+}
+
 void HandTracking::toGestureSample(const HandJointSet& h, HandGestureSample& out) {
     out = HandGestureSample();
     if (!h.active) return;

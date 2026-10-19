@@ -3047,14 +3047,22 @@ static void RenderThreadFunc(
                         // plane -> canvas -> m2v -> rig pose). Never through the scene
                         // transform: the hands live in the reference space, the model
                         // turns under them.
+                        // Preferred (XR_DXR_view_rig spec >= 4): the runtime returns the
+                        // joints in the rig frame for the same descriptor the views
+                        // used, located AFTER the views (it uses that locate's canvas);
+                        // the map is then the identity. HandRigMap is the fallback.
                         if (g_handRenderer.initialized()) {
-                            const modelviewer::HandRigMap map = modelviewer::MakeHandRigMap(
+                            const bool rigScoped = useRig &&
+                                g_handTracking.locateRig(xr->localSpace, frameState.predictedDisplayTime, &displayRig);
+                            const modelviewer::HandRigMap map = rigScoped ? modelviewer::HandRigMap{}
+                                : modelviewer::MakeHandRigMap(
                                 useRig ? &viewRigRaw : nullptr,
                                 xr->displayPixelWidth, xr->displayPixelHeight,
                                 xr->displayWidthM, xr->displayHeightM, cameraPose, rigVH);
                             modelviewer::HandRenderHand hands[2];
                             for (int h = 0; h < 2; h++) {
-                                const modelviewer::HandJointSet& js = g_handTracking.hand(h);
+                                const modelviewer::HandJointSet& js =
+                                    rigScoped ? g_handTracking.rigHand(h) : g_handTracking.hand(h);
                                 hands[h].active = js.active;
                                 memcpy(hands[h].color, h == 0 ? kHandColorLeft : kHandColorRight, sizeof(hands[h].color));
                                 for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
@@ -4554,6 +4562,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             // so the overlay hook draws it inside every view's tile after the
             // opaque model. Render-thread objects, created before it starts.
             g_handTracking.init(xr.instance, xr.systemId, xr.session, g_hasHandTrackingExt);
+            g_handTracking.setViewRigSpecVersion(g_hasViewRigExt ? g_viewRigSpecVersion : 0);
             if (g_handTracking.enabled()) {
                 modelviewer::HandGestureConfig gcfg;
                 gcfg.applyEnvironment();

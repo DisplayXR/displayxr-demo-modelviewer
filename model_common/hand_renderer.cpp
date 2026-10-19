@@ -357,6 +357,10 @@ void HandRenderer::update(const HandRenderHand hands[2], float dtSeconds) {
         std::memcpy(s.color[h], hands[h].color, sizeof(s.color[h]));
         if (fade_[h] <= 0.f) continue;
         const HandRenderHand& hand = hands[h];
+        if (!diagLogged_ && diagHand_ < 0 && hand.joints[1].valid) {   // 1 = XR_HAND_JOINT_WRIST_EXT
+            std::memcpy(diagWrist_, hand.joints[1].pos, sizeof(diagWrist_));
+            diagHand_ = h;
+        }
         float minRadius = 0.f;
         for (int j = 0; j < 26; ++j) {
             const HandRenderJoint& jt = hand.joints[j];
@@ -397,6 +401,26 @@ void HandRenderer::draw(VkCommandBuffer cmd, const float view[16], const float p
 
     PushBlock pb{};
     mat4Mul(pb.viewProj, projHand, view);
+
+    if (!diagLogged_ && diagHand_ >= 0) {
+        diagLogged_ = true;
+        const float* p = diagWrist_;
+        float vz = 0.f, c[4];
+        for (int r = 0; r < 4; ++r)
+            c[r] = pb.viewProj[r] * p[0] + pb.viewProj[4 + r] * p[1] + pb.viewProj[8 + r] * p[2] + pb.viewProj[12 + r];
+        vz = view[2] * p[0] + view[6] * p[1] + view[10] * p[2] + view[14];   // view-space z (-forward)
+        const float n = (m10 != 0.f) ? m14 / m10 : 0.f;
+        const float f = (1.f + m10) != 0.f ? m14 / (1.f + m10) : 0.f;
+        const float mdepth = (vz < 0.f) ? (-m10 + m14 * (-1.f / vz)) : -1.f;
+        const bool inX = c[3] > 0.f && std::fabs(c[0]) <= c[3], inY = c[3] > 0.f && std::fabs(c[1]) <= c[3];
+        MV_LOG("hands: first drawn wrist (%s) world=(%.4f, %.4f, %.4f) view_z=%.4f clip=(%.4f, %.4f, %.4f, %.4f) "
+               "ndc=(%.3f, %.3f) %s | model near=%.4f far=%.4f -> model depth %.4f (%s the model's near plane; first wrist only, logged once)\n",
+               diagHand_ == 0 ? "L" : "R", p[0], p[1], p[2], vz, c[0], c[1], c[2], c[3],
+               c[3] != 0.f ? c[0] / c[3] : 0.f, c[3] != 0.f ? c[1] / c[3] : 0.f,
+               (inX && inY) ? "INSIDE the view-0 frustum (x/y)" : "OUTSIDE the view-0 frustum (x/y)",
+               n, f, mdepth,
+               vz >= 0.f ? "BEHIND THE CAMERA - invisible; NOT in front of" : (-vz < n) ? "in FRONT of" : "behind");
+    }
     cameraFromView(view, pb.eye);
     pb.eye[3] = encodeSrgb ? 1.f : 0.f;
     pb.depth[0] = m10;
