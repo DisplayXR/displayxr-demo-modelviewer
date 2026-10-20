@@ -10,7 +10,8 @@
 # macos/main.mm is the macOS entry point: Cocoa window + MoltenVK + OpenXR
 # session + HUD/input, with the renderer call sites wired to ModelRenderer
 # (loadModel / hasModel / getRobustSceneBounds, .glb/.gltf NSOpenPanel +
-# drag-drop). No transparent-background mode on macOS (Windows-only).
+# drag-drop), and the transparent-background mode (Ctrl/Cmd+T, #181) with its
+# alpha-driven click-through (clickthrough.cpp).
 
 cmake_minimum_required(VERSION 3.21)
 
@@ -48,6 +49,7 @@ endif()
 
 add_executable(model_viewer_handle_vk_macos
     main.mm
+    clickthrough.cpp    # alpha-coverage readback for click-through (Ctrl/Cmd+T transparent mode)
     # stb_image (read) implementation TU comes from displayxr::common
     # (stb_image_impl_macos.cpp) — model_loader.cpp takes declarations only
     # (#396 W4).
