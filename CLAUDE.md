@@ -166,9 +166,11 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   convergence plane (`eye_scaled.z`). Callers pass `near_offset = vH`,
   `far_offset = 1000·vH`; **transparent mode passes `far_offset = 0`** (far at
   the ZDP → foreground only). Anchored to `vH` so the band no longer scales with
-  `ez` (large scenes don't clip). macOS has no transparent mode → `far_offset =
-  1000·vH` there. This whole path is dormant whenever the runtime supplies the
-  rig (the common case); it survives as the no-extension fallback.
+  `ez` (large scenes don't clip). This whole path is dormant whenever the
+  runtime supplies the rig (the common case); it survives as the no-extension
+  fallback. Under the rig every desktop leg (Windows, Linux, macOS) resolves
+  near/far/clipFar through `dxr::ResolveClipPlanes` and feeds
+  `XR_DXR_depth_budget` v1-v3 (budget, content bounds, content mask).
 - **Load-time framing is the WEB rule, not just `dxr::AutoFitVHeight`.**
   `common/model_fit.h` (`modelviewer::FitVHeight`) is the single framing rule
   every leg uses — Windows/macOS/Linux call it, Android inlines the same maths.
@@ -416,6 +418,38 @@ model path, `--vh` and `--transparent` DO work (`dxr::ParseLaunchArgs`); the
 other launch flags are parsed and reported as unsupported rather than ignored
 silently. Note `launch_args.h` must be included **before** the X11 headers —
 `<X11/X.h>` `#define`s `None`, which mangles `dxr::LaunchSrcKind::None`.
+
+**macOS: transparent background (Ctrl+T / Cmd+T) + click-through (#181).**
+Same contract as Windows/Linux: the session ALWAYS chains
+`XrCocoaWindowBindingCreateInfoDXR.transparentBackgroundEnabled = XR_TRUE`
+(the runtime fixes `CAMetalLayer.opaque` at `xrCreateSession`), the app's own
+NSWindow is created non-opaque with a clear background and its CAMetalLayer
+`opaque = NO`, and the toggle only changes what the app draws (alpha-0 clear,
+no skybox; `RenderPlaceholder` clears to alpha 0 too). Opaque frames are alpha
+255 everywhere, so a runtime that probes the atlas alpha per frame sees nothing
+to composite. Plain `T` stays the eye-tracking toggle. `MODEL_TRANSPARENT=1` /
+`--transparent` start transparent (`main(argc, argv)` now runs
+`dxr::ParseLaunchArgs`: positional model path, `--vh`, `--transparent`; the
+rest of the undock flags log "not supported on macOS"); `MODEL_TRANSPARENT=0`
+= `XR_FALSE`, opaque window, Ctrl+T refuses with a log line + toast.
+Transparent mode: `NSFloatingWindowLevel` (keep-above; fullscreen keeps its
+own level), no window shadow, an AppKit toast, auto-orbit held while
+standalone, `dxr::ResolveClipPlanes` far at the ZDP when the runtime gives no
+budget. **Click-through** (`macos/clickthrough.{h,cpp}`): the Linux coverage
+readback verbatim (first+last view tile, fence-pipelined HOST_CACHED,
+alpha > 8, 1-texel dilation, `DXR_CLICKTHROUGH_TEXEL_PX` / `_DILATE` /
+`_ALPHA`), but Cocoa has no input region, so `UpdateClickThrough()` polls
+`[NSEvent mouseLocation]` every frame and sets `NSWindow.ignoresMouseEvents`
+for the point under the cursor — a window that ignores the mouse gets no
+mouse-moved events, so it could never turn itself back on from window events.
+Never flips while a button is held; the app's AppKit controls (top bar, HUD,
+toast) stay clickable; below 64×64 px of silhouette the window stays
+clickable. Test levers: `kill -USR1 <pid>` = Ctrl+T (no TCC needed), and
+`DXR_MODELVIEWER_ALPHA_PROBE=1` logs the raw alpha the app submits
+(min/max/zero/full, from the same readback, also in opaque mode) plus the
+click-through decision every ~2 s. On a Leia panel the see-through needs the
+runtime's live desktop capture (runtime#2264, leia-plugin#418); sim_display
+is alpha-native and works today.
 
 ### CI (`.github/workflows/`)
 `build-windows.yml` + `build-macos.yml` run on **`pull_request` + push to main**
