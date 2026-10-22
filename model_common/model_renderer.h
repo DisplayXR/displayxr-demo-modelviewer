@@ -258,8 +258,8 @@ struct ModelRenderer {
                    //! projMatrix — see the coverage block below for why the
                    //! rasterizer's own far clip is the second clip #128 missed.
                    //! nullptr = "same as projMatrix", for callers whose real
-                   //! far plane is already unrestricted (macOS has no
-                   //! transparent mode) and which never arm the mask.
+                   //! far plane is already unrestricted (opaque-only paths)
+                   //! and which never arm the mask.
                    const float projUnclipped[16] = nullptr);
 
     // ── Unclipped-silhouette coverage (#127 / displayxr-runtime#1470) ────────

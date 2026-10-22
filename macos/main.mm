@@ -15,6 +15,10 @@
  * - V key cycles rendering modes via xrRequestDisplayRenderingModeDXR
  * - 0-3 keys select rendering mode directly
  * - Ctrl+O or button click: NSOpenPanel to load .glb/.gltf models
+ * - Ctrl+T / Cmd+T: transparent background (desktop shows through, clicks pass
+ *   through the transparent surround, window floats above others) — #181.
+ *   MODEL_TRANSPARENT=1 or --transparent starts transparent; MODEL_TRANSPARENT=0
+ *   turns the capability off for the session. (Plain T = eye-tracking mode.)
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
@@ -32,6 +36,7 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_mcp_tools.h>
+#include <openxr/XR_DXR_depth_budget.h>  // advisory rear depth budget (ADR-040)
 
 #include <cmath>
 #include <csignal>
@@ -67,6 +72,17 @@
 #include "hand_gestures.h"      // pinch gestures -> rig deltas (pure math, unit-tested)
 #include "hand_renderer.h"      // translucent hand mesh via ModelRenderer's overlay hook
 #include "model_orbit.h"        // turntable: orbit state -> model transform, rig stays fixed
+#include "launch_args.h"        // dxr::ParseLaunchArgs — the shared launch contract (--transparent, path, --vh)
+// XR_DXR_depth_budget (ADR-040) — the Windows leg's #116 port, as on Linux.
+// clip_policy.h is the ONE place the runtime's advisory rear budget becomes
+// near/far/clipFar; content_bounds.h (v2) and content_mask.h (v3) describe
+// WHERE the content is so the runtime measures the background only behind it.
+#include "clip_policy.h"
+#include "content_bounds.h"
+#include "content_mask.h"
+#include "clickthrough.h"       // alpha-coverage readback -> ignoresMouseEvents (Ctrl/Cmd+T)
+#include <algorithm>
+#include <cstdarg>
 
 // ============================================================================
 // Logging
@@ -111,6 +127,7 @@ struct InputState {
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
     bool eyeTrackingModeToggleRequested = false;
+    bool transparentBgToggleRequested = false;   // Ctrl+T / Cmd+T
     bool loadRequested = false;
     bool teleportRequested = false;
     float teleportMouseX = 0.0f, teleportMouseY = 0.0f; // logical points
@@ -169,6 +186,49 @@ static float g_fitVHeight   = kDefaultVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
 static bool  g_fitValid     = false;
 static float g_displayHeightM = 0.0f;   // physical panel height (for ApplySceneCamera)
+// Full-model extents behind g_fitCenter, for the XR_DXR_depth_budget v2
+// content-bounds ROI (Windows: g_fitExtentW/H/D). W is the SWEPT horizontal
+// extent hypot(W, D), as on Windows/Linux — conservative under the turntable.
+static float g_fitExtentW = 0.0f;
+static float g_fitExtentH = 0.0f;
+static float g_fitExtentD = 0.0f;
+
+// XR_DXR_depth_budget v3: the retained content-occupancy mask, reduced from the
+// renderer's UNCLIPPED coverage pass once per rendered frame and re-chained on
+// frames that skip rendering. Must outlive xrEndFrame (XrContentMaskDXR::cells
+// is a pointer), hence file scope. Same as linux/main.cpp.
+static std::vector<uint8_t> g_contentMaskCells;
+static uint32_t g_contentMaskW = 0, g_contentMaskH = 0;
+static bool g_contentMaskChaining = false;  // one-time log on start/stop, never per frame
+
+// --vh=<metres>: pins the virtual display height over the auto-fit result.
+static float g_vhOverride = 0.0f;
+
+// Transparent background (Ctrl+T / Cmd+T, #181) — the Windows/Linux legs'
+// g_transparentBg. The runtime fixes the layer's opacity (CAMetalLayer.opaque,
+// the swapchain compositeAlpha) at xrCreateSession, so the session ALWAYS asks
+// for transparentBackgroundEnabled = XR_TRUE (g_transparentCapable) and the
+// toggle only changes what the app DRAWS: an alpha-0 clear and no skybox. With
+// alpha 1 everywhere an opaque frame is indistinguishable from an opaque
+// session (and a runtime that probes the atlas alpha per frame sees nothing to
+// composite). MODEL_TRANSPARENT=0 turns the capability off for the session —
+// opaque layer, XR_FALSE — and Ctrl+T then refuses with a log line instead of
+// drawing black.
+static bool g_transparentCapable = true;
+static bool g_transparentBg = false;
+// Click-through state (driven by UpdateClickThrough each frame).
+static bool g_ignoringMouse = false;
+// Last click-through decision inputs, for the alpha-probe log line.
+static struct { bool inContent, haveCov, hit, overChrome, reachable; float u, v; } g_ctLast = {};
+// DXR_MODELVIEWER_ALPHA_PROBE=1: run the click-through readback in opaque mode
+// too and log the raw atlas alpha the app submits (min/max/zero/full) every
+// ~2 s — the pixel-level check that opaque frames are alpha 255 everywhere and
+// transparent ones alpha 0 around the model.
+static bool g_alphaProbe = false;
+// Not under a workspace controller this frame (IsStandaloneSession, refreshed
+// in the render loop). Gates the transparent half of the auto-orbit hold and
+// the no-budget ZDP clip fallback, exactly as on Windows.
+static bool g_standaloneSession = true;
 
 // ============================================================================
 // Globals
@@ -190,8 +250,26 @@ typedef void (*PFN_sim_display_set_output_mode)(int mode);
 static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
 
 static bool g_fullscreen = false;
-static NSRect g_savedWindowFrame = {};
-static NSUInteger g_savedWindowStyle = 0;
+// Fullscreen saves the CONTENT rect (not the frame): the style it returns to
+// depends on g_transparentBg at exit time (titled vs borderless), and only the
+// content rect is the same in both.
+static NSRect g_savedContentRect = {};
+
+// The normal (opaque-mode) window style. Transparent mode (Ctrl+T) swaps the
+// window to NSWindowStyleMaskBorderless — the Windows leg's WS_POPUP, the
+// Linux leg's "no header bar while transparent" — so no title bar or frame
+// shows around the floating model. The content rect is preserved across the
+// swap; the window, the view and its CAMetalLayer are never recreated (the
+// runtime holds the view via XR_DXR_cocoa_window_binding).
+static const NSUInteger kTitledWindowStyle = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                             NSWindowStyleMaskResizable |
+                                             NSWindowStyleMaskMiniaturizable;
+// RMB window drag (transparent / borderless mode only — dxr::RmbWindowDrag,
+// the Windows borderless-overlay + Unity desktop-avatar convention). State in
+// AppKit global points (bottom-up).
+static bool g_rmbDragging = false;
+static NSPoint g_rmbMouseStart = {};
+static NSPoint g_rmbFrameStart = {};
 
 // Model-viewer state
 static ModelRenderer g_modelRenderer;
@@ -463,8 +541,12 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
     // framing the clip was authored for. Holding the idle clock at "now" (rather
     // than just skipping the yaw) restarts the 10 s countdown when playback
     // pauses, so the turntable doesn't snap on the instant the user hits K.
-    // macOS has no transparent mode, so that half of the Windows gate is moot.
-    if (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) {
+    // Also held while the background is TRANSPARENT in a standalone session
+    // (the Windows leg's AutoOrbitSuppressed): the model is a floating object
+    // on the desktop, and one that spins by itself reads as a glitch. Under a
+    // workspace controller the app is a framed tile, so it keeps orbiting.
+    if ((g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) ||
+        (g_transparentBg && g_standaloneSession)) {
         input.animationActive = false;
         input.lastInputTimeSec = NowSec();
     } else {
@@ -589,6 +671,17 @@ static void OpenLoadDialog() {
 - (void)windowWillClose:(NSNotification *)n { (void)n; g_running = false; }
 @end
 
+// Borderless NSWindows refuse key/main status by default, which would kill
+// keyboard input (Ctrl+T could not turn transparency back off). This window
+// stays eligible in every style.
+@interface ModelViewerWindow : NSWindow
+@end
+
+@implementation ModelViewerWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
 @interface MetalView : NSView
 @end
 
@@ -604,6 +697,10 @@ static void OpenLoadDialog() {
     CGFloat scale = self.window != nil ? self.window.backingScaleFactor
                                        : [NSScreen mainScreen].backingScaleFactor;
     layer.contentsScale = scale > 0 ? scale : 1.0;
+    // A transparent-capable session needs a non-opaque layer from the start
+    // (the runtime enforces it again at xrCreateSession). Opaque frames are
+    // alpha 1 everywhere, so this costs nothing visible.
+    layer.opaque = g_transparentCapable ? NO : YES;
     return layer;
 }
 - (void)syncLayerScale {
@@ -648,6 +745,70 @@ static void OpenLoadDialog() {
     if (g_input.pitch < -maxPitch) g_input.pitch = -maxPitch;
 }
 
+// RMB drag moves the window while it is borderless (transparent mode), the
+// Windows leg's dxr::RmbWindowDrag: with no title bar there is no other way
+// to move it. Opaque mode leaves RMB alone (the title bar moves the window),
+// exactly as on Windows. Gating to "the model, not the surround" is free:
+// UpdateClickThrough makes the window ignore the mouse over the transparent
+// surround, so a right-press there goes to whatever is underneath.
+//
+// This is a FALLBACK and must never fight the runtime. When the runtime owns
+// window placement (ADR-050 comp_metal_placement — active whenever the session
+// lands on comp_metal, including this Vulkan app routed VK -> comp_vk_client ->
+// comp_metal for a Metal-only weaving DP), it makes the window
+// movable = NO and takes a borderless window's right-button drag itself
+// (phase-snapped, atomic with the present); its local event monitor swallows
+// those events, so they never reach this view. If one does get here anyway
+// (an older runtime that owns placement but not the RMB drag), !isMovable
+// still says the runtime owns placement, and an app setFrameOrigin would move
+// the window behind its back (stale woven frame, no snap) — so the fallback
+// only runs while the window is movable, i.e. no runtime placement (an
+// in-process vk_native session, where the present reads the window position
+// every frame and a plain setFrameOrigin is what the title-bar drag does too).
+// The app never flips movable back.
+static bool AppOwnsRmbWindowMove(NSWindow *w) {
+    return w != nil && w.isMovable && g_transparentBg && !g_fullscreen;
+}
+
+// Never let AppKit start a window drag from a click in the content view
+// (mouseDownCanMoveWindow defaults to YES for a non-opaque view, which this
+// layer-backed transparent view is) — window moves belong to the runtime's
+// placement or to the RMB fallback above.
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+
+- (void)rightMouseDown:(NSEvent *)event {
+    if (AppOwnsRmbWindowMove(self.window)) {
+        MarkUserInput(g_input);
+        g_rmbDragging = true;
+        g_rmbMouseStart = [NSEvent mouseLocation];
+        g_rmbFrameStart = self.window.frame.origin;
+        return;
+    }
+    [super rightMouseDown:event];
+}
+
+- (void)rightMouseDragged:(NSEvent *)event {
+    if (g_rmbDragging && self.window != nil && self.window.isMovable) {
+        MarkUserInput(g_input);
+        // The live cursor, not the event deltas: deltas are lost when events
+        // coalesce, and the window moving under the cursor skews them.
+        const NSPoint m = [NSEvent mouseLocation];
+        const NSPoint o = NSMakePoint(round(g_rmbFrameStart.x + (m.x - g_rmbMouseStart.x)),
+                                      round(g_rmbFrameStart.y + (m.y - g_rmbMouseStart.y)));
+        if (!NSEqualPoints(o, self.window.frame.origin)) [self.window setFrameOrigin:o];
+        return;
+    }
+    [super rightMouseDragged:event];
+}
+
+- (void)rightMouseUp:(NSEvent *)event {
+    if (g_rmbDragging) {
+        g_rmbDragging = false;
+        return;
+    }
+    [super rightMouseUp:event];
+}
+
 - (void)scrollWheel:(NSEvent *)event {
     MarkUserInput(g_input);
     float delta = (float)[event scrollingDeltaY] * 0.02f;
@@ -665,6 +826,13 @@ static void OpenLoadDialog() {
     // Ctrl must be held. (Was bare L — retired for the uniform chord.)
     if ((ch == 'o' || ch == 'O') && ([event modifierFlags] & NSEventModifierFlagControl)) {
         g_input.loadRequested = true;
+        return;
+    }
+    // Ctrl+T (the Windows/Linux chord) or Cmd+T (the Mac habit) = transparent
+    // background. Checked before the switch so plain T stays eye-tracking.
+    if ((ch == 't' || ch == 'T') &&
+        ([event modifierFlags] & (NSEventModifierFlagControl | NSEventModifierFlagCommand))) {
+        g_input.transparentBgToggleRequested = true;
         return;
     }
     switch (ch) {
@@ -812,6 +980,45 @@ static void SignalHandler(int sig) {
     g_running = false;
 }
 
+// SIGUSR1 = Ctrl+T, for scripted runs (no TCC needed to deliver a keystroke):
+// `kill -USR1 <pid>`. Only sets the same request flag the key does.
+static void ToggleSignalHandler(int sig) {
+    (void)sig;
+    g_input.transparentBgToggleRequested = true;
+}
+
+// ---------------------------------------------------------------------------
+// Toast — a transient confirmation chip, bottom-centre (the Windows leg's
+// dxr::ToastState, as an AppKit view: the macOS HUD is AppKit already).
+// ---------------------------------------------------------------------------
+static NSVisualEffectView *g_toastBackdrop = nil;
+static NSTextField *g_toastLabel = nil;
+static double g_toastUntilSec = 0.0;
+
+static void ShowToast(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (g_toastBackdrop == nil || g_toastLabel == nil || g_metalView == nil) return;
+    [g_toastLabel setStringValue:[NSString stringWithUTF8String:buf]];
+    [g_toastLabel sizeToFit];
+    const NSSize ts = g_toastLabel.frame.size;
+    const CGFloat padX = 18.0, padY = 10.0;
+    const NSSize vs = g_metalView.bounds.size;
+    const CGFloat w = ceil(ts.width + 2 * padX), h = ceil(ts.height + 2 * padY);
+    [g_toastBackdrop setFrame:NSMakeRect(floor((vs.width - w) * 0.5), floor(vs.height * 0.10), w, h)];
+    [g_toastLabel setFrameOrigin:NSMakePoint(padX, padY)];
+    [g_toastBackdrop setHidden:NO];
+    g_toastUntilSec = NowSec() + 1.6;
+}
+
+static void UpdateToast() {
+    if (g_toastBackdrop != nil && !g_toastBackdrop.hidden && NowSec() >= g_toastUntilSec)
+        [g_toastBackdrop setHidden:YES];
+}
+
 static bool CreateMacOSWindow(uint32_t width, uint32_t height,
                               int32_t screenLeft, int32_t screenTop) {
     [NSApplication sharedApplication];
@@ -831,8 +1038,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
     // re-constrains the window onto [NSScreen mainScreen] — whichever screen
     // has focus at launch, i.e. often the laptop, not the 3D panel. Same fix
     // as the runtime's cube_handle_{metal,vk}_macos.
-    NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                       NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+    NSUInteger style = kTitledWindowStyle;
     NSRect frame = NSMakeRect(100, 100, width, height);
     NSScreen *target = nil;
     NSScreen *primary = [NSScreen screens].firstObject;
@@ -849,14 +1055,27 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
         const CGFloat titleH = wf.size.height - (CGFloat)height;
         frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
     }
-    g_window = [[NSWindow alloc] initWithContentRect:frame
+    g_window = [[ModelViewerWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
     if (target != nil) {
         // Global coordinates, title bar on-screen: no re-constrain.
         [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
     }
     [g_window setTitle:@"DisplayXR 3D Model Viewer"];
+    // Nothing in the app moves the window on a background / content drag:
+    // the runtime's placement owns moves (it sets movable = NO itself; the app
+    // never touches movable), and RMB-drag is the runtime's (or the fallback's).
+    [g_window setMovableByWindowBackground:NO];
     [g_window setDelegate:delegate];
+    // Transparent-capable session (#181): the window itself must not paint an
+    // opaque background behind the CAMetalLayer, or alpha 0 shows the window
+    // colour instead of the desktop. App-owned window, so this is the app's
+    // job (the runtime repeats it for the external view at xrCreateSession).
+    // Opaque frames are alpha 1 everywhere, so nothing changes until Ctrl+T.
+    if (g_transparentCapable) {
+        [g_window setOpaque:NO];
+        [g_window setBackgroundColor:[NSColor clearColor]];
+    }
 
     g_metalView = [[MetalView alloc] initWithFrame:frame];
     [g_window setContentView:g_metalView];
@@ -948,6 +1167,21 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
     g_animButtonBackdrop = animBd;
     [g_topBar addSubview:animBd];
 
+    // Toast chip (hidden until ShowToast).
+    g_toastBackdrop = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, 10, 10)];
+    [g_toastBackdrop setMaterial:NSVisualEffectMaterialHUDWindow];
+    [g_toastBackdrop setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
+    [g_toastBackdrop setState:NSVisualEffectStateActive];
+    [g_toastBackdrop setWantsLayer:YES];
+    g_toastBackdrop.layer.cornerRadius = 10.0;
+    g_toastBackdrop.layer.masksToBounds = YES;
+    [g_toastBackdrop setHidden:YES];
+    g_toastLabel = [NSTextField labelWithString:@""];
+    [g_toastLabel setFont:[NSFont systemFontOfSize:15 weight:NSFontWeightSemibold]];
+    [g_toastLabel setTextColor:[NSColor labelColor]];
+    [g_toastBackdrop addSubview:g_toastLabel];
+    [g_metalView addSubview:g_toastBackdrop];
+
     // A/B knob (diagnostic): DISPLAYXR_MV_OVERLAYS=0 removes every AppKit view
     // stacked over the CAMetalLayer (frosted HUD + top-bar NSVisualEffectViews).
     // Overlapping AppKit/vibrancy views make WindowServer composite the Metal
@@ -965,6 +1199,9 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
             g_modeButton = nil;
             g_animButton = nil;
             g_animButtonBackdrop = nil;
+            [g_toastBackdrop removeFromSuperview];
+            g_toastBackdrop = nil;
+            g_toastLabel = nil;
             LOG_INFO("DISPLAYXR_MV_OVERLAYS=0: HUD and top bar removed (nothing over the Metal layer)");
         }
     }
@@ -1015,22 +1252,136 @@ static void PumpMacOSEvents() {
     }
 }
 
+// Swap the window's style to/from borderless while keeping its CONTENT rect
+// (screen points, position + size) identical, the window key and the content
+// view first responder. setStyleMask alone keeps the FRAME, so the content
+// rect would grow/shrink by the title bar; the frame is recomputed from the
+// saved content rect right after. Never setFrame:display:YES (the view's
+// CAMetalLayer is the runtime's present target; it presents on its own).
+static void SetWindowStylePreservingContent(NSUInteger style, NSRect content) {
+    if (g_window == nil) return;
+    const bool wasKey = g_window.isKeyWindow;
+    if (g_window.styleMask != style) [g_window setStyleMask:style];
+    const NSRect want = [g_window frameRectForContentRect:content];
+    if (!NSEqualRects(want, g_window.frame)) [g_window setFrame:want display:NO animate:NO];
+    // A style change can drop key status / the first responder.
+    if (wasKey && !g_window.isKeyWindow) [g_window makeKeyWindow];
+    if (g_window.firstResponder != g_metalView) [g_window makeFirstResponder:g_metalView];
+}
+
+static NSUInteger WindowedStyle() {
+    return g_transparentBg ? NSWindowStyleMaskBorderless : kTitledWindowStyle;
+}
+
 static void ToggleBorderlessFullscreen() {
     if (g_fullscreen) {
-        [g_window setStyleMask:g_savedWindowStyle];
-        [g_window setFrame:g_savedWindowFrame display:YES animate:NO];
-        [g_window setLevel:NSNormalWindowLevel];
+        // Back to the windowed style the CURRENT background wants (Ctrl+T may
+        // have flipped while fullscreen) and the windowed z-band: floating
+        // while transparent (#181).
         g_fullscreen = false;
+        SetWindowStylePreservingContent(WindowedStyle(), g_savedContentRect);
+        [g_window setLevel:g_transparentBg ? NSFloatingWindowLevel : NSNormalWindowLevel];
         LOG_INFO("Exited fullscreen");
     } else {
-        g_savedWindowStyle = [g_window styleMask];
-        g_savedWindowFrame = [g_window frame];
+        g_savedContentRect = [g_window contentRectForFrameRect:[g_window frame]];
         NSScreen *screen = [g_window screen] ?: [NSScreen mainScreen];
-        [g_window setStyleMask:NSWindowStyleMaskBorderless];
-        [g_window setFrame:[screen frame] display:YES animate:NO];
+        SetWindowStylePreservingContent(NSWindowStyleMaskBorderless, [screen frame]);
         [g_window setLevel:NSStatusWindowLevel];
         g_fullscreen = true;
         LOG_INFO("Entered fullscreen");
+    }
+}
+
+// Window side of Ctrl+T (#181). Keep-above while transparent — the Windows
+// leg's HWND_TOPMOST, Linux's _NET_WM_STATE_ABOVE — and no window shadow: the
+// shadow AppKit derives from a non-opaque window's content would outline the
+// floating model with a grey halo against the desktop. Opaque restores both
+// and makes the whole window clickable again. Fullscreen keeps its own level.
+static void ApplyTransparentWindowState() {
+    if (g_window == nil) return;
+    if (!g_fullscreen) {
+        // No decorations while transparent (borderless; RMB-drag moves it),
+        // the normal titled window when opaque. Fullscreen is borderless
+        // already and picks the style on exit.
+        SetWindowStylePreservingContent(WindowedStyle(),
+                                        [g_window contentRectForFrameRect:[g_window frame]]);
+        [g_window setLevel:g_transparentBg ? NSFloatingWindowLevel : NSNormalWindowLevel];
+    }
+    if (!g_transparentBg) g_rmbDragging = false;
+    // On-window chrome, exactly as the Windows leg (#833, "chrome is hidden in
+    // transparent/punch-through mode by design"): the top button bar (Open /
+    // Mode / Animation) is dropped while transparent and comes back on opaque.
+    // The Tab HUD panel and the toast chip are NOT touched — Windows keeps
+    // both (the toast is unioned into its click region). A hidden view is also
+    // out of UpdateClickThrough's chrome hit-test, so the bar's area passes
+    // clicks through like any other transparent surround.
+    if (g_topBar != nil) [g_topBar setHidden:g_transparentBg ? YES : NO];
+    [g_window setHasShadow:g_transparentBg ? NO : YES];
+    if (!g_transparentBg && g_ignoringMouse) {
+        [g_window setIgnoresMouseEvents:NO];
+        g_ignoringMouse = false;
+    }
+    [g_window invalidateShadow];
+}
+
+// Click-through, per frame (#181). Cocoa has no input region, only the
+// all-or-nothing NSWindow.ignoresMouseEvents, so the decision is made for the
+// CURRENT cursor position from a global poll ([NSEvent mouseLocation]) — once
+// the window ignores the mouse it receives no mouse-moved events, so window
+// events could never turn it back on. Content under the cursor (the frame's
+// own alpha, clickthrough.cpp) or one of the app's AppKit controls = clickable;
+// transparent surround = pass through to whatever is underneath.
+static void UpdateClickThrough() {
+    if (g_window == nil || g_metalView == nil) return;
+    bool wantIgnore = false;
+    if (g_transparentBg) {
+        // Never flip mid-gesture: a drag that leaves the silhouette must keep
+        // its mouseDragged stream (and its mouseUp).
+        if ([NSEvent pressedMouseButtons] != 0) return;
+        const NSRect frame = [g_window frame];
+        const NSRect content = [g_window contentRectForFrameRect:frame];
+        const NSPoint p = [NSEvent mouseLocation];   // global, bottom-up
+        if (NSPointInRect(p, content) && content.size.width > 0 && content.size.height > 0) {
+            // Chrome first: the app's own AppKit controls (top-bar buttons,
+            // a visible HUD/toast) stay clickable — the Linux helper's "union
+            // the header bar in". The transparent top-bar container itself
+            // does not count.
+            const NSPoint inWin = [g_window convertPointFromScreen:p];
+            NSView *hv = [g_metalView hitTest:[g_metalView.superview convertPoint:inWin fromView:nil]];
+            const bool overChrome = hv != nil && hv != g_metalView && hv != g_topBar;
+            bool hit = false;
+            const float u = (float)((p.x - content.origin.x) / content.size.width);
+            const float v = 1.0f - (float)((p.y - content.origin.y) / content.size.height);
+            const bool haveCov = MacClickthroughHit(u, v, &hit);
+            // Reachability net (Linux/Windows): a silhouette below 64x64 px of
+            // window area (model panned away, nothing loaded) keeps the whole
+            // window clickable so Ctrl+T can still bring it back.
+            const CGFloat bs = g_window.backingScaleFactor > 0 ? g_window.backingScaleFactor : 1.0;
+            const uint64_t coveredPt = MacClickthroughCoveredPx((uint32_t)content.size.width,
+                                                                (uint32_t)content.size.height);
+            const bool reachable = (uint64_t)((double)coveredPt * bs * bs) >= 64ull * 64ull;
+            static int s_lastReach = -1;
+            if (haveCov && (reachable ? 1 : 0) != s_lastReach) {
+                s_lastReach = reachable ? 1 : 0;
+                if (!reachable)
+                    LOG_WARN("clickthrough: silhouette covers only ~%llu px — keeping the window "
+                             "clickable (Ctrl+T still works)", (unsigned long long)(coveredPt * bs * bs));
+            }
+            wantIgnore = haveCov && reachable && !overChrome && !hit;
+            g_ctLast = {true, haveCov, hit, overChrome, reachable, u, v};
+        } else {
+            g_ctLast.inContent = false;
+        }
+    }
+    if (wantIgnore != g_ignoringMouse) {
+        [g_window setIgnoresMouseEvents:wantIgnore ? YES : NO];
+        g_ignoringMouse = wantIgnore;
+        static bool s_logged = false;
+        if (wantIgnore && !s_logged) {
+            s_logged = true;
+            LOG_INFO("clickthrough: cursor over the transparent surround — clicks pass through "
+                     "(logged once)");
+        }
     }
 }
 
@@ -1094,6 +1445,11 @@ struct AppXrSession {
     // in front of content that pops out under the pointer. 0 = not enabled.
     uint32_t cursorDepthSpecVersion = 0;
 
+    // XR_DXR_depth_budget (ADR-040). Optional — an older runtime leaves it
+    // off and ResolveClipPlanes falls back to the pre-extension rule.
+    bool hasDepthBudgetExt = false;
+    uint32_t depthBudgetExtVersion = 0;
+
     // XR_DXR_mcp_tools (#22): app-defined agent tools on the runtime-hosted
     // per-process MCP server. The whole path is inert when the extension or
     // the MCP capability gate is absent — never load-bearing.
@@ -1113,6 +1469,7 @@ struct AppXrSession {
     float renderingModeScaleX[8] = {};
     float renderingModeScaleY[8] = {};
     bool renderingModeDisplay3D[8] = {};
+    bool renderingModeIsRequestable[8] = {};    // false = a workspace controller owns the mode
     uint32_t renderingModeTileColumns[8] = {};  // atlas tile layout (v12)
     uint32_t renderingModeTileRows[8] = {};
     //! Array index of the mode the runtime reports isActive at enumeration
@@ -1234,7 +1591,8 @@ static bool BeginFrame(AppXrSession& xr, XrFrameState& frameState);
 static bool AcquireSwapchainImage(AppXrSession& xr, uint32_t& imageIndex);
 static void ReleaseSwapchainImage(AppXrSession& xr);
 static void EndFrame(AppXrSession& xr, XrTime displayTime,
-    XrCompositionLayerProjectionView* projViews, uint32_t viewCount);
+    XrCompositionLayerProjectionView* projViews, uint32_t viewCount,
+    const void* frameEndNext = nullptr);
 static void CleanupOpenXR(AppXrSession& xr);
 
 // ============================================================================
@@ -1262,6 +1620,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
             modelviewer::CursorDepthWanted())
             xr.cursorDepthSpecVersion = ext.extensionVersion;
+        if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
+            xr.hasDepthBudgetExt = true;
+            xr.depthBudgetExtVersion = ext.extensionVersion;
+        }
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
@@ -1279,6 +1641,11 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.cursorDepthSpecVersion > 0) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
     LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
              xr.cursorDepthSpecVersion);
+    // XR_DXR_depth_budget (ADR-040): opt in so the runtime publishes its rear
+    // depth budget on xrLocateViews (consumed in transparent mode only).
+    if (xr.hasDepthBudgetExt) enabled.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_depth_budget: %s (v%u)", xr.hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
+             xr.depthBudgetExtVersion);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -1483,9 +1850,21 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
 
     XrCocoaWindowBindingCreateInfoDXR macBinding = {(XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR};
     macBinding.viewHandle = (__bridge void*)g_metalView;
+    // #181: ALWAYS request a transparent-capable layer (Windows/Linux parity).
+    // The runtime fixes CAMetalLayer.opaque + the compositeAlpha here, once;
+    // Ctrl+T later changes only what the app draws (alpha-0 clear, no skybox).
+    // MODEL_TRANSPARENT=0 is the one opt-out.
+    macBinding.transparentBackgroundEnabled = g_transparentCapable ? XR_TRUE : XR_FALSE;
     if (xr.hasCocoaWindowBinding && g_metalView) {
         vkBinding.next = &macBinding;
-        LOG_INFO("Using XR_DXR_cocoa_window_binding");
+        LOG_INFO("Using XR_DXR_cocoa_window_binding (transparentBackgroundEnabled=%s%s)",
+                 g_transparentCapable ? "XR_TRUE" : "XR_FALSE",
+                 g_transparentCapable ? (g_transparentBg ? ", starting TRANSPARENT" : ", starting opaque") : "");
+    } else if (g_transparentCapable) {
+        // Hosted-NULL fallback: no app window to make see-through.
+        g_transparentCapable = false;
+        g_transparentBg = false;
+        LOG_INFO("No cocoa window binding — transparent background unavailable");
     }
 
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
@@ -1585,6 +1964,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                     xr.renderingModeScaleX[i] = modes[i].viewScaleX;
                     xr.renderingModeScaleY[i] = modes[i].viewScaleY;
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
+                    xr.renderingModeIsRequestable[i] = (modes[i].isRequestable == XR_TRUE);
                     xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
                     xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
                     // Only a 3D mode is a candidate for the app's default. The
@@ -2029,13 +2409,15 @@ static void ReleaseSwapchainImage(AppXrSession& xr) {
 }
 
 static void EndFrame(AppXrSession& xr, XrTime displayTime,
-    XrCompositionLayerProjectionView* projViews, uint32_t viewCount) {
+    XrCompositionLayerProjectionView* projViews, uint32_t viewCount,
+    const void* frameEndNext) {
     XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     layer.space = xr.localSpace;
     layer.viewCount = viewCount;
     layer.views = projViews;
     const XrCompositionLayerBaseHeader* layers[] = {(const XrCompositionLayerBaseHeader*)&layer};
     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
+    ei.next = frameEndNext;   // XR_DXR_depth_budget ROI (content mask / bounds)
     ei.displayTime = displayTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     ei.layerCount = 1; ei.layers = layers;
@@ -2049,13 +2431,69 @@ static void CleanupOpenXR(AppXrSession& xr) {
     if (xr.instance) xrDestroyInstance(xr.instance);
 }
 
+/*!
+ * True when NOT under a workspace controller: no modes enumerated (pre-v7
+ * runtime) or the active mode is app-requestable (a controller marks them
+ * non-requestable). Gates the no-budget ZDP clip and the transparent half of
+ * the auto-orbit hold — the Windows/Linux IsStandaloneSession.
+ */
+static bool IsStandaloneSession(const AppXrSession& xr) {
+    return (xr.renderingModeCount == 0) ||
+           (g_input.currentRenderingMode < xr.renderingModeCount &&
+            xr.renderingModeIsRequestable[g_input.currentRenderingMode]);
+}
+
+/*!
+ * Log the rear depth budget on change only — never per frame (linux/main.cpp's
+ * LogRearDepthBudget). Prints on every STATE change and once the ramped value
+ * has settled; `applied` is what dxr::ResolveClipPlanes used (1000 whenever
+ * the frame is opaque).
+ */
+static void LogRearDepthBudget(const XrRearDepthBudgetDXR* budget, float applied, bool transparent,
+                               bool standalone) {
+    static bool s_haveLogged = false;
+    static bool s_lastHadBudget = false;
+    static int s_lastState = -1;
+    static float s_lastLoggedVH = -1.0f, s_lastLoggedApplied = -1.0f, s_prevVH = -1.0f;
+    static bool s_lastTransparent = false;
+    static float s_lastFallbackApplied = -1.0f;
+
+    if (budget == nullptr) {
+        if (!s_haveLogged || s_lastHadBudget || applied != s_lastFallbackApplied) {
+            s_haveLogged = true;
+            s_lastHadBudget = false;
+            s_lastFallbackApplied = applied;
+            LOG_INFO("Rear depth budget: none from the runtime — fallback rule, applied farOffsetVH=%.0f "
+                     "(transparent=%d standalone=%d)", applied, transparent ? 1 : 0, standalone ? 1 : 0);
+        }
+        return;
+    }
+    const float vh = budget->farOffsetVH;
+    const bool stateChanged = !s_lastHadBudget || (int)budget->state != s_lastState;
+    const bool settled = (vh == s_prevVH) && (vh != s_lastLoggedVH || applied != s_lastLoggedApplied);
+    const bool transparentChanged = transparent != s_lastTransparent;
+    s_prevVH = vh;
+    if (!stateChanged && !settled && !transparentChanged) return;
+    s_haveLogged = true;
+    s_lastHadBudget = true;
+    s_lastState = (int)budget->state;
+    s_lastLoggedVH = vh;
+    s_lastLoggedApplied = applied;
+    s_lastTransparent = transparent;
+    LOG_INFO("Rear depth budget: state=%s farOffsetVH=%.2f (%.3f m) -> applied farOffsetVH=%.2f%s "
+             "(transparent=%d standalone=%d)",
+             dxr::RearDepthBudgetStateName(budget->state), vh, budget->farOffsetMeters, applied,
+             (transparent && applied < 1000.0f) ? " [rear clip ON]" : " [no rear clip]",
+             transparent ? 1 : 0, standalone ? 1 : 0);
+}
+
 // ============================================================================
 // Placeholder rendering (clear to dark gray when no scene loaded)
 // ============================================================================
 
 static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
                                VkImage image, uint32_t w, uint32_t h,
-                               float yaw, float pitch) {
+                               float yaw, float pitch, bool transparentBg) {
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
     VkCommandBuffer cmd;
@@ -2075,7 +2513,11 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
     // Tint color based on camera direction so drag-rotation gives visual feedback
     float ny = (yaw / 3.14159f) * 0.5f + 0.5f;   // 0..1 over ±π
     float np = (pitch / 1.5f) * 0.5f + 0.5f;       // 0..1 over ±1.5 rad
-    VkClearColorValue cc = {{0.05f + ny * 0.15f, 0.08f + np * 0.12f, 0.15f, 1.0f}};
+    // Opaque: alpha exactly 1 everywhere. Transparent (#181): alpha 0, so an
+    // empty viewer is see-through rather than a tinted slab on the desktop.
+    VkClearColorValue cc = transparentBg
+        ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
+        : VkClearColorValue{{0.05f + ny * 0.15f, 0.08f + np * 0.12f, 0.15f, 1.0f}};
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range);
 
@@ -2144,7 +2586,12 @@ static void ApplyAutoFitForLoadedScene() {
         float sweptW = 0.0f;
         float vh = modelviewer::FitVHeight(extent, viewportW, viewportH, &sweptW);
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
+        if (g_vhOverride > 0.0f) vh = g_vhOverride;             // --vh pins it
         g_fitVHeight = vh;
+        // Full extents for the XR_DXR_depth_budget v2 content bounds.
+        g_fitExtentW = sweptW > 0.0f ? sweptW : hypotf(extent[0], extent[2]);
+        g_fitExtentH = extent[1];
+        g_fitExtentD = extent[2];
 
         // glTF models are authored front-facing (+Z toward the viewer), so a
         // yaw scan isn't needed — start at yaw=0 and let the user rotate.
@@ -2250,10 +2697,14 @@ static void TryAutoLoadBundledEnvironment() {
     }
 }
 
+// Positional model path from the launch contract (dxr::ParseLaunchArgs).
+static std::string g_launchModelPath;
+
 static void TryAutoLoadBundledScene() {
     std::string dir = ExeDir();
     if (dir.empty()) return;
     std::string path = dir + "/sample.glb";
+    if (!g_launchModelPath.empty()) path = g_launchModelPath;
     // DXR_MODELVIEWER_MODEL=<path> replaces the bundled sample at startup, any
     // format the loader takes (.glb/.gltf/.usd*/.obj/.fbx/.stl). An environment
     // variable for the same reason as DXR_MODELVIEWER_DETERMINISTIC: the .app
@@ -2278,14 +2729,65 @@ static void TryAutoLoadBundledScene() {
 // Main
 // ============================================================================
 
-int main() {
+int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
+    signal(SIGUSR1, ToggleSignalHandler);   // scripted Ctrl+T (see ToggleSignalHandler)
 
     LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) + External macOS Window ===");
+
+    // Launch contract (shared with Windows/Linux, dxr::ParseLaunchArgs): the
+    // first positional argument is a model path, --vh=<metres> pins the
+    // virtual display height, --transparent starts transparent. The rest of
+    // the undock contract (--rect, --pose, --margin, --src, --title) is parsed
+    // and reported as unsupported on macOS rather than silently ignored.
+    // Finder's legacy -psn_<n> process-serial argument is dropped first.
+    bool launchTransparent = false;
+    {
+        std::vector<std::string> args;
+        for (int i = 1; i < argc; i++) {
+            if (strncmp(argv[i], "-psn_", 5) == 0) continue;
+            args.emplace_back(argv[i]);
+        }
+        if (!args.empty()) {
+            const dxr::LaunchArgs la = dxr::ParseLaunchArgs(args);
+            for (const std::string& w : la.warnings) LOG_WARN("launch: %s", w.c_str());
+            if (!la.ok()) {
+                for (const std::string& e : la.errors) LOG_ERROR("launch: %s", e.c_str());
+                return 1;
+            }
+            if (la.hasVh && la.vh > 0.0f) { g_vhOverride = la.vh; LOG_INFO("launch: --vh=%.4f m", la.vh); }
+            if (!la.positionalPath.empty()) g_launchModelPath = la.positionalPath;
+            if (la.srcKind == dxr::LaunchSrcKind::LocalPath && !la.src.empty()) g_launchModelPath = la.src;
+            if (la.transparent) { launchTransparent = true; LOG_INFO("launch: --transparent"); }
+            if (la.srcKind == dxr::LaunchSrcKind::Url) LOG_WARN("launch: --src URL download is not supported on macOS (ignored)");
+            if (la.hasRect) LOG_WARN("launch: --rect is not supported on macOS (ignored)");
+            if (la.hasPose) LOG_WARN("launch: --pose is not supported on macOS (ignored)");
+            if (la.hasMargin) LOG_WARN("launch: --margin is not supported on macOS (ignored)");
+            if (!la.title.empty()) LOG_WARN("launch: --title is not supported on macOS (ignored)");
+        }
+    }
+
+    // MODEL_TRANSPARENT (Linux parity; #181):
+    //   unset / empty  transparent-capable, start opaque, Ctrl/Cmd+T toggles
+    //   1 (non-zero)   transparent-capable, start transparent (= --transparent)
+    //   0              NOT capable: opaque layer, transparentBackgroundEnabled =
+    //                  XR_FALSE — the pre-#181 behaviour; Ctrl+T refuses.
+    {
+        const char* te = getenv("MODEL_TRANSPARENT");
+        if (te != nullptr && te[0] == '0') {
+            g_transparentCapable = false;
+            if (launchTransparent) LOG_WARN("launch: --transparent overridden by MODEL_TRANSPARENT=0");
+            LOG_INFO("MODEL_TRANSPARENT=0 — transparent background disabled for this session");
+        } else if ((te != nullptr && te[0] != '\0') || launchTransparent) {
+            g_transparentBg = true;
+        }
+        const char* ap = getenv("DXR_MODELVIEWER_ALPHA_PROBE");
+        g_alphaProbe = ap != nullptr && ap[0] != '\0' && ap[0] != '0';
+    }
 
     // Initialize rendering mode from env var (legacy fallback)
     {
@@ -2364,6 +2866,13 @@ int main() {
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
         vkDestroyDevice(vkDevice, nullptr); vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr); return 1; }
+    // Window side of the starting background (level + shadow), now that the
+    // session has settled whether the capability survived.
+    ApplyTransparentWindowState();
+    LOG_INFO("Window: opaque=%d layer.opaque=%d level=%ld (capable=%d)",
+             g_window.isOpaque ? 1 : 0, g_metalView.layer.opaque ? 1 : 0, (long)g_window.level,
+             g_transparentCapable ? 1 : 0);
+    if (g_transparentBg) LOG_INFO("Transparent background: ON (startup)");
 
     // Adopt the display's active mode rather than assuming a view count, so a
     // 4-view Quad display renders a 4-tile atlas instead of a hard-coded 2.
@@ -2456,7 +2965,7 @@ int main() {
     LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
     LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
     LOG_INFO("          [/]=Exposure  G=Tone curve  (drop an .hdr to change the environment)");
-    LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.glb/.gltf also accept drag-and-drop)");
+    LOG_INFO("          Ctrl+O/Open=Load  Ctrl/Cmd+T=Transparent bg  Tab=HUD  ESC=Quit  (.glb/.gltf also accept drag-and-drop)");
     if (g_handTracking.enabled())
         LOG_INFO("          Hands: pinch+drag=Rotate  two-hand pinch: spread=Zoom twist=Roll drag=Rotate");
 
@@ -2472,6 +2981,30 @@ int main() {
 
     while (g_running && !xr.exitRequested) {
         PumpMacOSEvents();
+
+        // Ctrl+T / Cmd+T (#181): opaque <-> transparent background.
+        if (g_input.transparentBgToggleRequested) {
+            g_input.transparentBgToggleRequested = false;
+            if (!g_transparentCapable) {
+                // Refuse loudly. The session's transparency was fixed at
+                // xrCreateSession; clearing to alpha 0 into an OPAQUE layer
+                // would draw a black window, not a see-through one.
+                LOG_WARN("Ctrl+T ignored — this session is not transparent-capable "
+                         "(MODEL_TRANSPARENT=0 or no cocoa window binding). "
+                         "Restart without MODEL_TRANSPARENT=0 to enable it.");
+                ShowToast("Transparent background unavailable (MODEL_TRANSPARENT=0)");
+            } else {
+                g_transparentBg = !g_transparentBg;
+                LOG_INFO("Transparent background: %s (Ctrl+T)", g_transparentBg ? "ON" : "OFF");
+                ApplyTransparentWindowState();
+                ShowToast("Background  %s", g_transparentBg ? "TRANSPARENT" : "OPAQUE");
+                // Same as the other legs: the turntable restarts its idle
+                // countdown rather than snapping on the instant you go opaque.
+                g_input.lastInputTimeSec = NowSec();
+            }
+        }
+        UpdateClickThrough();
+        UpdateToast();
 
         auto now = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(now - lastTime).count();
@@ -2580,6 +3113,10 @@ int main() {
             if (BeginFrame(xr, frameState)) {
                 std::vector<XrCompositionLayerProjectionView> projectionViews;
                 bool rendered = false;
+                // XR_DXR_depth_budget v2 content-bounds ROI, filled in the render
+                // block below, chained at xrEndFrame (Windows: contentBoundsUV).
+                XrRect2Df contentBoundsUV{};
+                bool haveContentBounds = false;
 
                 if (frameState.shouldRender) {
                     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -2675,6 +3212,13 @@ int main() {
                         eyeTrackingState.next = &viewRigRaw;
                     }
 
+                    // XR_DXR_depth_budget (ADR-040): chain the advisory rear depth
+                    // budget. Only under the rig, as on Windows/Linux — ez/vH, the
+                    // ResolveClipPlanes inputs, are rig quantities.
+                    XrRearDepthBudgetDXR rearBudget = {};
+                    const bool useDepthBudget = xr.hasDepthBudgetExt && useRig;
+                    if (useDepthBudget) dxr::ChainRearDepthBudget(viewState, rearBudget);
+
                     uint32_t runtimeViewCount = xr.maxViewCount > 0 ? xr.maxViewCount : 2;
                     if (runtimeViewCount > 8) runtimeViewCount = 8;
                     XrView views[8] = {};
@@ -2686,6 +3230,16 @@ int main() {
                     if (XR_SUCCEEDED(locResult) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+
+                        // A runtime that recognizes the chained struct always
+                        // overwrites `type`; an untouched zero-init (older runtime)
+                        // stays null so ResolveClipPlanes falls back to the
+                        // pre-extension rule (clip_policy.h contract).
+                        const XrRearDepthBudgetDXR* rearBudgetPtr =
+                            (useDepthBudget && rearBudget.type == (XrStructureType)XR_TYPE_REAR_DEPTH_BUDGET_DXR)
+                                ? &rearBudget : nullptr;
+                        const bool standalone = IsStandaloneSession(xr);
+                        g_standaloneSession = standalone;
 
                         // --- Per-frame mode metadata ---
                         uint32_t modeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
@@ -2816,13 +3370,20 @@ int main() {
 
                         // --- Consume the runtime's render-ready XrView{pose, fov} (#396 W7) ---
                         // The runtime owns the off-axis Kooima (window resolve included); the
-                        // app keeps only the clip policy (fov is clip-independent). near =
-                        // ez - vH, far = ez + 1000*vH (macOS modelviewer is always opaque),
+                        // app keeps only the clip policy (fov is clip-independent), resolved by
+                        // dxr::ResolveClipPlanes: near = ez - vH; far = ez + 1000*vH when
+                        // opaque, ez + the runtime's rear budget (or 0 = the ZDP, standalone
+                        // with no budget) when transparent — exactly Windows/Linux.
                         // ez = RigLocalEyeZ (== the display-space eye Z display3d resolved).
                         // The view matrix is the plain clean-frame mat4_view_from_xr_pose —
                         // ModelRenderer owns the Vulkan Y-down flip via a negative viewport.
                         // GL projection → [0,1] depth remap kept (mesh uses the depth buffer).
                         std::vector<Display3DView> eyeViews((size_t)eyeCount);
+                        // Per-eye far cull (0 = none) and the UNRESTRICTED-far twin
+                        // projection for the v3 coverage pass, so the content mask
+                        // never depends on the budget it feeds (runtime#1470).
+                        std::vector<float> eyeClipFar((size_t)eyeCount, 0.0f);
+                        std::vector<std::array<float, 16>> eyeProjUnclipped((size_t)eyeCount);
                         bool hasKooima = useRig;
                         if (useRig) {
                             // Mono: collapse the active views to their centroid (pose + fov).
@@ -2853,12 +3414,22 @@ int main() {
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 const XrView& sv = srcViews[eye];
                                 float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
-                                float near_z = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
-                                float far_z  = ez + 1000.0f * rigVH;
+                                const dxr::ClipPlanes clip = dxr::ResolveClipPlanes(
+                                    ez, rigVH, rearBudgetPtr, g_transparentBg, standalone);
+                                const float near_z = clip.near_z;
+                                const float far_z  = clip.far_z;
+                                eyeClipFar[eye] = clip.clipFar;
+                                if (eye == 0) LogRearDepthBudget(rearBudgetPtr, clip.farOffsetVH, g_transparentBg, standalone);
                                 mat4_view_from_xr_pose(eyeViews[eye].view_matrix, sv.pose);
                                 mat4_from_xr_fov(eyeViews[eye].projection_matrix, sv.fov, near_z, far_z);
                                 // GL ([-1,1] clip-z) → Vulkan [0,1] depth for the mesh's depth buffer.
                                 convert_projection_gl_to_zero_to_one(eyeViews[eye].projection_matrix);
+                                // The unrestricted twin: transparent=false IS the
+                                // farOffsetVH = 1000 branch; near is budget-independent.
+                                const dxr::ClipPlanes clipU = dxr::ResolveClipPlanes(
+                                    ez, rigVH, nullptr, /*transparent=*/false, standalone);
+                                mat4_from_xr_fov(eyeProjUnclipped[eye].data(), sv.fov, clipU.near_z, clipU.far_z);
+                                convert_projection_gl_to_zero_to_one(eyeProjUnclipped[eye].data());
                                 eyeViews[eye].fov = sv.fov;
                                 eyeViews[eye].eye_world = sv.pose.position;
                                 eyeViews[eye].orientation = sv.pose.orientation;
@@ -2959,17 +3530,22 @@ int main() {
                             projectionViews.assign((size_t)locatedViewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
                             std::vector<std::array<float, 16>> viewMat((size_t)eyeCount);
                             std::vector<std::array<float, 16>> projMat((size_t)eyeCount);
+                            std::vector<std::array<float, 16>> projMatUnclipped((size_t)eyeCount);
+                            std::vector<float> clipFar((size_t)eyeCount, 0.0f);
                             std::vector<std::pair<uint32_t, uint32_t>> tileOffsets((size_t)eyeCount);
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 int srcView = eye < (int)runtimeViewCount ? eye : 0;
                                 if (hasKooima) {
                                     memcpy(viewMat[eye].data(), eyeViews[eye].view_matrix, sizeof(float) * 16);
                                     memcpy(projMat[eye].data(), eyeViews[eye].projection_matrix, sizeof(float) * 16);
+                                    projMatUnclipped[eye] = eyeProjUnclipped[eye];
+                                    clipFar[eye] = eyeClipFar[eye];
                                     views[srcView].pose.position = eyeViews[eye].eye_world;
                                     views[srcView].pose.orientation = cameraPose.orientation;
                                 } else {
                                     mat4_view_from_xr_pose(viewMat[eye].data(), views[srcView].pose);
                                     mat4_from_xr_fov(projMat[eye].data(), views[srcView].fov, 0.01f, 100.0f);
+                                    projMatUnclipped[eye] = projMat[eye];   // no budget without the rig
                                 }
 
                                 // Tile-aware viewport: row-major eye layout in the atlas.
@@ -2996,6 +3572,37 @@ int main() {
                             VkImage targetImage = swapchainImages[imageIndex].image;
                             VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
+                            // XR_DXR_depth_budget v2: the model's full-extent AABB
+                            // projected through this frame's view-projections, unioned
+                            // over the rendered eyes, canvas-normalised. Rig-only and
+                            // model-only (linux/main.cpp, Windows #116 v2).
+                            if (xr.hasDepthBudgetExt && hasKooima && g_fitValid && g_modelRenderer.hasModel()) {
+                                const float halfW = 0.5f * g_fitExtentW, halfH = 0.5f * g_fitExtentH,
+                                            halfD = 0.5f * g_fitExtentD;
+                                const float aabbMin[3] = {g_fitCenter[0] - halfW, g_fitCenter[1] - halfH,
+                                                          g_fitCenter[2] - halfD};
+                                const float aabbMax[3] = {g_fitCenter[0] + halfW, g_fitCenter[1] + halfH,
+                                                          g_fitCenter[2] + halfD};
+                                std::vector<std::array<float, 16>> viewProj((size_t)eyeCount);
+                                std::vector<const float*> viewProjPtr((size_t)eyeCount);
+                                for (int eye = 0; eye < eyeCount; eye++) {
+                                    mat4_multiply(viewProj[eye].data(), projMat[eye].data(), viewMat[eye].data());
+                                    viewProjPtr[eye] = viewProj[eye].data();
+                                }
+                                dxr::ProjectAabbToCanvasBounds(aabbMin, aabbMax, viewProjPtr.data(),
+                                                               (uint32_t)eyeCount, &contentBoundsUV);
+                                haveContentBounds = true;
+                            }
+
+                            // XR_DXR_depth_budget v3: arm the renderer's coverage-only
+                            // pass (no far clip, unrestricted projection) so the mask is
+                            // the silhouette AT AN UNRESTRICTED BUDGET (runtime#1470).
+                            // Gated on the runtime's version, transparency and an app
+                            // window (the Windows "transparent && borderless" gate).
+                            const bool wantContentMask = xr.hasDepthBudgetExt && xr.depthBudgetExtVersion >= 3 &&
+                                                         hasKooima && g_transparentBg && g_transparentCapable;
+                            g_modelRenderer.beginContentMaskFrame(wantContentMask);
+
                             if (g_modelRenderer.hasModel()) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     g_modelRenderer.renderEye(
@@ -3003,12 +3610,93 @@ int main() {
                                         xr.swapchain.width, xr.swapchain.height,
                                         tileOffsets[eye].first, tileOffsets[eye].second,
                                         renderW, renderH,
-                                        viewMat[eye].data(), projMat[eye].data());
+                                        viewMat[eye].data(), projMat[eye].data(),
+                                        g_transparentBg, clipFar[eye], projMatUnclipped[eye].data());
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
                                     targetImage, xr.swapchain.width, xr.swapchain.height,
-                                    g_input.yaw, g_input.pitch);
+                                    g_input.yaw, g_input.pitch, g_transparentBg);
+                            }
+
+                            // v3: reduce the frame's UNCLIPPED coverage to the
+                            // extension's occupancy grid (linux/main.cpp sizing).
+                            if (wantContentMask) {
+                                const uint8_t* cov = g_modelRenderer.contentMaskCoverage();
+                                std::vector<uint8_t> cells;
+                                const uint32_t covW = ModelRenderer::kContentMaskCovW;
+                                const uint32_t covH = ModelRenderer::kContentMaskCovH;
+                                const uint32_t mW = std::max(1u, std::min(covW / 4u, dxr::kContentMaskRecommendedCells));
+                                const uint32_t mH = std::max(1u, std::min(covH / 4u, dxr::kContentMaskRecommendedCells));
+                                const bool ok = cov != nullptr &&
+                                    dxr::ContentMaskFromCoverage(cov, covW, covH, covW, g_windowW, g_windowH,
+                                                                 nullptr, mW, mH, cells) &&
+                                    dxr::ContentMaskCoverageCells(cells) > 0;
+                                if (ok) {
+                                    g_contentMaskCells.swap(cells);
+                                    g_contentMaskW = mW;
+                                    g_contentMaskH = mH;
+                                    if (!g_contentMaskChaining) {
+                                        g_contentMaskChaining = true;
+                                        LOG_INFO("XR_DXR_depth_budget v3: content mask chaining started (%ux%u cells, %u occupied)",
+                                                 mW, mH, dxr::ContentMaskCoverageCells(g_contentMaskCells));
+                                    }
+                                } else {
+                                    g_contentMaskCells.clear();
+                                }
+                            }
+                            if (!wantContentMask || g_contentMaskCells.empty()) {
+                                g_contentMaskCells.clear();
+                                if (g_contentMaskChaining) {
+                                    g_contentMaskChaining = false;
+                                    LOG_INFO("XR_DXR_depth_budget v3: content mask chaining stopped "
+                                             "— falling back to the content bounds / runtime ROI");
+                                }
+                            }
+
+                            // Click-through coverage (#181): the frame's own alpha,
+                            // first + last view tile, read back one frame late.
+                            // Also run in opaque mode under DXR_MODELVIEWER_ALPHA_PROBE.
+                            {
+                                MacClickthroughParams cp;
+                                cp.dev = vkDevice;
+                                cp.phys = physDevice;
+                                cp.queue = graphicsQueue;
+                                cp.queueFamily = queueFamilyIndex;
+                                cp.viewImage = targetImage;
+                                cp.viewFormat = swapFormat;
+                                cp.tileW = renderW;
+                                cp.tileH = renderH;
+                                cp.firstTileX = tileOffsets[0].first;
+                                cp.firstTileY = tileOffsets[0].second;
+                                cp.lastTileX = tileOffsets[(size_t)eyeCount - 1].first;
+                                cp.lastTileY = tileOffsets[(size_t)eyeCount - 1].second;
+                                cp.twoViews = eyeCount > 1;
+                                cp.winW = g_windowW;
+                                cp.winH = g_windowH;
+                                cp.active = (g_transparentBg && g_transparentCapable) || g_alphaProbe;
+                                MacClickthroughUpdate(cp);
+                                if (g_alphaProbe) {
+                                    static double s_nextProbe = 0.0;
+                                    MacAlphaStats st;
+                                    if (NowSec() >= s_nextProbe && MacClickthroughAlphaStats(&st)) {
+                                        s_nextProbe = NowSec() + 2.0;
+                                        const NSRect cr = [g_window contentRectForFrameRect:[g_window frame]];
+                                        const NSPoint mp = [NSEvent mouseLocation];
+                                        LOG_INFO("alpha-probe: bg=%s texels=%u alpha min=%u max=%u "
+                                                 "zero=%u (%.1f%%) full=%u (%.1f%%) | cursor=(%.0f,%.0f) "
+                                                 "content=(%.0f,%.0f %.0fx%.0f) ignoresMouseEvents=%d "
+                                                 "[ct in=%d cov=%d hit=%d chrome=%d reach=%d uv=%.2f,%.2f]",
+                                                 g_transparentBg ? "TRANSPARENT" : "OPAQUE", st.texels,
+                                                 (unsigned)st.minAlpha, (unsigned)st.maxAlpha,
+                                                 st.zero, 100.0 * st.zero / (st.texels ? st.texels : 1),
+                                                 st.full, 100.0 * st.full / (st.texels ? st.texels : 1),
+                                                 mp.x, mp.y, cr.origin.x, cr.origin.y, cr.size.width, cr.size.height,
+                                                 g_window.ignoresMouseEvents ? 1 : 0,
+                                                 g_ctLast.inContent, g_ctLast.haveCov, g_ctLast.hit,
+                                                 g_ctLast.overChrome, g_ctLast.reachable, g_ctLast.u, g_ctLast.v);
+                                    }
+                                }
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime
@@ -3062,11 +3750,23 @@ int main() {
                     }
                 }
 
+                // XR_DXR_depth_budget ROI chain (Windows' frameEndNext): mask
+                // first, then bounds; the runtime's precedence is mask -> bounds
+                // -> whole canvas regardless of order. The retained mask
+                // re-chains on frames that skip rendering.
+                XrFrameEndInfo roiChain = {XR_TYPE_FRAME_END_INFO};
+                XrContentMaskDXR contentMask = {};
+                XrContentBoundsDXR contentBounds = {};
+                if (xr.hasDepthBudgetExt && xr.depthBudgetExtVersion >= 3 && !g_contentMaskCells.empty())
+                    dxr::ChainContentMask(roiChain, contentMask, g_contentMaskCells, g_contentMaskW, g_contentMaskH);
+                if (haveContentBounds) dxr::ChainContentBounds(roiChain, contentBounds, contentBoundsUV);
+
                 if (rendered) {
                     EndFrame(xr, frameState.predictedDisplayTime,
-                        projectionViews.data(), (uint32_t)projectionViews.size());
+                        projectionViews.data(), (uint32_t)projectionViews.size(), roiChain.next);
                 } else {
                     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
+                    ei.next = roiChain.next;
                     ei.displayTime = frameState.predictedDisplayTime;
                     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
                     ei.layerCount = 0; ei.layers = nullptr;
@@ -3100,12 +3800,14 @@ int main() {
                     // "held" rather than "idle countdown" while a clip plays —
                     // the countdown is being reset every frame, so it will never
                     // reach the turntable and saying otherwise is a lie.
-                    const bool orbitHeld =
+                    const bool clipHeld =
                         g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused();
+                    const bool transpHeld = g_transparentBg && g_standaloneSession;
                     const char *orbitLabel = g_input.animateEnabled
-                        ? (orbitHeld ? "ON (held: clip playing)"
-                                     : (g_input.animationActive ? "ON (running)"
-                                                                : "ON (idle countdown)"))
+                        ? (clipHeld ? "ON (held: clip playing)"
+                                    : transpHeld ? "ON (held: transparent)"
+                                    : (g_input.animationActive ? "ON (running)"
+                                                               : "ON (idle countdown)"))
                         : "OFF";
                     uint32_t activeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                         ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
@@ -3131,6 +3833,7 @@ int main() {
                         "%@\n"
                         "Env: %s  EV %+.2f  Tone: %s\n"
                         "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s\n"
+                        "Background: %s\n"
                         "FPS: %.0f (%.1f ms)\n"
                         "Render: %ux%u  Window: %ux%u\n"
                         "Display: %.3f x %.3f m\n"
@@ -3139,7 +3842,8 @@ int main() {
                         "%@"
                         "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
                         "DblClick=Focus  -/= Depth  Space=Reset  N=Clip  K=Play/Pause\n"
-                        "M=Auto-Orbit  V=Mode  L=Load  [/]=Exposure  G=Tone\n"
+                        "M=Auto-Orbit  V=Mode  Ctrl+O=Load  [/]=Exposure  G=Tone\n"
+                        "Ctrl/Cmd+T=Transparent  T=Eye-tracking mode\n"
                         "Pinch+drag=Rotate  2-hand pinch: spread=Zoom twist=Roll\n"
                         "Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
@@ -3150,6 +3854,8 @@ int main() {
                         g_modelRenderer.environmentName().c_str(),
                         g_modelRenderer.exposureEV(), g_modelRenderer.toneCurveName(),
                         depthPct, g_input.viewParams.scaleFactor, orbitLabel,
+                        !g_transparentCapable ? "OPAQUE (transparency off: MODEL_TRANSPARENT=0)"
+                            : (g_transparentBg ? "TRANSPARENT" : "OPAQUE"),
                         fps, g_avgFrameTime * 1000.0,
                         g_renderW, g_renderH, g_windowW, g_windowH,
                         xr.displayWidthM, xr.displayHeightM,
@@ -3207,6 +3913,7 @@ int main() {
     g_modelRenderer.cleanup();      // waits for the device: the hand buffers are idle after this
     g_handRenderer.destroy();
     g_handTracking.destroy();       // trackers before the session
+    MacClickthroughDestroy(vkDevice);
     if (cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, cmdPool, nullptr);
     CleanupOpenXR(xr);
     // MoltenVK may throw std::system_error ("mutex lock failed") during device/instance
