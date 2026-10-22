@@ -250,8 +250,26 @@ typedef void (*PFN_sim_display_set_output_mode)(int mode);
 static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
 
 static bool g_fullscreen = false;
-static NSRect g_savedWindowFrame = {};
-static NSUInteger g_savedWindowStyle = 0;
+// Fullscreen saves the CONTENT rect (not the frame): the style it returns to
+// depends on g_transparentBg at exit time (titled vs borderless), and only the
+// content rect is the same in both.
+static NSRect g_savedContentRect = {};
+
+// The normal (opaque-mode) window style. Transparent mode (Ctrl+T) swaps the
+// window to NSWindowStyleMaskBorderless — the Windows leg's WS_POPUP, the
+// Linux leg's "no header bar while transparent" — so no title bar or frame
+// shows around the floating model. The content rect is preserved across the
+// swap; the window, the view and its CAMetalLayer are never recreated (the
+// runtime holds the view via XR_DXR_cocoa_window_binding).
+static const NSUInteger kTitledWindowStyle = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                             NSWindowStyleMaskResizable |
+                                             NSWindowStyleMaskMiniaturizable;
+// RMB window drag (transparent / borderless mode only — dxr::RmbWindowDrag,
+// the Windows borderless-overlay + Unity desktop-avatar convention). State in
+// AppKit global points (bottom-up).
+static bool g_rmbDragging = false;
+static NSPoint g_rmbMouseStart = {};
+static NSPoint g_rmbFrameStart = {};
 
 // Model-viewer state
 static ModelRenderer g_modelRenderer;
@@ -653,6 +671,17 @@ static void OpenLoadDialog() {
 - (void)windowWillClose:(NSNotification *)n { (void)n; g_running = false; }
 @end
 
+// Borderless NSWindows refuse key/main status by default, which would kill
+// keyboard input (Ctrl+T could not turn transparency back off). This window
+// stays eligible in every style.
+@interface ModelViewerWindow : NSWindow
+@end
+
+@implementation ModelViewerWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
 @interface MetalView : NSView
 @end
 
@@ -714,6 +743,52 @@ static void OpenLoadDialog() {
     float maxPitch = 1.5f;
     if (g_input.pitch > maxPitch) g_input.pitch = maxPitch;
     if (g_input.pitch < -maxPitch) g_input.pitch = -maxPitch;
+}
+
+// RMB drag moves the window while it is borderless (transparent mode), the
+// Windows leg's dxr::RmbWindowDrag: with no title bar there is no other way
+// to move it. Opaque mode leaves RMB alone (the title bar moves the window),
+// exactly as on Windows. Gating to "the model, not the surround" is free:
+// UpdateClickThrough makes the window ignore the mouse over the transparent
+// surround, so a right-press there goes to whatever is underneath.
+//
+// No phase-snap path exists for this leg: the runtime's ADR-050 placement
+// (comp_metal_placement) serves Metal sessions only, and the in-process
+// xrWeaveSnapWindowRectDXR route is Linux-vk_native / Metal only. This app is
+// vk_native on macOS, whose present reads the window position every frame,
+// so a plain setFrameOrigin is the move — the same thing AppKit's title-bar
+// drag does to this window in opaque mode.
+- (void)rightMouseDown:(NSEvent *)event {
+    if (g_transparentBg && !g_fullscreen && self.window != nil) {
+        MarkUserInput(g_input);
+        g_rmbDragging = true;
+        g_rmbMouseStart = [NSEvent mouseLocation];
+        g_rmbFrameStart = self.window.frame.origin;
+        return;
+    }
+    [super rightMouseDown:event];
+}
+
+- (void)rightMouseDragged:(NSEvent *)event {
+    if (g_rmbDragging && self.window != nil) {
+        MarkUserInput(g_input);
+        // The live cursor, not the event deltas: deltas are lost when events
+        // coalesce, and the window moving under the cursor skews them.
+        const NSPoint m = [NSEvent mouseLocation];
+        const NSPoint o = NSMakePoint(round(g_rmbFrameStart.x + (m.x - g_rmbMouseStart.x)),
+                                      round(g_rmbFrameStart.y + (m.y - g_rmbMouseStart.y)));
+        if (!NSEqualPoints(o, self.window.frame.origin)) [self.window setFrameOrigin:o];
+        return;
+    }
+    [super rightMouseDragged:event];
+}
+
+- (void)rightMouseUp:(NSEvent *)event {
+    if (g_rmbDragging) {
+        g_rmbDragging = false;
+        return;
+    }
+    [super rightMouseUp:event];
 }
 
 - (void)scrollWheel:(NSEvent *)event {
@@ -945,8 +1020,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
     // re-constrains the window onto [NSScreen mainScreen] — whichever screen
     // has focus at launch, i.e. often the laptop, not the 3D panel. Same fix
     // as the runtime's cube_handle_{metal,vk}_macos.
-    NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                       NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+    NSUInteger style = kTitledWindowStyle;
     NSRect frame = NSMakeRect(100, 100, width, height);
     NSScreen *target = nil;
     NSScreen *primary = [NSScreen screens].firstObject;
@@ -963,7 +1037,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
         const CGFloat titleH = wf.size.height - (CGFloat)height;
         frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
     }
-    g_window = [[NSWindow alloc] initWithContentRect:frame
+    g_window = [[ModelViewerWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
     if (target != nil) {
         // Global coordinates, title bar on-screen: no re-constrain.
@@ -1156,20 +1230,40 @@ static void PumpMacOSEvents() {
     }
 }
 
+// Swap the window's style to/from borderless while keeping its CONTENT rect
+// (screen points, position + size) identical, the window key and the content
+// view first responder. setStyleMask alone keeps the FRAME, so the content
+// rect would grow/shrink by the title bar; the frame is recomputed from the
+// saved content rect right after. Never setFrame:display:YES (the view's
+// CAMetalLayer is the runtime's present target; it presents on its own).
+static void SetWindowStylePreservingContent(NSUInteger style, NSRect content) {
+    if (g_window == nil) return;
+    const bool wasKey = g_window.isKeyWindow;
+    if (g_window.styleMask != style) [g_window setStyleMask:style];
+    const NSRect want = [g_window frameRectForContentRect:content];
+    if (!NSEqualRects(want, g_window.frame)) [g_window setFrame:want display:NO animate:NO];
+    // A style change can drop key status / the first responder.
+    if (wasKey && !g_window.isKeyWindow) [g_window makeKeyWindow];
+    if (g_window.firstResponder != g_metalView) [g_window makeFirstResponder:g_metalView];
+}
+
+static NSUInteger WindowedStyle() {
+    return g_transparentBg ? NSWindowStyleMaskBorderless : kTitledWindowStyle;
+}
+
 static void ToggleBorderlessFullscreen() {
     if (g_fullscreen) {
-        [g_window setStyleMask:g_savedWindowStyle];
-        [g_window setFrame:g_savedWindowFrame display:YES animate:NO];
-        // Back to the windowed z-band: floating while transparent (#181).
-        [g_window setLevel:g_transparentBg ? NSFloatingWindowLevel : NSNormalWindowLevel];
+        // Back to the windowed style the CURRENT background wants (Ctrl+T may
+        // have flipped while fullscreen) and the windowed z-band: floating
+        // while transparent (#181).
         g_fullscreen = false;
+        SetWindowStylePreservingContent(WindowedStyle(), g_savedContentRect);
+        [g_window setLevel:g_transparentBg ? NSFloatingWindowLevel : NSNormalWindowLevel];
         LOG_INFO("Exited fullscreen");
     } else {
-        g_savedWindowStyle = [g_window styleMask];
-        g_savedWindowFrame = [g_window frame];
+        g_savedContentRect = [g_window contentRectForFrameRect:[g_window frame]];
         NSScreen *screen = [g_window screen] ?: [NSScreen mainScreen];
-        [g_window setStyleMask:NSWindowStyleMaskBorderless];
-        [g_window setFrame:[screen frame] display:YES animate:NO];
+        SetWindowStylePreservingContent(NSWindowStyleMaskBorderless, [screen frame]);
         [g_window setLevel:NSStatusWindowLevel];
         g_fullscreen = true;
         LOG_INFO("Entered fullscreen");
@@ -1183,8 +1277,15 @@ static void ToggleBorderlessFullscreen() {
 // and makes the whole window clickable again. Fullscreen keeps its own level.
 static void ApplyTransparentWindowState() {
     if (g_window == nil) return;
-    if (!g_fullscreen)
+    if (!g_fullscreen) {
+        // No decorations while transparent (borderless; RMB-drag moves it),
+        // the normal titled window when opaque. Fullscreen is borderless
+        // already and picks the style on exit.
+        SetWindowStylePreservingContent(WindowedStyle(),
+                                        [g_window contentRectForFrameRect:[g_window frame]]);
         [g_window setLevel:g_transparentBg ? NSFloatingWindowLevel : NSNormalWindowLevel];
+    }
+    if (!g_transparentBg) g_rmbDragging = false;
     [g_window setHasShadow:g_transparentBg ? NO : YES];
     if (!g_transparentBg && g_ignoringMouse) {
         [g_window setIgnoresMouseEvents:NO];
