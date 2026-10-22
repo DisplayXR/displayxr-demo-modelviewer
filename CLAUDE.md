@@ -447,7 +447,7 @@ toast) stay clickable; below 64×64 px of silhouette the window stays
 clickable. Test levers: `kill -USR1 <pid>` = Ctrl+T (no TCC needed), and
 `DXR_MODELVIEWER_ALPHA_PROBE=1` logs the raw alpha the app submits
 (min/max/zero/full, from the same readback, also in opaque mode) plus the
-click-through decision every ~2 s. On a Leia panel the see-through needs the
+click-through decision every ~2 s. On a weaving panel the see-through needs the
 runtime's live desktop capture (runtime#2264, leia-plugin#418); sim_display
 is alpha-native and works today.
 

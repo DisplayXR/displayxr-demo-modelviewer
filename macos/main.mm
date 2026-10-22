@@ -755,7 +755,7 @@ static void OpenLoadDialog() {
 // This is a FALLBACK and must never fight the runtime. When the runtime owns
 // window placement (ADR-050 comp_metal_placement — active whenever the session
 // lands on comp_metal, including this Vulkan app routed VK -> comp_vk_client ->
-// comp_metal for a Metal-only DP such as Leia), it makes the window
+// comp_metal for a Metal-only weaving DP), it makes the window
 // movable = NO and takes a borderless window's right-button drag itself
 // (phase-snapped, atomic with the present); its local event monitor swallows
 // those events, so they never reach this view. If one does get here anyway
