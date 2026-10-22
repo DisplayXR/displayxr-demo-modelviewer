@@ -752,14 +752,32 @@ static void OpenLoadDialog() {
 // UpdateClickThrough makes the window ignore the mouse over the transparent
 // surround, so a right-press there goes to whatever is underneath.
 //
-// No phase-snap path exists for this leg: the runtime's ADR-050 placement
-// (comp_metal_placement) serves Metal sessions only, and the in-process
-// xrWeaveSnapWindowRectDXR route is Linux-vk_native / Metal only. This app is
-// vk_native on macOS, whose present reads the window position every frame,
-// so a plain setFrameOrigin is the move — the same thing AppKit's title-bar
-// drag does to this window in opaque mode.
+// This is a FALLBACK and must never fight the runtime. When the runtime owns
+// window placement (ADR-050 comp_metal_placement — active whenever the session
+// lands on comp_metal, including this Vulkan app routed VK -> comp_vk_client ->
+// comp_metal for a Metal-only DP such as Leia), it makes the window
+// movable = NO and takes a borderless window's right-button drag itself
+// (phase-snapped, atomic with the present); its local event monitor swallows
+// those events, so they never reach this view. If one does get here anyway
+// (an older runtime that owns placement but not the RMB drag), !isMovable
+// still says the runtime owns placement, and an app setFrameOrigin would move
+// the window behind its back (stale woven frame, no snap) — so the fallback
+// only runs while the window is movable, i.e. no runtime placement (an
+// in-process vk_native session, where the present reads the window position
+// every frame and a plain setFrameOrigin is what the title-bar drag does too).
+// The app never flips movable back.
+static bool AppOwnsRmbWindowMove(NSWindow *w) {
+    return w != nil && w.isMovable && g_transparentBg && !g_fullscreen;
+}
+
+// Never let AppKit start a window drag from a click in the content view
+// (mouseDownCanMoveWindow defaults to YES for a non-opaque view, which this
+// layer-backed transparent view is) — window moves belong to the runtime's
+// placement or to the RMB fallback above.
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+
 - (void)rightMouseDown:(NSEvent *)event {
-    if (g_transparentBg && !g_fullscreen && self.window != nil) {
+    if (AppOwnsRmbWindowMove(self.window)) {
         MarkUserInput(g_input);
         g_rmbDragging = true;
         g_rmbMouseStart = [NSEvent mouseLocation];
@@ -770,7 +788,7 @@ static void OpenLoadDialog() {
 }
 
 - (void)rightMouseDragged:(NSEvent *)event {
-    if (g_rmbDragging && self.window != nil) {
+    if (g_rmbDragging && self.window != nil && self.window.isMovable) {
         MarkUserInput(g_input);
         // The live cursor, not the event deltas: deltas are lost when events
         // coalesce, and the window moving under the cursor skews them.
@@ -1044,6 +1062,10 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height,
         [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
     }
     [g_window setTitle:@"DisplayXR 3D Model Viewer"];
+    // Nothing in the app moves the window on a background / content drag:
+    // the runtime's placement owns moves (it sets movable = NO itself; the app
+    // never touches movable), and RMB-drag is the runtime's (or the fallback's).
+    [g_window setMovableByWindowBackground:NO];
     [g_window setDelegate:delegate];
     // Transparent-capable session (#181): the window itself must not paint an
     // opaque background behind the CAMetalLayer, or alpha 0 shows the window
@@ -1286,6 +1308,14 @@ static void ApplyTransparentWindowState() {
         [g_window setLevel:g_transparentBg ? NSFloatingWindowLevel : NSNormalWindowLevel];
     }
     if (!g_transparentBg) g_rmbDragging = false;
+    // On-window chrome, exactly as the Windows leg (#833, "chrome is hidden in
+    // transparent/punch-through mode by design"): the top button bar (Open /
+    // Mode / Animation) is dropped while transparent and comes back on opaque.
+    // The Tab HUD panel and the toast chip are NOT touched — Windows keeps
+    // both (the toast is unioned into its click region). A hidden view is also
+    // out of UpdateClickThrough's chrome hit-test, so the bar's area passes
+    // clicks through like any other transparent surround.
+    if (g_topBar != nil) [g_topBar setHidden:g_transparentBg ? YES : NO];
     [g_window setHasShadow:g_transparentBg ? NO : YES];
     if (!g_transparentBg && g_ignoringMouse) {
         [g_window setIgnoresMouseEvents:NO];
