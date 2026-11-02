@@ -10,3 +10,8 @@ that are copied verbatim from DisplayXR/displayxr-runtime and remain licensed
 under the Boost Software License 1.0 (BSL-1.0); see each file's
 SPDX-License-Identifier. Some carry Copyright Collabora, Ltd. (the XR_MNDX_*
 headers).
+
+The hand mesh model_common/assets/hands/ultraleap_generic_hand_left.glb is a
+modified form of the GenericHand model from the Ultraleap Unity plug-in,
+Copyright (C) Ultraleap, Inc., licensed under the Apache License, Version 2.0;
+see model_common/assets/hands/THIRD_PARTY.md.
