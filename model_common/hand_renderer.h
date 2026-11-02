@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  Translucent hand mesh: spheres at the 26 XR_EXT_hand_tracking
- *         joints, capsules (cylinders between the joint spheres) along each
- *         bone, sized by the reported joint radii. Drawn through
+ * @brief  Translucent "ghost" hands from the 26 XR_EXT_hand_tracking joints.
+ *         Two looks: the default is ONE continuous skinned hand surface, the
+ *         Ultraleap GenericHand that the plug-in's Ghost Hands use, CPU-skinned
+ *         from the joints every frame (hand_skin.h); the older look,
+ *         DXR_MODELVIEWER_HANDS_LOOK=capsules, is spheres at the joints and
+ *         capsules along each bone, sized by the reported joint radii (also the
+ *         fallback if the embedded mesh fails to load). Drawn through
  *         ModelRenderer's overlay hook — inside the renderer's own render
  *         pass, after the opaque model, depth test on / depth write off,
  *         alpha-blended — so it lands in every view's tile the same way the
@@ -21,6 +25,7 @@
 
 #include <cstdint>
 
+#include "hand_skin.h"
 #include "model_vulkan_utils.h"
 
 namespace modelviewer {
@@ -29,6 +34,8 @@ struct HandRenderJoint {
     bool valid = false;
     float pos[3] = {0.f, 0.f, 0.f};   //!< world (the model's space)
     float radius = 0.01f;             //!< world units
+    bool orientValid = false;
+    float orient[4] = {0.f, 0.f, 0.f, 1.f};   //!< x, y, z, w; world (XR joint axes: +Y = back of the hand)
 };
 
 struct HandRenderHand {
@@ -64,8 +71,12 @@ public:
     //! (hairline: ~0.6 mm on an 8 mm fingertip).
     static constexpr float kOutlineFraction = 0.08f;
 
+    enum class Look { Mesh, Capsules };
+    //! Which look init() settled on (DXR_MODELVIEWER_HANDS_LOOK, mesh load).
+    Look look() const { return look_; }
+
 private:
-    struct Vertex { float p[3]; float n[3]; };
+    struct Vertex { float p[3]; float n[3]; float a; };   // a = per-vertex opacity (mesh wrist fade)
     struct Slot {
         ModelBuffer vb, ib;
         void* vbMapped = nullptr;
@@ -73,15 +84,16 @@ private:
         uint32_t indexCount[2] = {0, 0};
         uint32_t firstIndex[2] = {0, 0};
         float fade[2] = {0.f, 0.f};
-        float outline[2] = {0.f, 0.f};   // world units
+        float outline[2] = {0.f, 0.f};   // world units (0 = no outline pass: the mesh look has none)
         float color[2][3] = {{0.f, 0.f, 0.f}, {0.f, 0.f, 0.f}};
     };
     static constexpr uint32_t kSlots = 3;
-    // Capacity per slot, two hands: 25 bones x 2 rings of (kSeg+1) verts +
-    // 26 joint spheres x (kRings+1) x (kSeg+1) verts, kSeg = 11, kRings = 6
-    // (see the generator in the .cpp). Fits uint16 indices with room to spare.
-    static constexpr uint32_t kMaxVerts = 2 * (25 * 24 + 26 * 84);
-    static constexpr uint32_t kMaxIndices = 2 * (25 * 66 + 26 * 396);
+    // Capsule-look capacity per slot, two hands: 25 bones x 2 rings of
+    // (kSeg+1) verts + 26 joint spheres x (kRings+1) x (kSeg+1) verts,
+    // kSeg = 11, kRings = 6 (see the generator in the .cpp). The mesh look
+    // raises the slot size to two skinned hands (init()). uint16 indices.
+    static constexpr uint32_t kCapsuleVerts = 2 * (25 * 24 + 26 * 84);
+    static constexpr uint32_t kCapsuleIndices = 2 * (25 * 66 + 26 * 396);
 
     bool createPipelines(VkRenderPass renderPass, VkSampleCountFlagBits samples, uint32_t colorAttachmentCount);
 
@@ -97,6 +109,12 @@ private:
     VkPipeline pipelinePrime_ = VK_NULL_HANDLE;   // depth prime
     VkPipeline pipelineOutline_ = VK_NULL_HANDLE; // outline hull
     Slot slots_[kSlots];
+    uint32_t maxVerts_ = kCapsuleVerts;
+    uint32_t maxIndices_ = kCapsuleIndices;
+    Look look_ = Look::Mesh;
+    HandSkinMesh mesh_[2];                              // [0] left, [1] right (its mirror)
+    HandSkinBone bones_[2][kHandSkinJointCount];        // last good pose: a hand fading out keeps it
+    bool haveBones_[2] = {false, false};
     uint32_t slot_ = 0;
     float fade_[2] = {0.f, 0.f};
     bool visible_ = false;

@@ -22,6 +22,7 @@
 
 layout(location = 0) in vec3 vNormal;
 layout(location = 1) in vec3 vToEye;
+layout(location = 2) in float vAlpha;   // per-vertex opacity: the mesh fades out over the wrist cut
 
 layout(push_constant) uniform PushBlock {
     mat4 viewProj;
@@ -41,11 +42,14 @@ vec3 encodeSrgb(vec3 c) {
 }
 
 void main() {
+    // The faded-out wrist cut of the mesh neither primes depth nor draws.
+    if (vAlpha < 0.02) discard;
+
     // Model-projection depth for this fragment: z_ndc = (m10 * z_v + m14) / -z_v
     // with z_v = -1 / gl_FragCoord.w  ->  -m10 + m14 * gl_FragCoord.w.
     gl_FragDepth = clamp(-pc.depth.x + pc.depth.y * gl_FragCoord.w, 0.0, 1.0);
 
-    const float fade = pc.color.a;
+    const float fade = pc.color.a * vAlpha;
     vec3 rgb;
     float a;
     if (pc.params.y > 0.5) {

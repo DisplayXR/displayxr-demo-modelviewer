@@ -1,5 +1,6 @@
 #version 450
-// Translucent "ghost" hand (joint spheres + bone capsules), drawn after the
+// Translucent "ghost" hand (the skinned Ultraleap GenericHand surface, or the
+// joint-sphere + bone-capsule look), drawn after the
 // opaque model inside the same render pass in three passes — depth prime,
 // body, outline — see hand_renderer.cpp. Clean +Y-up world coordinates; the
 // renderer's negative-height viewport does the Vulkan Y flip, as for pbr.vert.
@@ -11,6 +12,7 @@
 
 layout(location = 0) in vec3 inPos;
 layout(location = 1) in vec3 inNormal;
+layout(location = 2) in float inAlpha;   // per-vertex opacity (the mesh's baked wrist fade; 1 for capsules)
 
 layout(push_constant) uniform PushBlock {
     mat4 viewProj;   // handProj * view — the MODEL projection with a much nearer near plane
@@ -22,10 +24,12 @@ layout(push_constant) uniform PushBlock {
 
 layout(location = 0) out vec3 vNormal;
 layout(location = 1) out vec3 vToEye;
+layout(location = 2) out float vAlpha;
 
 void main() {
     vec3 p = inPos + inNormal * pc.params.x;
     gl_Position = pc.viewProj * vec4(p, 1.0);
     vNormal = inNormal;
     vToEye = pc.eye.xyz - p;
+    vAlpha = inAlpha;
 }

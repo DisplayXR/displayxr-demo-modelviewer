@@ -554,9 +554,15 @@ first time hands are seen a short hint appears (HUD chip on macOS, toast on
 Windows, log line on Linux).
 
 The look follows the Ultraleap "Ghost Hand" (the Ultraleap Unity plugin's
-`Ultraleap/Tracking/Hands/Runtime/Models/GenericHand/`, Apache-2.0): a
-depth-prime pass so each pixel of a hand is blended once, a dark glass body
-whose colour is its fresnel rim, and a hairline inverted-hull outline.
+`Ultraleap/Tracking/Hands/Runtime/Models/GenericHand/`, Apache-2.0): each hand
+is ONE continuous surface, the plug-in's own rigged GenericHand mesh
+(`model_common/assets/hands/`, embedded in the binary; see its
+`THIRD_PARTY.md`), CPU-skinned every frame from the 26 tracked joints, drawn
+with a depth-prime pass so each pixel is blended once and a dark glass body
+whose colour is its fresnel rim, fading out over the wrist cut. Every bone head
+lands on its tracked joint, and the mesh scales with the tracked hand. The
+earlier look, spheres at the joints joined by capsules (plus a hairline
+inverted-hull outline), stays available with `DXR_MODELVIEWER_HANDS_LOOK=capsules`.
 
 The hands are rendered in the app's reference space through the *fixed* rig —
 a hand 20 cm in front of the panel floats 20 cm in front of the virtual
@@ -571,6 +577,7 @@ Tuning (environment, desktop legs):
 | `DXR_MODELVIEWER_PINCH_M=<m>` | Pinch-enter distance for a 9.5 cm palm (exit = 1.6×); scales with the tracked hand's palm length. Default 0.025 |
 | `DXR_MODELVIEWER_ORBIT_RAD_PER_M=<r>` | Drag sensitivity, radians per metre. Default 10 |
 | `DXR_MODELVIEWER_HANDS_OFFSET_M=x,y,z` | Constant offset added to every joint (metres, reference space) — a mounting/test aid |
+| `DXR_MODELVIEWER_HANDS_LOOK=<mesh or capsules>` | Hand look: `mesh` (default) = the skinned Ultraleap ghost hand; `capsules` = joint spheres + bone capsules |
 
 **Trying it without a camera.** The runtime's `sim_input` provider scripts two
 hands that circle and curl (the curl brings the thumb and index tips to ~1 cm,

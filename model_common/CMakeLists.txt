@@ -160,6 +160,20 @@ foreach(GLSL_REL ${SHADER_SOURCES})
     list(APPEND SHADER_HEADERS ${HEADER})
 endforeach()
 
+# ── Rigged hand mesh (embedded) ───────────────────────────────────────────
+# The Ultraleap GenericHand (Apache-2.0, assets/hands/THIRD_PARTY.md),
+# converted to .glb by scripts/convert_ultraleap_hand.py, is compiled into the
+# binary as a byte array: no installer, app bundle or APK has to carry it.
+set(HAND_MESH_GLB "${CMAKE_CURRENT_SOURCE_DIR}/assets/hands/ultraleap_generic_hand_left.glb")
+set(HAND_MESH_HEADER "${CMAKE_CURRENT_BINARY_DIR}/hand_mesh_glb.h")
+add_custom_command(
+    OUTPUT ${HAND_MESH_HEADER}
+    COMMAND ${CMAKE_COMMAND} -DIN=${HAND_MESH_GLB} -DOUT=${HAND_MESH_HEADER} -DVAR=kHandMeshGlb
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake
+    DEPENDS ${HAND_MESH_GLB} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake
+    COMMENT "Embedding the rigged hand mesh"
+)
+
 add_library(model_renderer STATIC
     model_renderer.h
     model_renderer.cpp
@@ -186,7 +200,11 @@ add_library(model_renderer STATIC
     hand_tracking.h
     hand_tracking.cpp         # XR_EXT_hand_tracking consumer + display->world joint map
     hand_renderer.h
-    hand_renderer.cpp         # translucent joint/capsule hand mesh (overlay hook)
+    hand_renderer.cpp         # translucent ghost hand (skinned mesh / capsules) via the overlay hook
+    hand_skin.h
+    hand_skin.cpp             # rigged-hand CPU skinning from the 26 joints (pure; tests/hand_skin_tests.cpp)
+    hand_skin_gltf.cpp        # the rigged hand's .glb reader (tinygltf)
+    ${HAND_MESH_HEADER}
     ${SHADER_HEADERS}
 )
 
@@ -241,4 +259,20 @@ if(MODELVIEWER_BUILD_TESTS)
     )
     target_include_directories(hand_gestures_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME hand_gestures_tests COMMAND hand_gestures_tests)
+
+    # The skinned ghost hand: bone-name -> XR joint map, bone frames, and the
+    # blend, run against the embedded asset itself. Pure C++ + tinygltf (its
+    # implementation compiled into the test), no OpenXR, no Vulkan.
+    add_executable(hand_skin_tests
+        tests/hand_skin_tests.cpp
+        hand_skin.cpp
+        hand_skin_gltf.cpp
+        ${HAND_MESH_HEADER}
+    )
+    target_include_directories(hand_skin_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(hand_skin_tests PRIVATE tinygltf)
+    if(MSVC)
+        target_compile_options(hand_skin_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME hand_skin_tests COMMAND hand_skin_tests)
 endif()
