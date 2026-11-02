@@ -18,7 +18,17 @@
  * ------------
  * - pinch       = thumb tip to index tip distance below `pinchEnterM`; it
  *                 stays a pinch until the distance exceeds `pinchExitM`
- *                 (hysteresis, so a jittery tip does not chatter).
+ *                 (hysteresis, so a jittery tip does not chatter). The
+ *                 thresholds are HAND-RELATIVE: a sample that carries its
+ *                 palm length scales them by palm / `referencePalmM`, so a
+ *                 hand the provider maps at a gain (Ultraleap relative
+ *                 mapping, ~0.48) or the runtime scales to the window
+ *                 pinches at the same finger posture as a physical one.
+ * - `HandGestureFrame::lengthScale` multiplies every position first, so the
+ *                 drag is measured in full-display metres whatever the
+ *                 window size (RIG_LOCAL joints are canvas-scaled, runtime
+ *                 ADR-034 Amendment 7): the viewer passes display height /
+ *                 canvas height.
  * - one hand pinched and moving = ORBIT: the pinch point's lateral motion
  *                 (metres) × `orbitRadPerM` goes to yaw (x) and pitch (y).
  * - both hands pinched:
@@ -42,11 +52,17 @@ struct HandGestureSample {
     bool tracked = false;             //!< both tips located this frame
     float thumbTip[3] = {0.f, 0.f, 0.f};
     float indexTip[3] = {0.f, 0.f, 0.f};
+    //! Wrist to middle-finger knuckle (XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT), in
+    //! the tips' units; 0 = unknown (the metre thresholds apply as given).
+    float palmLengthM = 0.f;
 };
 
 struct HandGestureFrame {
     HandGestureSample hand[2];        //!< 0 = left, 1 = right
     double timeSec = 0.0;             //!< monotonic seconds (for the EMA)
+    //! Applied to every position and palm length before use; 1 = the
+    //! locate space's metres. See the gesture spec above.
+    float lengthScale = 1.f;
 };
 
 struct HandGestureDelta {
@@ -60,8 +76,11 @@ struct HandGestureDelta {
 };
 
 struct HandGestureConfig {
-    float pinchEnterM = 0.025f;      //!< tip distance that starts a pinch
+    float pinchEnterM = 0.025f;      //!< tip distance that starts a pinch (for a referencePalmM hand)
     float pinchExitM = 0.040f;       //!< tip distance that ends it (> enter)
+    //! Palm length (wrist to middle knuckle) the pinch distances are stated
+    //! for; a sample's own palm length scales them. 0 = never scale.
+    float referencePalmM = 0.095f;
     float orbitRadPerM = 10.0f;      //!< 10 cm of pinch drag ~= 57 degrees
     float smoothTauS = 0.05f;        //!< EMA time constant on the pinch point; 0 = off
     float maxZoomStep = 1.25f;       //!< per-frame zoom ratio clamp (both ways)

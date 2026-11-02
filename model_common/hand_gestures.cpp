@@ -85,6 +85,7 @@ HandGestureDelta HandGestureController::update(const HandGestureFrame& frame) {
     }
     prevTime_ = frame.timeSec;
 
+    const float ls = frame.lengthScale > 0.f ? frame.lengthScale : 1.f;
     bool pinched[2] = {false, false};
     for (int h = 0; h < 2; ++h) {
         const HandGestureSample& s = frame.hand[h];
@@ -94,12 +95,25 @@ HandGestureDelta HandGestureController::update(const HandGestureFrame& frame) {
             pointValid_[h] = false;
             continue;
         }
-        tipDist_[h] = dist3(s.thumbTip, s.indexTip);
-        pinched[h] = pinch_[h].update(true, tipDist_[h], cfg_.pinchEnterM, cfg_.pinchExitM);
+        float thumb[3], index[3];
+        for (int i = 0; i < 3; ++i) {
+            thumb[i] = s.thumbTip[i] * ls;
+            index[i] = s.indexTip[i] * ls;
+        }
+        tipDist_[h] = dist3(thumb, index);
+        // Hand-relative thresholds (see the header): a known palm length
+        // scales the metre distances to this hand's size, gain and all.
+        float enter = cfg_.pinchEnterM, exit = cfg_.pinchExitM;
+        if (s.palmLengthM > 0.f && cfg_.referencePalmM > 0.f) {
+            const float hs = (s.palmLengthM * ls) / cfg_.referencePalmM;
+            enter *= hs;
+            exit *= hs;
+        }
+        pinched[h] = pinch_[h].update(true, tipDist_[h], enter, exit);
 
         // The pinch point is the midpoint of the two tips; smooth it.
         float raw[3];
-        for (int i = 0; i < 3; ++i) raw[i] = 0.5f * (s.thumbTip[i] + s.indexTip[i]);
+        for (int i = 0; i < 3; ++i) raw[i] = 0.5f * (thumb[i] + index[i]);
         if (!pointValid_[h] || cfg_.smoothTauS <= 0.f || dt <= 0.f) {
             for (int i = 0; i < 3; ++i) point_[h][i] = raw[i];
         } else {

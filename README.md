@@ -541,7 +541,7 @@ not used.
 
 | Gesture | Action |
 |---|---|
-| Pinch (thumb tip to index tip under 2.5 cm; released above 4 cm) + drag | Rotate the model: 10 cm of drag ≈ 57° |
+| Pinch (thumb tip to index tip under about a quarter of the palm length: 2.5 cm for a 9.5 cm palm; released above 4 cm at that size) + drag | Rotate the model: 10 cm of drag ≈ 57° (measured in full-display metres, so a window-wide drag turns it as far as a screen-wide one) |
 | Both hands pinched, spread / close | Zoom: the separation ratio is the scale ratio |
 | Both hands pinched, twist | Roll the model about the view axis (the model follows the hands) |
 | Both hands pinched, drag | Rotate, like one hand |
@@ -568,7 +568,7 @@ Tuning (environment, desktop legs):
 
 | Variable | Effect |
 |---|---|
-| `DXR_MODELVIEWER_PINCH_M=<m>` | Pinch-enter distance (exit = 1.6×). Default 0.025 |
+| `DXR_MODELVIEWER_PINCH_M=<m>` | Pinch-enter distance for a 9.5 cm palm (exit = 1.6×); scales with the tracked hand's palm length. Default 0.025 |
 | `DXR_MODELVIEWER_ORBIT_RAD_PER_M=<r>` | Drag sensitivity, radians per metre. Default 10 |
 | `DXR_MODELVIEWER_HANDS_OFFSET_M=x,y,z` | Constant offset added to every joint (metres, reference space) — a mounting/test aid |
 
