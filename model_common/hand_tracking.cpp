@@ -7,6 +7,7 @@
 
 #include "hand_tracking.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -177,6 +178,18 @@ void HandTracking::toGestureSample(const HandJointSet& h, HandGestureSample& out
     out.tracked = true;
     out.thumbTip[0] = t.pose.position.x; out.thumbTip[1] = t.pose.position.y; out.thumbTip[2] = t.pose.position.z;
     out.indexTip[0] = i.pose.position.x; out.indexTip[1] = i.pose.position.y; out.indexTip[2] = i.pose.position.z;
+    // Palm length (wrist -> middle knuckle): the pinch thresholds scale with
+    // it, so the gesture reads the same for a hand the provider maps at a gain
+    // or the runtime scales to the window.
+    const XrHandJointLocationEXT& w = h.joints[XR_HAND_JOINT_WRIST_EXT];
+    const XrHandJointLocationEXT& m = h.joints[XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT];
+    if ((w.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+        (m.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+        const float dx = m.pose.position.x - w.pose.position.x;
+        const float dy = m.pose.position.y - w.pose.position.y;
+        const float dz = m.pose.position.z - w.pose.position.z;
+        out.palmLengthM = std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
 }
 
 HandRigMap MakeHandRigMap(const XrViewDisplayRawDXR* raw,

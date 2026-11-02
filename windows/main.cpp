@@ -326,6 +326,10 @@ static XrSessionManager* g_xr = nullptr;
 // runtime has no hand-tracking provider.
 static modelviewer::HandTracking          g_handTracking;
 static modelviewer::HandGestureController g_handGestures;
+// The canvas height the runtime resolved for the latest view locate (raw
+// channel); with the display height it gives the gesture math its length
+// scale, so a pinch drag reads in full-display metres in any window size.
+static float g_handCanvasHeightM = 0.f;
 static modelviewer::HandRenderer          g_handRenderer;
 static float g_handRoll = 0.0f;          // model roll (two-hand twist); render thread only
 static bool  g_handsEverSeen = false;    // first detection -> toast
@@ -2874,6 +2878,13 @@ static void RenderThreadFunc(
                     g_handTracking.locate(xr->localSpace, frameState.predictedDisplayTime);
                     modelviewer::HandGestureFrame hf;
                     hf.timeSec = HandNowSec();
+                    // RIG_LOCAL joints are scaled to the canvas (runtime ADR-034
+                    // Amendment 7): undo that for the drag so a window-wide pinch
+                    // drag turns the model as far as a screen-wide one. The pinch
+                    // itself is hand-relative (palm length), scale-free.
+                    hf.lengthScale = (g_handCanvasHeightM > 0.f && xr->displayHeightM > 0.f)
+                                         ? xr->displayHeightM / g_handCanvasHeightM
+                                         : 1.f;
                     for (int h = 0; h < 2; h++)
                         modelviewer::HandTracking::toGestureSample(g_handTracking.hand(h), hf.hand[h]);
                     const modelviewer::HandGestureDelta hg = g_handGestures.update(hf);
@@ -3032,6 +3043,7 @@ static void RenderThreadFunc(
                                 viewRigRaw.canvasSizeMeters.height,
                                 viewRigRaw.canvasRectPx.extent.width,
                                 viewRigRaw.canvasRectPx.extent.height);
+                            g_handCanvasHeightM = viewRigRaw.canvasSizeMeters.height;
                         }
 
                         if (useRig && viewRigRaw.eyeCountOutput > 0) {

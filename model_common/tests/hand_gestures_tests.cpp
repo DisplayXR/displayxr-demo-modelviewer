@@ -253,6 +253,49 @@ void TestSmoothing() {
     Check(std::fabs(yaw) < 1.0f, "smoothing lags the raw step (it is doing something)");
 }
 
+void TestHandRelativePinch() {
+    std::printf("hand-relative pinch + length scale\n");
+    // A half-size hand (palm 0.0475 m: a provider mapping at gain 0.5) with
+    // its tips 0.02 m apart is a pinch at the metre threshold (enter 0.025)
+    // but not for THIS hand, whose thresholds halve (0.0125 / 0.020).
+    HandGestureController c(Deterministic());
+    HandGestureFrame f;
+    HandGestureSample s = Hand(0.f, 0.f, 0.3f, 0.02f);
+    s.palmLengthM = 0.0475f;
+    f.timeSec = 0.0; f.hand[1] = s;
+    Check(!c.update(f).any(), "half-size hand, tips 2 cm apart: open");
+    s = Hand(0.f, 0.f, 0.3f, 0.010f);
+    s.palmLengthM = 0.0475f;
+    f.timeSec = 1.0 / 60.0; f.hand[1] = s;
+    Check(c.update(f).oneHandOrbit, "half-size hand, tips 1 cm apart: pinch");
+    // No palm length: the metre thresholds apply as given.
+    HandGestureController c2(Deterministic());
+    f.timeSec = 0.0; f.hand[1] = Hand(0.f, 0.f, 0.3f, 0.02f);
+    Check(c2.update(f).oneHandOrbit, "unknown palm: 2 cm pinches at the metre threshold");
+    // referencePalmM = 0 switches the scaling off.
+    HandGestureConfig noScale = Deterministic();
+    noScale.referencePalmM = 0.f;
+    HandGestureController c3(noScale);
+    f.hand[1] = s;   // half-size hand, tips 1 cm: a pinch either way
+    Check(c3.update(f).oneHandOrbit, "referencePalmM 0: metre thresholds");
+    // lengthScale 3 (a third-height window): the same 0.10 m drag reads as
+    // 0.30 m -> 3x the yaw, and the pinch holds (tips and palm scale together).
+    HandGestureController c4(Deterministic());
+    float yaw = 0.f;
+    for (int i = 0; i <= 10; ++i) {
+        HandGestureFrame g;
+        g.timeSec = (double)i / 60.0;
+        g.lengthScale = 3.f;
+        HandGestureSample r = Hand(0.01f * i, 0.f, 0.3f, 0.02f);
+        r.palmLengthM = 0.095f;
+        g.hand[1] = r;
+        HandGestureDelta d = c4.update(g);
+        Check(d.oneHandOrbit, "scaled hand stays pinched");
+        yaw += d.yaw;
+    }
+    Check(Near(yaw, -3.0f, 1e-3f), "lengthScale 3: 0.10 m drag -> yaw -3.0 rad");
+}
+
 } // namespace
 
 int main() {
@@ -262,6 +305,7 @@ int main() {
     TestTrackingLoss();
     TestSeparationGuard();
     TestSmoothing();
+    TestHandRelativePinch();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
