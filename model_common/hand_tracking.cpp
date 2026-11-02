@@ -30,6 +30,13 @@ XrVector3f quatRotate(const XrQuaternionf& q, const XrVector3f& v) {
 
 XrQuaternionf quatConjugate(const XrQuaternionf& q) { return {-q.x, -q.y, -q.z, q.w}; }
 
+XrQuaternionf quatMul(const XrQuaternionf& a, const XrQuaternionf& b) {   // a * b (apply b, then a)
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
 } // namespace
 
 bool HandTracking::init(XrInstance instance, XrSystemId systemId, XrSession session, bool extensionEnabled) {
@@ -235,6 +242,13 @@ XrVector3f HandRigMapPoint(const HandRigMap& map, const XrVector3f& p) {
     // canvas-local -> world through the virtual display plane (rig) pose.
     const XrVector3f r = quatRotate(map.rig.orientation, d);
     return {r.x + map.rig.position.x, r.y + map.rig.position.y, r.z + map.rig.position.z};
+}
+
+XrQuaternionf HandRigMapOrientation(const HandRigMap& map, const XrQuaternionf& q) {
+    if (map.identity) return q;
+    // Same chain as HandRigMapPoint minus the translations and the uniform
+    // m2v scale (which does not rotate): display plane^-1, then the rig.
+    return quatMul(map.rig.orientation, quatMul(quatConjugate(map.displayPlane.orientation), q));
 }
 
 } // namespace modelviewer

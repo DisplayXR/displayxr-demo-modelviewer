@@ -137,6 +137,9 @@ HandRigMap MakeHandRigMap(const XrViewDisplayRawDXR* raw,
 //! A point located in the hand's space -> the model's world.
 XrVector3f HandRigMapPoint(const HandRigMap& map, const XrVector3f& p);
 
+//! A joint orientation located in the hand's space -> the model's world.
+XrQuaternionf HandRigMapOrientation(const HandRigMap& map, const XrQuaternionf& q);
+
 //! A joint radius (metres) -> world units.
 inline float HandRigMapRadius(const HandRigMap& map, float radiusM) { return radiusM * map.m2v; }
 

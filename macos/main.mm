@@ -2782,6 +2782,11 @@ int main() {
                                     const XrVector3f w = modelviewer::HandRigMapPoint(map, jl.pose.position);
                                     rj.pos[0] = w.x; rj.pos[1] = w.y; rj.pos[2] = w.z;
                                     rj.radius = modelviewer::HandRigMapRadius(map, jl.radius > 0.002f ? jl.radius : 0.008f);
+                                    rj.orientValid = (jl.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
+                                    if (rj.orientValid) {
+                                        const XrQuaternionf q = modelviewer::HandRigMapOrientation(map, jl.pose.orientation);
+                                        rj.orient[0] = q.x; rj.orient[1] = q.y; rj.orient[2] = q.z; rj.orient[3] = q.w;
+                                    }
                                 }
                             }
                             g_handRenderer.update(hands, deltaTime);

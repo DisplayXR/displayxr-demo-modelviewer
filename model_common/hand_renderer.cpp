@@ -8,11 +8,14 @@
 #include "hand_renderer.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "mv_log.h"
 #include "hand.vert.h"
 #include "hand.frag.h"
+#include "hand_mesh_glb.h"   // the embedded Ultraleap GenericHand (assets/hands/)
 
 namespace modelviewer {
 
@@ -21,10 +24,11 @@ namespace {
 constexpr float kPi = 3.14159265358979323846f;
 
 // Mesh resolution. Per hand: 25 bones x (2 rings of kSeg+1 verts) +
-// 26 joints x ((kRings+1) x (kSeg+1)) verts -- see kMaxVerts in the header
+// 26 joints x ((kRings+1) x (kSeg+1)) verts -- see kCapsuleVerts in the header
 // (25*24 + 26*84 verts, 25*66 + 26*396 indices with kSeg = 11, kRings = 6).
 constexpr uint32_t kSeg = 11;     // around
 constexpr uint32_t kRings = 6;    // sphere latitude bands
+constexpr size_t kVertexFloats = 7;   // HandRenderer::Vertex: position, normal, opacity
 
 // XR_EXT_hand_tracking joint parents (-1 = root). PALM hangs off the wrist
 // but gets no bone: it sits inside the wrist-to-metacarpal fan anyway.
@@ -81,15 +85,15 @@ void cameraFromView(const float* v, float out[3]) {
 
 struct MeshWriter {
     HandRenderer* owner;
-    float* v;          // vertex floats (6 per vertex)
+    float* v;          // vertex floats (kVertexFloats per vertex)
     uint16_t* i;
     uint32_t vcount = 0, icount = 0, vcap, icap;
 
     bool room(uint32_t nv, uint32_t ni) const { return vcount + nv <= vcap && icount + ni <= icap; }
 
     void vertex(const float p[3], const float n[3]) {
-        float* d = v + (size_t)vcount * 6;
-        d[0] = p[0]; d[1] = p[1]; d[2] = p[2]; d[3] = n[0]; d[4] = n[1]; d[5] = n[2];
+        float* d = v + (size_t)vcount * kVertexFloats;
+        d[0] = p[0]; d[1] = p[1]; d[2] = p[2]; d[3] = n[0]; d[4] = n[1]; d[5] = n[2]; d[6] = 1.f;
         ++vcount;
     }
     void tri(uint32_t a, uint32_t b, uint32_t c) {
@@ -169,12 +173,42 @@ bool HandRenderer::init(VkDevice device, VkPhysicalDevice physDevice, VkRenderPa
     destroy();
     device_ = device;
     physDevice_ = physDevice;
+    static_assert(sizeof(Vertex) == kVertexFloats * sizeof(float), "vertex layout");
+
+    // Look: one continuous skinned hand (default) or the joint/capsule mesh.
+    look_ = Look::Mesh;
+    if (const char* e = std::getenv("DXR_MODELVIEWER_HANDS_LOOK")) {
+        if (std::strcmp(e, "capsules") == 0) look_ = Look::Capsules;
+        else if (*e && std::strcmp(e, "mesh") != 0)
+            MV_ERR("HandRenderer: DXR_MODELVIEWER_HANDS_LOOK='%s' unknown (mesh|capsules) - using mesh\n", e);
+    }
+    maxVerts_ = kCapsuleVerts;
+    maxIndices_ = kCapsuleIndices;
+    haveBones_[0] = haveBones_[1] = false;
+    if (look_ == Look::Mesh) {
+        HandSkinMesh m;
+        std::string err;
+        if (!HandSkinLoadGlb(kHandMeshGlb, kHandMeshGlb_size, m, &err)) {
+            MV_ERR("HandRenderer: embedded hand mesh failed to load (%s) - falling back to capsules\n", err.c_str());
+            look_ = Look::Capsules;
+        } else {
+            mesh_[0] = m.leftHand ? m : HandSkinMirror(m);
+            mesh_[1] = HandSkinMirror(mesh_[0]);
+            const uint32_t nv = (uint32_t)(mesh_[0].vertexCount() + mesh_[1].vertexCount());
+            const uint32_t ni = (uint32_t)(mesh_[0].indices.size() + mesh_[1].indices.size());
+            if (nv > maxVerts_) maxVerts_ = nv;
+            if (ni > maxIndices_) maxIndices_ = ni;
+            MV_LOG("HandRenderer: ghost-hand mesh (Ultraleap GenericHand, %zu verts / %zu tris per hand, CPU-skinned from the 26 joints)\n",
+                   mesh_[0].vertexCount(), mesh_[0].indices.size() / 3);
+        }
+    }
+    if (look_ == Look::Capsules) MV_LOG("HandRenderer: joint/capsule hands (DXR_MODELVIEWER_HANDS_LOOK=capsules or mesh fallback)\n");
 
     for (Slot& s : slots_) {
-        s.vb = modelCreateBuffer(device_, physDevice_, (VkDeviceSize)kMaxVerts * sizeof(Vertex),
+        s.vb = modelCreateBuffer(device_, physDevice_, (VkDeviceSize)maxVerts_ * sizeof(Vertex),
                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        s.ib = modelCreateBuffer(device_, physDevice_, (VkDeviceSize)kMaxIndices * sizeof(uint16_t),
+        s.ib = modelCreateBuffer(device_, physDevice_, (VkDeviceSize)maxIndices_ * sizeof(uint16_t),
                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         if (s.vb.buffer == VK_NULL_HANDLE || s.ib.buffer == VK_NULL_HANDLE ||
@@ -215,13 +249,14 @@ bool HandRenderer::createPipelines(VkRenderPass renderPass, VkSampleCountFlagBit
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = "main";
 
     VkVertexInputBindingDescription bind = {0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attrs[2] = {
+    VkVertexInputAttributeDescription attrs[3] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
         {1, 0, VK_FORMAT_R32G32B32_SFLOAT, sizeof(float) * 3},
+        {2, 0, VK_FORMAT_R32_SFLOAT, sizeof(float) * 6},
     };
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &bind;
-    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = attrs;
+    vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -346,7 +381,7 @@ void HandRenderer::update(const HandRenderHand hands[2], float dtSeconds) {
 
     slot_ = (slot_ + 1) % kSlots;
     Slot& s = slots_[slot_];
-    MeshWriter w{this, (float*)s.vbMapped, (uint16_t*)s.ibMapped, 0, 0, kMaxVerts, kMaxIndices};
+    MeshWriter w{this, (float*)s.vbMapped, (uint16_t*)s.ibMapped, 0, 0, maxVerts_, maxIndices_};
 
     visible_ = false;
     for (int h = 0; h < 2; ++h) {
@@ -360,6 +395,39 @@ void HandRenderer::update(const HandRenderHand hands[2], float dtSeconds) {
         if (!diagLogged_ && diagHand_ < 0 && hand.joints[1].valid) {   // 1 = XR_HAND_JOINT_WRIST_EXT
             std::memcpy(diagWrist_, hand.joints[1].pos, sizeof(diagWrist_));
             diagHand_ = h;
+        }
+        if (look_ == Look::Mesh) {
+            // One continuous surface: skin the rigged hand from the joints.
+            // A frame whose joints cannot build the bones (a joint missing,
+            // or the hand already lost while it fades out) re-uses the last
+            // good pose instead of popping.
+            const HandSkinMesh& mesh = mesh_[h];
+            HandSkinJointIn in[kHandSkinJointCount];
+            for (int j = 0; j < kHandSkinJointCount; ++j) {
+                const HandRenderJoint& jt = hand.joints[j];
+                in[j].valid = jt.valid;
+                std::memcpy(in[j].pos, jt.pos, sizeof(in[j].pos));
+                in[j].orientValid = jt.valid && jt.orientValid;
+                std::memcpy(in[j].orient, jt.orient, sizeof(in[j].orient));
+            }
+            HandSkinBone bones[kHandSkinJointCount];
+            if (hand.active && HandSkinComputeFrames(mesh, in, bones)) {
+                std::memcpy(bones_[h], bones, sizeof(bones));
+                haveBones_[h] = true;
+            }
+            const uint32_t nv = (uint32_t)mesh.vertexCount();
+            const uint32_t ni = (uint32_t)mesh.indices.size();
+            if (!haveBones_[h] || !w.room(nv, ni)) continue;
+            const uint32_t base = w.vcount;
+            float* dst = w.v + (size_t)base * kVertexFloats;
+            HandSkinApply(mesh, bones_[h], dst, kVertexFloats);
+            for (uint32_t v = 0; v < nv; ++v) dst[(size_t)v * kVertexFloats + 6] = mesh.alpha[v];
+            w.vcount += nv;
+            for (uint32_t k = 0; k < ni; ++k) w.i[w.icount++] = (uint16_t)(base + mesh.indices[k]);
+            s.indexCount[h] = w.icount - s.firstIndex[h];
+            s.outline[h] = 0.f;   // the reference Ghost Hand's outline is fully transparent: no hull
+            if (s.indexCount[h] > 0) visible_ = true;
+            continue;
         }
         float minRadius = 0.f;
         for (int j = 0; j < 26; ++j) {
@@ -438,6 +506,7 @@ void HandRenderer::draw(VkCommandBuffer cmd, const float view[16], const float p
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, passes[pass]);
         for (int h = 0; h < 2; ++h) {
             if (s.indexCount[h] == 0) continue;
+            if (pass == 2 && s.outline[h] <= 0.f) continue;   // mesh look: no outline hull
             pb.color[0] = s.color[h][0]; pb.color[1] = s.color[h][1]; pb.color[2] = s.color[h][2];
             pb.color[3] = s.fade[h];
             pb.params[0] = pass == 2 ? s.outline[h] : 0.f;
