@@ -183,6 +183,8 @@ add_library(model_renderer STATIC
     model_loader_backends.h
     model_loader.cpp           # format dispatcher + path helpers
     model_loader_gltf.cpp      # .glb/.gltf backend (tinygltf, defines its impl)
+    gltf_accessor_check.h
+    gltf_accessor_check.cpp    # accessor + animation-channel range checks (tests/gltf_anim_tests.cpp)
     gltf_siblings.h
     gltf_siblings.cpp          # .gltf external buffer/image URI policy (#114)
     model_loader_material.h
@@ -275,4 +277,19 @@ if(MODELVIEWER_BUILD_TESTS)
         target_compile_options(hand_skin_tests PRIVATE /utf-8)
     endif()
     add_test(NAME hand_skin_tests COMMAND hand_skin_tests)
+
+    # The checks the glTF backend runs before reading an animation channel's
+    # sampler accessors (missing bufferView, short output, wrong output type,
+    # out-of-range sampler / target node). Hand-built tinygltf documents, no
+    # file, no tinygltf implementation, no GPU.
+    add_executable(gltf_anim_tests
+        tests/gltf_anim_tests.cpp
+        gltf_accessor_check.cpp
+    )
+    target_include_directories(gltf_anim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(gltf_anim_tests PRIVATE tinygltf)
+    if(MSVC)
+        target_compile_options(gltf_anim_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME gltf_anim_tests COMMAND gltf_anim_tests)
 endif()

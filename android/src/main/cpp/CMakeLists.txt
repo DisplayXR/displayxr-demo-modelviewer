@@ -109,6 +109,7 @@ add_library(model_viewer_vk_android SHARED
     ${MODEL_COMMON}/model_raycast.cpp
     ${MODEL_COMMON}/model_loader.cpp
     ${MODEL_COMMON}/model_loader_gltf.cpp
+    ${MODEL_COMMON}/gltf_accessor_check.cpp
     ${MODEL_COMMON}/model_loader_material.cpp
     ${MODEL_COMMON}/model_vulkan_utils.cpp
     ${SHADER_HEADERS})

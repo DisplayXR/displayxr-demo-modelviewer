@@ -22,6 +22,7 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/quaternion.hpp>
 
+#include "gltf_accessor_check.h"
 #include "model_loader.h"
 #include "model_loader_backends.h"
 #include "mv_log.h"
@@ -396,32 +397,9 @@ struct IndexIssues {
     size_t badInverseBind = 0;  // inverseBindMatrices unreadable -> identity
 };
 
-// `idx` as an accessor of `type` with one of `compTypes`, whose bufferView and
-// buffer exist and whose last element (strided the way accessorPtr() strides
-// it) ends inside both; nullptr otherwise.
-const tinygltf::Accessor* checkedAccessor(const tinygltf::Model& m, int idx, int type,
-                                          std::initializer_list<int> compTypes) {
-    if (idx < 0 || idx >= (int)m.accessors.size()) return nullptr;
-    const tinygltf::Accessor& acc = m.accessors[(size_t)idx];
-    if (acc.type != type) return nullptr;
-    if (std::find(compTypes.begin(), compTypes.end(), acc.componentType) == compTypes.end())
-        return nullptr;
-    // accessorPtr() dereferences the bufferView even for an empty accessor.
-    if (acc.bufferView < 0 || acc.bufferView >= (int)m.bufferViews.size()) return nullptr;
-    const tinygltf::BufferView& bv = m.bufferViews[(size_t)acc.bufferView];
-    if (bv.buffer < 0 || bv.buffer >= (int)m.buffers.size()) return nullptr;
-    const size_t bufSize = m.buffers[(size_t)bv.buffer].data.size();
-    if (bv.byteOffset > bufSize || bv.byteLength > bufSize - bv.byteOffset) return nullptr;
-    if (acc.count == 0) return &acc;
-    const size_t elem =
-        (size_t)tinygltf::GetNumComponentsInType((uint32_t)acc.type) *
-        (size_t)tinygltf::GetComponentSizeInBytes((uint32_t)acc.componentType);
-    const size_t stride = bv.byteStride ? bv.byteStride : elem;
-    if (acc.byteOffset > bv.byteLength) return nullptr;
-    const size_t avail = bv.byteLength - acc.byteOffset;
-    if (elem > avail || (acc.count - 1) > (avail - elem) / stride) return nullptr;
-    return &acc;
-}
+// Accessor range check shared with the animation checks; lives in
+// gltf_accessor_check.cpp so tests/gltf_anim_tests.cpp can reach it.
+using gltf_check::checkedAccessor;
 
 // Why `prim` cannot be read safely, or nullptr when it can. `skinned` = the
 // primitive will be read as skinned (valid node.skin + JOINTS_0 + WEIGHTS_0).
@@ -997,32 +975,56 @@ bool model_load_gltf(const char* gltfPath, ModelData& out) {
         if (p == "weights")     { out = AnimPath::Weights;     return true; }
         return false;
     };
-    for (const auto& src : model.animations) {
+    // Every channel is checked (gltf_check::animationChannelProblem) before its
+    // sampler is read: a channel that fails is dropped and the rest of the clip
+    // still plays. Only samplers a surviving channel uses are read; the others
+    // stay empty so channel -> sampler indices keep the file's numbering.
+    std::vector<size_t> nodeMorphWeights(out.nodes.size());
+    for (size_t i = 0; i < out.nodes.size(); ++i) nodeMorphWeights[i] = out.nodes[i].weights.size();
+    size_t droppedChannels = 0;
+    std::string firstDrop;  // reason for the first dropped channel, for the one log line
+    for (size_t ai = 0; ai < model.animations.size(); ++ai) {
+        const tinygltf::Animation& src = model.animations[ai];
         Animation anim;
         anim.name = src.name;
-        anim.samplers.reserve(src.samplers.size());
-        for (const auto& s : src.samplers) {
-            AnimSampler smp;
-            readAccessorFloats(model, s.input, smp.input);
-            readAccessorFloats(model, s.output, smp.output);
-            smp.interp = s.interpolation == "STEP"        ? AnimInterp::Step
-                       : s.interpolation == "CUBICSPLINE" ? AnimInterp::CubicSpline
-                                                          : AnimInterp::Linear;
-            if (!smp.input.empty())
-                anim.duration = std::max(anim.duration, smp.input.back());
-            anim.samplers.push_back(std::move(smp));
-        }
-        for (const auto& c : src.channels) {
+        anim.samplers.resize(src.samplers.size());
+        std::vector<char> samplerRead(src.samplers.size(), 0);
+        for (size_t ci = 0; ci < src.channels.size(); ++ci) {
+            const tinygltf::AnimationChannel& c = src.channels[ci];
             AnimChannel ch;
+            // Paths outside the core four (an extension's) are not ours to play.
+            if (!mapPath(c.target_path, ch.path)) continue;
+            if (const char* why =
+                    gltf_check::animationChannelProblem(model, src, c, nodeMorphWeights)) {
+                if (droppedChannels++ == 0) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf), "animation %zu channel %zu: %s", ai, ci, why);
+                    firstDrop = buf;
+                }
+                continue;
+            }
             ch.targetNode = c.target_node;
             ch.sampler = c.sampler;
-            if (ch.targetNode < 0 || ch.targetNode >= (int)out.nodes.size()) continue;
-            if (ch.sampler < 0 || ch.sampler >= (int)anim.samplers.size()) continue;
-            if (!mapPath(c.target_path, ch.path)) continue;
+            const size_t si = (size_t)c.sampler;
+            if (!samplerRead[si]) {
+                samplerRead[si] = 1;
+                const tinygltf::AnimationSampler& s = src.samplers[si];
+                AnimSampler& smp = anim.samplers[si];
+                readAccessorFloats(model, s.input, smp.input);
+                readAccessorFloats(model, s.output, smp.output);
+                smp.interp = s.interpolation == "STEP"        ? AnimInterp::Step
+                           : s.interpolation == "CUBICSPLINE" ? AnimInterp::CubicSpline
+                                                              : AnimInterp::Linear;
+                if (!smp.input.empty())
+                    anim.duration = std::max(anim.duration, smp.input.back());
+            }
             anim.channels.push_back(ch);
         }
         if (!anim.channels.empty()) out.animations.push_back(std::move(anim));
     }
+    if (droppedChannels)
+        MV_ERR("[model_loader] %zu animation channel(s) dropped (first: %s)\n",
+               droppedChannels, firstDrop.c_str());
 
     if (issues.badMesh || issues.badSkin || issues.badMaterial || issues.badJoint ||
         issues.badInverseBind)
