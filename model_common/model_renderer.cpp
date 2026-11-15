@@ -3896,14 +3896,16 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
         }
     }
 
-    // Swapchain → TRANSFER_DST. First eye (vpX==0): UNDEFINED ok. Second eye:
-    // preserve the first by treating the prior contents as COLOR_ATTACHMENT.
-    // TODO: "first tile" should be viewportX == 0 && viewportY == 0 — in a 2x2
-    // layout tile 2 at (0, tile_h) takes UNDEFINED and may discard tiles 0-1.
+    // Swapchain → TRANSFER_DST. First view in the image (tile at 0,0):
+    // UNDEFINED ok. Later views: preserve the prior tiles by treating the
+    // contents as COLOR_ATTACHMENT. (vpX alone misfires on row-tiled 2x2
+    // layouts, where view 2 starts a new row at vpX==0 and would discard
+    // views 0-1.)
+    const bool firstViewInImage = (viewportX == 0 && viewportY == 0);
     VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toDst.srcAccessMask = (viewportX == 0) ? 0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toDst.srcAccessMask = firstViewInImage ? 0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toDst.oldLayout = (viewportX == 0) ? VK_IMAGE_LAYOUT_UNDEFINED
+    toDst.oldLayout = firstViewInImage ? VK_IMAGE_LAYOUT_UNDEFINED
                                        : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -3911,12 +3913,12 @@ void ModelRenderer::renderEye(VkImage swapchainImage,
     toDst.image = swapchainImage;
     toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     // The source stage must be able to perform srcAccessMask: TOP_OF_PIPE
-    // performs no accesses, so the second eye's COLOR_ATTACHMENT_WRITE needs
+    // performs no accesses, so a later view's COLOR_ATTACHMENT_WRITE needs
     // COLOR_ATTACHMENT_OUTPUT (VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02819;
-    // DisplayXR/displayxr-leia-plugin#280). That is also the first eye's
+    // DisplayXR/displayxr-leia-plugin#280). That is also the previous view's
     // toColor destination stage, so the two barriers chain.
     const VkPipelineStageFlags toDstSrcStage =
-        (viewportX == 0) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        firstViewInImage ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     vkCmdPipelineBarrier(cmd, toDstSrcStage, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &toDst);
 
