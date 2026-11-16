@@ -18,7 +18,7 @@
  * - Ctrl+T / Cmd+T: transparent background (desktop shows through, clicks pass
  *   through the transparent surround, window floats above others) — #181.
  *   MODEL_TRANSPARENT=1 or --transparent starts transparent; MODEL_TRANSPARENT=0
- *   turns the capability off for the session. (Plain T = eye-tracking mode.)
+ *   turns the capability off for the session.
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
@@ -126,7 +126,6 @@ struct InputState {
     bool hudVisible = false;  // Hidden by default; toggle with Tab.
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
-    bool eyeTrackingModeToggleRequested = false;
     bool transparentBgToggleRequested = false;   // Ctrl+T / Cmd+T
     bool loadRequested = false;
     bool teleportRequested = false;
@@ -829,7 +828,8 @@ static bool AppOwnsRmbWindowMove(NSWindow *w) {
         return;
     }
     // Ctrl+T (the Windows/Linux chord) or Cmd+T (the Mac habit) = transparent
-    // background. Checked before the switch so plain T stays eye-tracking.
+    // background. (Plain T is unbound: eye-tracking MANAGED/MANUAL
+    // switching is a cube-test-app key; this demo stays on MANAGED.)
     if ((ch == 't' || ch == 'T') &&
         ([event modifierFlags] & (NSEventModifierFlagControl | NSEventModifierFlagCommand))) {
         g_input.transparentBgToggleRequested = true;
@@ -863,9 +863,6 @@ static bool AppOwnsRmbWindowMove(NSWindow *w) {
             break;
         case 'i': case 'I':
             g_input.captureAtlasRequested = true;
-            break;
-        case 't': case 'T':
-            g_input.eyeTrackingModeToggleRequested = true;
             break;
         // (model open moved to Ctrl+O — see the modifier check above the switch)
         case '-': case '_': {
@@ -916,7 +913,7 @@ static bool AppOwnsRmbWindowMove(NSWindow *w) {
             g_modelRenderer.setExposureEV(g_modelRenderer.exposureEV() + 0.25f);
             LOG_INFO("Exposure: %+.2f EV", g_modelRenderer.exposureEV());
             break;
-        case 'g': case 'G':   // grading: cycle the tone curve (T is eye-tracking)
+        case 'g': case 'G':   // grading: cycle the tone curve
             g_modelRenderer.cycleToneCurve();
             LOG_INFO("Tone curve: %s", g_modelRenderer.toneCurveName());
             break;
@@ -1424,7 +1421,6 @@ struct AppXrSession {
 
     // Function pointers
     PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT = nullptr;
-    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
@@ -1701,8 +1697,6 @@ static bool InitializeOpenXR(AppXrSession& xr) {
                 xr.displayScreenLeft, xr.displayScreenTop);
         }
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
-        if (xr.supportedEyeTrackingModes != 0)
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
 
         // Load unified rendering mode function pointers (v7)
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
@@ -3096,16 +3090,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Handle eye tracking mode toggle
-        if (g_input.eyeTrackingModeToggleRequested) {
-            g_input.eyeTrackingModeToggleRequested = false;
-            if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
-                xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
-            }
-        }
-
         PollEvents(xr);
 
         if (xr.sessionRunning) {
@@ -3848,7 +3832,7 @@ int main(int argc, char** argv) {
                         "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
                         "DblClick=Focus  -/= Depth  Space=Reset  N=Clip  K=Play/Pause\n"
                         "M=Auto-Orbit  V=Mode  Ctrl+O=Load  [/]=Exposure  G=Tone\n"
-                        "Ctrl/Cmd+T=Transparent  T=Eye-tracking mode\n"
+                        "Ctrl/Cmd+T=Transparent\n"
                         "Pinch+drag=Rotate  2-hand pinch: spread=Zoom twist=Roll\n"
                         "Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,

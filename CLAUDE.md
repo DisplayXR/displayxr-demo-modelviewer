@@ -355,7 +355,7 @@ The Linux leg transliterates `windows/main.cpp` plus displayxr-common's
 `input_handler.cpp` (which is `<windows.h>`-gated and cannot be linked here),
 sensitivities and clamps included — LMB-drag orbit at 0.005 rad/px with the
 ±1.4 rad pitch clamp, double-click focus, wheel zoom with the Shift/Ctrl/Alt
-variants, WASDEQ, SPACE, C, V, 0-8, T, I, M, N, K, L, G, `[`/`]`, `-`/`=`,
+variants, WASDEQ, SPACE, C, V, 0-8, I, M, N, K, L, G, `[`/`]`, `-`/`=`,
 Ctrl+O, F11, P-then-X/Y/Z, ESC. Keys come from the window helper as X11
 keysyms on both backends, so the one key switch serves X11 and Wayland. Two
 divergences, both forced by the Linux window systems:
@@ -443,7 +443,8 @@ NSWindow is created non-opaque with a clear background and its CAMetalLayer
 `opaque = NO`, and the toggle only changes what the app draws (alpha-0 clear,
 no skybox; `RenderPlaceholder` clears to alpha 0 too). Opaque frames are alpha
 255 everywhere, so a runtime that probes the atlas alpha per frame sees nothing
-to composite. Plain `T` stays the eye-tracking toggle. `MODEL_TRANSPARENT=1` /
+to composite. Plain `T` is unbound (eye-tracking MANAGED/MANUAL switching is a
+cube-test-app key; the demos stay on MANAGED). `MODEL_TRANSPARENT=1` /
 `--transparent` start transparent (`main(argc, argv)` now runs
 `dxr::ParseLaunchArgs`: positional model path, `--vh`, `--transparent`; the
 rest of the undock flags log "not supported on macOS"); `MODEL_TRANSPARENT=0`

@@ -35,7 +35,7 @@
  *   LMB on header bar: drag (phase-snapped) / minimize / close
  *   dbl-click     focus/teleport  wheel      zoom (+Shift/Ctrl/Alt variants)
  *   WASDEQ move   SPACE reset     C rig      V / 0-8 rendering mode
- *   T eye-track   I atlas capture M orbit    N/K clip   L/G/[/] grading
+ *   I atlas capture M orbit    N/K clip   L/G/[/] grading
  *   -/= depth     Ctrl+O open     F11 full   P then X/Y/Z recenter pins
  *   ESC quit
  * Ctrl+O opens a zenity file-selection dialog (async fork/exec, no hard
@@ -267,7 +267,6 @@ struct InputState {
     // One-shot requests, consumed by the main loop
     bool resetViewRequested = false;            // SPACE
     bool rigModeToggleRequested = false;        // C
-    bool eyeTrackingModeToggleRequested = false;// T
     bool captureAtlasRequested = false;         // I
     bool cycleRenderingModeRequested = false;   // V
     int32_t absoluteRenderingModeRequested = -1;// 0-8
@@ -682,15 +681,12 @@ struct AppXrSession {
 
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
-    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
     PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
     //! XR_DXR_weave's window-origin phase snap. Resolved defensively: the
     //! desktop-Linux runtime does not advertise XR_DXR_weave yet (the plumbing
     //! is runtime#1588 / PR#1592), so this stays null and the drag runs
     //! unsnapped. NEVER a hard requirement.
     PFN_xrWeaveSnapWindowRectDXR pfnWeaveSnapWindowRect = nullptr;
-
-    XrEyeTrackingModeDXR activeEyeTrackingMode = XR_EYE_TRACKING_MODE_MANAGED_DXR;
 
     uint32_t renderingModeCount = 0;
     uint32_t renderingModeViewCounts[8] = {};
@@ -847,8 +843,6 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
                               (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
         xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
                               (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
-                              (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
     }
     if (xr.hasAtlasCaptureExt) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
@@ -1906,7 +1900,7 @@ static void HandleWindowEvent(const DxrWindowEvent& ev) {
         // mediaplayer). Strict: Ctrl must be held.
         if ((sym == XK_o || sym == XK_O) && ctrl) { StartFilePicker(); break; }
         // Ctrl+T = transparent background. Must be checked BEFORE the bare
-        // switch below or plain-T (eye-tracking mode) swallows it — the same
+        // switch below or a bare-T binding would swallow it — the same
         // ordering displayxr-common's input_handler.cpp uses on Windows. A
         // request flag, not a direct flip: the render loop stays the single
         // owner of the transition, as on Windows.
@@ -1941,7 +1935,6 @@ static void HandleWindowEvent(const DxrWindowEvent& ev) {
             case XK_7: if (g_input.renderingModeCount > 7) g_input.absoluteRenderingModeRequested = 7; break;
             case XK_8: if (g_input.renderingModeCount > 8) g_input.absoluteRenderingModeRequested = 8; break;
 
-            case XK_t: case XK_T: g_input.eyeTrackingModeToggleRequested = true; break;
             case XK_c: case XK_C: g_input.rigModeToggleRequested = true; break;
             case XK_i: case XK_I: g_input.captureAtlasRequested = true; break;
             case XK_m: case XK_M: g_input.animateToggleRequested = true; break;
@@ -2325,7 +2318,7 @@ int main(int argc, char** argv) {
     LOG_INFO("  [LMB-drag] Rotate  [Dbl-click] Focus  [Scroll] Zoom  "
              "(+Shift depth, +Ctrl parallax, +Alt perspective)");
     LOG_INFO("  [RMB-drag] Move the window (phase-snapped)  [WASDEQ] Move  [Space] Reset");
-    LOG_INFO("  [V] Mode  [0-8] Mode N  [T] Eye tracking  [C] Rig  [-/=] Depth  [I] Capture");
+    LOG_INFO("  [V] Mode  [0-8] Mode N  [C] Rig  [-/=] Depth  [I] Capture");
     LOG_INFO("  [M] Auto-Orbit  [N] Clip  [K] Play/Pause  [L] Lighting  [G] Tone  [ [ / ] ] Exposure");
     LOG_INFO("  [Ctrl+O] Load  [F11] Fullscreen  [P then X/Y/Z] Pin recenter axis  [ESC] Quit");
 
@@ -2586,23 +2579,6 @@ int main(int argc, char** argv) {
         // V / 0-8 through the shared sequencer; it also writes this frame's
         // viewParams.ipdFactor, so it must run before the rig is built.
         UpdateModeSwitch(xr, g_input, dt);
-
-        // T — MANAGED <-> MANUAL eye tracking.
-        if (g_input.eyeTrackingModeToggleRequested) {
-            g_input.eyeTrackingModeToggleRequested = false;
-            if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                const XrEyeTrackingModeDXR newMode =
-                    (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
-                        ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
-                const XrResult etr = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
-                if (XR_SUCCEEDED(etr)) xr.activeEyeTrackingMode = newMode;
-                LOG_INFO("Eye tracking mode -> %s (%s)",
-                         newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
-                         XR_SUCCEEDED(etr) ? "OK" : "unsupported");
-            } else {
-                LOG_WARN("Eye tracking mode toggle: xrRequestEyeTrackingModeDXR unavailable");
-            }
-        }
 
         // N / K — clip playback. Applied BEFORE the camera update so the
         // auto-orbit gate sees this frame's play/pause state (Windows parity).
