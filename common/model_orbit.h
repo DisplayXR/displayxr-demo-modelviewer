@@ -28,6 +28,18 @@
  * right axis, roll about the view axis, and zoom is a uniform scale about C,
  * so C stays on the convergence plane. Keys, mouse, touch and hands all feed
  * the same state and therefore agree by construction.
+ *
+ * SCREEN-PLANE SLIDE (#192, robust framing). C is the turn PIVOT, but the
+ * depth put on the glass is a separate one (the surface's 75th percentile,
+ * model_fit.h), so S carries one more display-space term:
+ *
+ *     S = T(0, 0, sf · shift) · Scale(sf) · R(Q)⁻¹ · T(−C),
+ *     shift = pivot.z − screenPlaneZ   (model units, fixed at load; 0 = box)
+ *
+ * The slide is applied AFTER the rotation, along the view axis, and scales
+ * with zoom, so the screen-plane depth stays on the glass at rest and under
+ * zoom while the model still turns about its median. This is the web SDK's
+ * `fitTo(center, extent, { screenPlaneZ })` (displayxr-web#330).
  */
 #pragma once
 
@@ -40,8 +52,11 @@ namespace modelviewer {
 //! The fixed rig every leg declares: identity at the locate origin.
 inline XrPosef OrbitRigPose() { return {{0.f, 0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}}; }
 
-//! Column-major S = Scale(sf) · R(orbit.orientation)⁻¹ · T(−orbit.position).
-inline void BuildSceneTransform(float out[16], const XrPosef& orbit, float scale) {
+//! Column-major S = T(0,0,sf·screenPlaneShift) · Scale(sf) ·
+//! R(orbit.orientation)⁻¹ · T(−orbit.position). `screenPlaneShift` = 0 is the
+//! pre-#192 transform, bit for bit.
+inline void BuildSceneTransform(float out[16], const XrPosef& orbit, float scale,
+                                float screenPlaneShift = 0.f) {
     const XrQuaternionf& q = orbit.orientation;
     // Rotation matrix of q (column-major), then transpose it for the inverse.
     const float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
@@ -63,7 +78,7 @@ inline void BuildSceneTransform(float out[16], const XrPosef& orbit, float scale
     out[8] = m02; out[9] = m12; out[10] = m22; out[11] = 0.f;
     out[12] = -(m00 * cx + m01 * cy + m02 * cz);
     out[13] = -(m10 * cx + m11 * cy + m12 * cz);
-    out[14] = -(m20 * cx + m21 * cy + m22 * cz);
+    out[14] = -(m20 * cx + m21 * cy + m22 * cz) + s * screenPlaneShift;
     out[15] = 1.f;
 }
 

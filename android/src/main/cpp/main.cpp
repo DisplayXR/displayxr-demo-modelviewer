@@ -331,6 +331,11 @@ std::atomic<uint64_t> g_spin_base{0};  // frame the turntable phase restarts fro
 // distance is auto-derived from the scene extent at load (bigger =
 // smaller/further); tune the multiplier in load_butterfly if needed.
 float g_scene_center[3] = {0.0f, 0.0f, 0.0f};
+// Screen-plane slide (#192, model units, pivot.z - p75; 0 under box framing):
+// the model turns about g_scene_center (the pivot) and this slide, applied in
+// display space after the rotation and scaled with the model, puts the p75 depth
+// on the glass (desktop twin: common/model_orbit.h).
+float g_screen_shift = 0.0f;
 std::atomic<float> g_scene_push{1.5f};
 // glTF models come in arbitrary units (the Fox is ~155 units long); normalize
 // the model to ~kTargetSize metres so it fits the display + the 0.01–100 clip.
@@ -499,7 +504,7 @@ build_splat_model(float angle)
 	scale.m[0] = sc; scale.m[5] = sc; scale.m[10] = sc;
 
 	Mat4 push = mat4_identity();
-	push.m[14] = -g_scene_push.load(std::memory_order_relaxed);
+	push.m[14] = -g_scene_push.load(std::memory_order_relaxed) + sc * g_screen_shift;
 
 	// push * rotx * roty * flip * scale * recenter (orbit about the recentred origin)
 	return mat4_mul(push,
@@ -1098,13 +1103,52 @@ load_model_path(const char *path)
 	}
 	LOGI("Loaded model: %s", path);
 
-	// Auto-frame: recenter on the robust scene centroid and pick a push-back
-	// distance from the scene extent so it starts at a comfortable size.
+	// Auto-frame: recenter on the model and pick a push-back distance from the
+	// scene extent so it starts at a comfortable size.
 	float ext[3] = {1.0f, 1.0f, 1.0f};
 	if (g_model.getRobustSceneBounds(0.05f, 0.95f, g_scene_center, ext)) {
+		// The world-unit normalisation stays on the full BOX (it only rescales
+		// units for the clip range; the fit below is scale-invariant).
 		float maxe = ext[0] > ext[1] ? ext[0] : ext[1];
 		if (ext[2] > maxe) {
 			maxe = ext[2];
+		}
+		// Robust centring (#192, the default on every leg; common/model_fit.h
+		// is the desktop twin, mirrored by the web SDK's addModel,
+		// displayxr-web#327/#330): the recentre point becomes the PIVOT
+		// (area-weighted median x, box centre y, area-weighted median z), the
+		// area-weighted 75th-percentile depth goes on the glass through the
+		// separate g_screen_shift slide (~25% of the surface in front), and the
+		// extents the fit frames are the 1st-99th percentile, capped so the
+		// full box (measured about the pivot) stays within 90% of the viewport.
+		// A thin outlier (tail, antenna) no longer drags any of the three.
+		// `setprop debug.dxr.mv.center box` restores the bounding-box rule.
+		{
+			char prop[PROP_VALUE_MAX] = {};
+			const bool want_box =
+			    __system_property_get("debug.dxr.mv.center", prop) > 0 && std::strcmp(prop, "box") == 0;
+			const float box_c[3] = {g_scene_center[0], g_scene_center[1], g_scene_center[2]};
+			const float box_e[3] = {ext[0], ext[1], ext[2]};
+			float rc[3], rext[3], zdp = 0.0f;
+			const char *how = "box (debug.dxr.mv.center=box)";
+			g_screen_shift = 0.0f;
+			if (!want_box) {
+				if (g_model.getCenteringFrame(kAutoFitFill, rc, rext, &zdp)) {
+					for (int i = 0; i < 3; ++i) {
+						g_scene_center[i] = rc[i];
+						ext[i] = rext[i];
+					}
+					g_screen_shift = rc[2] - zdp;
+					how = "robust";
+				} else {
+					how = "box (no surface stats)";
+				}
+			}
+			LOGI("Centering: %s - box centre=(%.3f,%.3f,%.3f) extent=(%.3f,%.3f,%.3f) -> "
+			     "pivot=(%.3f,%.3f,%.3f) screen-plane z=%.3f fit extent=(%.3f,%.3f,%.3f)",
+			     how, box_c[0], box_c[1], box_c[2], box_e[0], box_e[1], box_e[2], g_scene_center[0],
+			     g_scene_center[1], g_scene_center[2], g_scene_center[2] - g_screen_shift, ext[0],
+			     ext[1], ext[2]);
 		}
 		// Normalize to kTargetSize metres. Framing depends on the locate path
 		// (#396 W7): under XR_DXR_view_rig the world is display-anchored — the

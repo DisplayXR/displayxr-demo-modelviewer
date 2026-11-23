@@ -2207,84 +2207,38 @@ bool ModelRenderer::getRobustSceneBounds(float, float,
     return true;
 }
 
-// Area-weighted surface sampling: kSamples points drawn uniformly over the
-// triangles (probability ∝ area, a fixed-seed LCG so a model always frames the
-// same), positioned in world space through each primitive's baked modelMatrix
-// (bind pose; skinned primitives use theirs, which is the bind placement).
-// Per-axis weighted percentiles of those samples feed getCenteringFrame().
+// Robust framing input (#192): every primitive's triangles, placed through its
+// baked modelMatrix (bind pose; skinned primitives use theirs, which is the bind
+// placement), sampled uniformly by area by the shared dxr::RobustFrameSampler —
+// the same sampling the web SDK's addModel runs, so the two frame alike.
 void ModelRenderer::computeSurfaceStats(const std::vector<ModelVertex>& verts,
                                         const std::vector<uint32_t>& indices) {
-    hasSurfStats_ = false;
+    robustFrame_ = dxr::RobustFrame{};
     if (verts.empty() || indices.size() < 3 || primitives_.empty()) return;
-    struct Tri { glm::vec3 a, b, c; };
-    std::vector<Tri> tris;
-    std::vector<double> cum;
-    tris.reserve(indices.size() / 3);
-    cum.reserve(indices.size() / 3);
-    double total = 0.0;
+    dxr::RobustFrameSampler sampler;
     for (const ModelPrimitive& p : primitives_) {
-        const glm::mat4 m = glm::make_mat4(p.modelMatrix);
-        for (uint32_t ii = 0; ii + 2 < p.indexCount; ii += 3) {
-            const uint32_t i0 = indices[p.firstIndex + ii], i1 = indices[p.firstIndex + ii + 1],
-                           i2 = indices[p.firstIndex + ii + 2];
-            if (i0 >= verts.size() || i1 >= verts.size() || i2 >= verts.size()) continue;
-            auto w = [&](uint32_t i) {
-                return glm::vec3(m * glm::vec4(verts[i].pos[0], verts[i].pos[1], verts[i].pos[2], 1.0f));
-            };
-            Tri t{w(i0), w(i1), w(i2)};
-            const double area = 0.5 * (double)glm::length(glm::cross(t.b - t.a, t.c - t.a));
-            if (!(area > 0.0) || !std::isfinite(area)) continue;
-            total += area;
-            tris.push_back(t);
-            cum.push_back(total);
-        }
+        if (p.firstIndex >= indices.size()) continue;
+        const size_t count = std::min<size_t>(p.indexCount, indices.size() - p.firstIndex);
+        sampler.addTriangles(verts[0].pos, sizeof(ModelVertex), verts.size(),
+                             indices.data() + p.firstIndex, count, p.modelMatrix);
     }
-    if (tris.empty() || !(total > 0.0)) return;
-
-    constexpr int kSamples = 65536;
-    std::vector<float> axis[3];
-    for (auto& a : axis) a.reserve(kSamples);
-    uint64_t s = 0x9E3779B97F4A7C15ull;
-    auto rnd = [&]() {  // 53-bit uniform in [0,1)
-        s = s * 6364136223846793005ull + 1442695040888963407ull;
-        return (double)(s >> 11) * (1.0 / 9007199254740992.0);
-    };
-    for (int k = 0; k < kSamples; ++k) {
-        const double r = rnd() * total;
-        const size_t ti = (size_t)(std::lower_bound(cum.begin(), cum.end(), r) - cum.begin());
-        const Tri& t = tris[std::min(ti, tris.size() - 1)];
-        float u = (float)rnd(), v = (float)rnd();
-        if (u + v > 1.0f) { u = 1.0f - u; v = 1.0f - v; }
-        const glm::vec3 p = t.a + u * (t.b - t.a) + v * (t.c - t.a);
-        axis[0].push_back(p.x); axis[1].push_back(p.y); axis[2].push_back(p.z);
-    }
-    for (int i = 0; i < 3; ++i) {
-        std::vector<float>& a = axis[i];
-        std::sort(a.begin(), a.end());
-        auto pct = [&](float q) { return a[std::min(a.size() - 1, (size_t)(q * (float)(a.size() - 1) + 0.5f))]; };
-        surfP01_[i]    = pct(0.01f);
-        surfMedian_[i] = pct(0.50f);
-        surfP75_[i]    = pct(0.75f);
-        surfP99_[i]    = pct(0.99f);
-    }
-    hasSurfStats_ = true;
+    if (!sampler.compute(robustFrame_)) return;
+    const dxr::RobustFrame& f = robustFrame_;
     MV_LOG("surface stats (%d area-weighted samples over %zu tris): median=(%.3f, %.3f, %.3f) "
             "p75z=%.3f p01=(%.3f, %.3f, %.3f) p99=(%.3f, %.3f, %.3f)\n",
-            kSamples, tris.size(), surfMedian_[0], surfMedian_[1], surfMedian_[2], surfP75_[2],
-            surfP01_[0], surfP01_[1], surfP01_[2], surfP99_[0], surfP99_[1], surfP99_[2]);
+            dxr::kRobustFrameSamples, sampler.triangleCount(), f.median[0], f.median[1], f.median[2],
+            f.zdpDepth, f.p01[0], f.p01[1], f.p01[2], f.p99[0], f.p99[1], f.p99[2]);
 }
 
-bool ModelRenderer::getCenteringFrame(float outCenter[3], float outTrimmed[3],
-                                      float outSymFull[3]) const {
+bool ModelRenderer::getCenteringFrame(float fill, float outPivot[3], float outFitExtent[3],
+                                      float* outScreenPlaneZ) const {
     float mn[3], mx[3];
-    if (!hasSurfStats_ || !getSceneBBox(mn, mx)) return false;
-    outCenter[0] = surfMedian_[0];
-    outCenter[1] = 0.5f * (mn[1] + mx[1]);
-    outCenter[2] = surfP75_[2];
-    for (int i = 0; i < 3; ++i) {
-        outTrimmed[i] = std::max(surfP99_[i] - surfP01_[i], 1e-6f);
-        outSymFull[i] = 2.0f * std::max(std::fabs(mx[i] - outCenter[i]), std::fabs(outCenter[i] - mn[i]));
-    }
+    if (!robustFrame_.valid || !getSceneBBox(mn, mx)) return false;
+    // The pivot's y and the 90% full-box guard use the SCENE box (swept over the
+    // clips for an animated model, see recomputeAnimatedBounds); the guard is
+    // measured about the pivot, exactly as the web SDK does.
+    dxr::RobustFitExtent(robustFrame_, mn, mx, fill, outFitExtent, outPivot);
+    if (outScreenPlaneZ) *outScreenPlaneZ = robustFrame_.zdpDepth;
     return true;
 }
 

@@ -27,6 +27,7 @@
 #include "model_vulkan_utils.h"
 #include "model_loader.h"
 #include "model_raycast.h"
+#include "robust_frame_vendored.h"  // dxr::RobustFrameSampler (displayxr-common#92)
 // MV_TEX_SLOTS / MV_MAT_VEC4S. A GLSL file, included here on purpose: it holds
 // nothing but #defines, and shaders/pbr.frag includes the same bytes. The
 // material SSBO's stride is a function of both numbers, so they cannot be
@@ -172,18 +173,24 @@ struct ModelRenderer {
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
-    //! Robust centring frame from AREA-WEIGHTED surface samples (bind pose,
-    //! world space), computed once at load. A thin outlier (a tail, an antenna)
-    //! carries little surface area, so it stops dragging the centre and the
-    //! screen plane the way the AABB does. Prototype (feat/robust-centering):
-    //!   centre.x  = area-weighted median x        (turn pivot)
-    //!   centre.y  = AABB centre y                  (unchanged)
-    //!   centre.z  = area-weighted 75th-percentile z, +z toward the viewer, so
-    //!               ~25% of the surface sits in front of the screen plane
-    //!   trimmed   = per-axis area-weighted 1st-99th percentile extent
-    //!   symFull   = 2 x the farthest AABB face from `centre`, per axis: the box
-    //!               a fit must still hold (at a looser fill) so nothing clips.
-    bool getCenteringFrame(float outCenter[3], float outTrimmed[3], float outSymFull[3]) const;
+    //! Robust framing (the default; displayxr-demo-modelviewer#192, mirrors the
+    //! web SDK's addModel, displayxr-web#327). From AREA-WEIGHTED surface
+    //! samples (bind pose, world space), computed once at load by
+    //! dxr::RobustFrameSampler (robust_frame_vendored.h): a thin outlier (a
+    //! tail, an antenna) carries little area, so it stops dragging the centre,
+    //! the screen plane and the scale the way the AABB does.
+    //!   outPivot     = (area-weighted median x, AABB centre y, area-weighted
+    //!                  median z): the point the turntable turns about
+    //!   outScreenPlaneZ = area-weighted 75th-percentile z, +z toward the
+    //!                  viewer: the depth put on the glass (~25% of the surface
+    //!                  in front of it) by a SEPARATE slide, not by moving the
+    //!                  pivot (common/model_orbit.h)
+    //!   outFitExtent = per-axis 1st-99th percentile, but never so small that
+    //!                  the full AABB measured about the pivot exceeds 90% of
+    //!                  the viewport once the fit scales to `fill`
+    //! Returns false when the model has no usable surface (callers keep the box).
+    bool getCenteringFrame(float fill, float outPivot[3], float outFitExtent[3],
+                           float* outScreenPlaneZ) const;
     // Smoothed world-space centroid of the active skeleton (mean joint
     // position), updated by updateAnimation. Lets the platform bind the
     // display rig to a moving/skinned subject so it stays centered + at the
@@ -963,12 +970,8 @@ private:
     float bboxMax_[3] = {0, 0, 0};
     bool  hasBBox_ = false;
 
-    // getCenteringFrame() inputs, from computeSurfaceStats at load.
-    float surfMedian_[3] = {0, 0, 0};
-    float surfP75_[3]    = {0, 0, 0};
-    float surfP01_[3]    = {0, 0, 0};
-    float surfP99_[3]    = {0, 0, 0};
-    bool  hasSurfStats_  = false;
+    // getCenteringFrame() input, from computeSurfaceStats at load.
+    dxr::RobustFrame robustFrame_;
     void computeSurfaceStats(const std::vector<ModelVertex>& verts,
                              const std::vector<uint32_t>& indices);
 

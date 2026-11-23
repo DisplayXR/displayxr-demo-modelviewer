@@ -638,45 +638,43 @@ static void ApplyLaunchPoseAndMargin(const dxr::LaunchArgs& a, const char* where
 // any heuristic (PCA, etc.) can pick the wrong side; the user can rotate
 // with mouse drag from a predictable starting pose.
 // Caller must hold g_sceneMutex (we read pickData_ from the renderer).
-// Robust-centring offset (robust centre - AABB centre), zero in box mode. The
+// Robust-centring offset (robust centre - AABB centre, #192), zero under box. The
 // per-frame skeleton anchor of a skinned model is the AABB-centre analogue, so the
-// anchor binding below adds this to keep the robust screen plane while it animates.
+// anchor binding in the render loop adds this to keep the robust screen plane
+// while the model animates.
 static float g_robustDelta[3] = {0.0f, 0.0f, 0.0f};
+// Screen-plane slide (#192, model units, pivot.z - p75; 0 under box): the
+// turntable turns about g_fitCenter (the pivot) and this puts the p75 depth on
+// the glass (common/model_orbit.h). Written at load, read by the render thread.
+static std::atomic<float> g_screenPlaneShift{0.0f};
 
 static void ApplyAutoFitForLoadedScene_locked() {
     // Gate the right-justified animation button on whether this model has clips.
     g_hasAnimations.store(g_modelRenderer.hasAnimations());
     float center[3], extent[3];
-    // Full model AABB: center for the rig position, extent[0]/extent[1] (FULL
-    // sizes, not half-extents) for the width-aware fit.
+    // Full model AABB: the box centre/extent (FULL sizes, not half-extents) that
+    // the centring rule below starts from.
     bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
-    // Prototype (feat/robust-centering): DXR_MODELVIEWER_CENTER=box|robust, default robust.
-    // robust = area-weighted surface centring (ModelRenderer::getCenteringFrame): pivot x at
-    // the surface median, screen plane at the 75th-percentile depth (~25% of the surface in
-    // front), and fit extents trimmed to the 1st-99th percentile — but never so far that the
-    // FULL box (measured from the new centre) exceeds kRobustCapFill of the viewport.
+    // Robust centring (#192, the default; common/model_fit.h): pivot x at the
+    // area-weighted surface median, the screen plane at the 75th-percentile depth
+    // (~25% of the surface in front of the glass), fit extents trimmed to the
+    // 1st-99th percentile but never so far that the full box (from the new centre)
+    // exceeds 90% of the viewport. Mirrors the web SDK's addModel
+    // (displayxr-web#327). DXR_MODELVIEWER_CENTER=box restores the AABB rule.
+    g_robustDelta[0] = g_robustDelta[1] = g_robustDelta[2] = 0.0f;
+    g_screenPlaneShift.store(0.0f, std::memory_order_relaxed);
     if (ok) {
-        const char* cm = std::getenv("DXR_MODELVIEWER_CENTER");
-        const bool robust = !(cm && std::strcmp(cm, "box") == 0);
-        float rc[3], trimmed[3], symFull[3];
-        g_robustDelta[0] = g_robustDelta[1] = g_robustDelta[2] = 0.0f;
-        if (robust && g_modelRenderer.getCenteringFrame(rc, trimmed, symFull)) {
-            constexpr float kRobustCapFill = 0.9f;
-            const float fillNow = g_fitFill.load(std::memory_order_relaxed);
-            LOG_INFO("Centering: robust — box centre=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) -> "
-                     "centre=(%.3f, %.3f, %.3f) trimmed=(%.3f, %.3f, %.3f) symFull=(%.3f, %.3f, %.3f)",
-                     center[0], center[1], center[2], extent[0], extent[1], extent[2],
-                     rc[0], rc[1], rc[2], trimmed[0], trimmed[1], trimmed[2],
-                     symFull[0], symFull[1], symFull[2]);
-            for (int i = 0; i < 3; ++i) {
-                g_robustDelta[i] = rc[i] - center[i];
-                center[i] = rc[i];
-                extent[i] = (std::max)(trimmed[i], symFull[i] * fillNow / kRobustCapFill);
-            }
-        } else {
-            LOG_INFO("Centering: %s (AABB centre on the screen plane)",
-                     robust ? "box (no surface stats)" : "box (DXR_MODELVIEWER_CENTER=box)");
-        }
+        const float boxCenter[3] = {center[0], center[1], center[2]};
+        const float boxExtent[3] = {extent[0], extent[1], extent[2]};
+        float shift = 0.0f;
+        const char* how = modelviewer::ApplyCentering(
+            g_modelRenderer, modelviewer::CenteringFromString(std::getenv("DXR_MODELVIEWER_CENTER")),
+            g_fitFill.load(std::memory_order_relaxed), center, extent, g_robustDelta, &shift);
+        g_screenPlaneShift.store(shift, std::memory_order_relaxed);
+        LOG_INFO("Centering: %s - box centre=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) -> "
+                 "pivot=(%.3f, %.3f, %.3f) screen-plane z=%.3f fit extent=(%.3f, %.3f, %.3f)",
+                 how, boxCenter[0], boxCenter[1], boxCenter[2], boxExtent[0], boxExtent[1], boxExtent[2],
+                 center[0], center[1], center[2], center[2] - shift, extent[0], extent[1], extent[2]);
     }
     if (ok) {
         g_fitCenter[0] = center[0];
@@ -2976,12 +2974,30 @@ static void RenderThreadFunc(
                         if (turntable) {
                             float sceneXf[16];
                             modelviewer::BuildSceneTransform(sceneXf, orbitPose,
-                                                             inputSnapshot.viewParams.scaleFactor);
+                                                             inputSnapshot.viewParams.scaleFactor,
+                                                             g_screenPlaneShift.load(std::memory_order_relaxed));
                             g_modelRenderer.setSceneTransform(sceneXf);
                         } else {
                             g_modelRenderer.clearSceneTransform();
                         }
-                        const XrPosef cameraPose = turntable ? modelviewer::OrbitRigPose() : orbitPose;
+                        // No-rig fallback (camera orbit): the display plane passes
+                        // through the camera position, so the screen-plane slide is the
+                        // camera moved to pivot + R * (0, 0, -shift): the turntable's
+                        // picture in world units (zoom scales the display there, not the
+                        // model, so it holds under zoom too).
+                        XrPosef cameraPose = turntable ? modelviewer::OrbitRigPose() : orbitPose;
+                        if (!turntable) {
+                            const float shift = g_screenPlaneShift.load(std::memory_order_relaxed);
+                            if (shift != 0.0f) {
+                                const XMVECTOR q = XMVectorSet(orbitPose.orientation.x, orbitPose.orientation.y,
+                                                               orbitPose.orientation.z, orbitPose.orientation.w);
+                                XMFLOAT3 off;
+                                XMStoreFloat3(&off, XMVector3Rotate(XMVectorSet(0.0f, 0.0f, -shift, 0.0f), q));
+                                cameraPose.position.x += off.x;
+                                cameraPose.position.y += off.y;
+                                cameraPose.position.z += off.z;
+                            }
+                        }
                         const float rigVH = turntable
                             ? inputSnapshot.viewParams.virtualDisplayHeight
                             : inputSnapshot.viewParams.virtualDisplayHeight

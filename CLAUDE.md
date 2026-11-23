@@ -199,6 +199,26 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
   own pixel rect and sends no `--vh`, so the two rules disagreeing means the
   product visibly changes size as it leaves the page. Only a DEEP subject
   notices (`D > W / aspect`); `--vh` still overrides the whole thing.
+- **...fed by ROBUST CENTRING, not the bounding box (#192, default on every
+  leg).** The centre and extents that go into `FitVHeight` come from an
+  area-weighted surface sample (`ModelRenderer::getCenteringFrame`, built on
+  displayxr-common's `dxr::RobustFrameSampler` / `robust_frame.h`; vendored as
+  `model_common/robust_frame_vendored.h` until a common tag ships it). The
+  turn **pivot** = (area-weighted median x, box centre y, area-weighted median
+  z); the **screen plane** = area-weighted 75th-percentile z (~25% of the
+  surface in front of the glass) is a SEPARATE display-space slide
+  (`g_screenPlaneShift` = pivot.z − p75, scaled by fit × zoom, in
+  `modelviewer::BuildSceneTransform`), so the model turns about its median while
+  p75 stays on the glass — never fold them into one centre. Extents = per-axis
+  1st–99th percentile, guarded so the full box measured about the pivot stays
+  within 90% of the viewport (`dxr::RobustFitExtent(frame, box, ...)`). Skinned
+  models add the pivot offset (`g_robustDelta`) to the per-frame skeleton anchor
+  (Windows, Linux). This mirrors the web SDK's `addModel` (displayxr-web#327 /
+  #330, `fitTo(center, extent, { screenPlaneZ })`) for the same undocking
+  reason, and the sampling is specified bit-for-bit in the header so both frame
+  identically — don't change it here alone. `DXR_MODELVIEWER_CENTER=box`
+  (Android `debug.dxr.mv.center box`) is the A/B fallback; every leg logs
+  `Centering: robust|box ...` once per load.
 
 - **Tile-memory stores (perf/android-gpu-cost).** Every non-transmissive frame
   renders through `renderPassFast_`, a compatible twin of `renderPass_` that
