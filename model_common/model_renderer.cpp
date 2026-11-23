@@ -2028,6 +2028,7 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     // bounds (correct height/center for the auto-fit). Needs primitives_/nodes_/
     // animations_/skins_ (set above) plus the still-intact CPU verts + indices.
     recomputeAnimatedBounds(md.vertices, md.indices);
+    computeSurfaceStats(md.vertices, md.indices);
 
     // CPU ray cast for the depth-aware cursor: per-cluster BVHs over the base
     // geometry (before md's CPU arrays go out of scope), bind-pose transforms.
@@ -2202,6 +2203,87 @@ bool ModelRenderer::getRobustSceneBounds(float, float,
     for (int i = 0; i < 3; ++i) {
         outCenter[i] = 0.5f * (mn[i] + mx[i]);
         outExtent[i] = mx[i] - mn[i];
+    }
+    return true;
+}
+
+// Area-weighted surface sampling: kSamples points drawn uniformly over the
+// triangles (probability ∝ area, a fixed-seed LCG so a model always frames the
+// same), positioned in world space through each primitive's baked modelMatrix
+// (bind pose; skinned primitives use theirs, which is the bind placement).
+// Per-axis weighted percentiles of those samples feed getCenteringFrame().
+void ModelRenderer::computeSurfaceStats(const std::vector<ModelVertex>& verts,
+                                        const std::vector<uint32_t>& indices) {
+    hasSurfStats_ = false;
+    if (verts.empty() || indices.size() < 3 || primitives_.empty()) return;
+    struct Tri { glm::vec3 a, b, c; };
+    std::vector<Tri> tris;
+    std::vector<double> cum;
+    tris.reserve(indices.size() / 3);
+    cum.reserve(indices.size() / 3);
+    double total = 0.0;
+    for (const ModelPrimitive& p : primitives_) {
+        const glm::mat4 m = glm::make_mat4(p.modelMatrix);
+        for (uint32_t ii = 0; ii + 2 < p.indexCount; ii += 3) {
+            const uint32_t i0 = indices[p.firstIndex + ii], i1 = indices[p.firstIndex + ii + 1],
+                           i2 = indices[p.firstIndex + ii + 2];
+            if (i0 >= verts.size() || i1 >= verts.size() || i2 >= verts.size()) continue;
+            auto w = [&](uint32_t i) {
+                return glm::vec3(m * glm::vec4(verts[i].pos[0], verts[i].pos[1], verts[i].pos[2], 1.0f));
+            };
+            Tri t{w(i0), w(i1), w(i2)};
+            const double area = 0.5 * (double)glm::length(glm::cross(t.b - t.a, t.c - t.a));
+            if (!(area > 0.0) || !std::isfinite(area)) continue;
+            total += area;
+            tris.push_back(t);
+            cum.push_back(total);
+        }
+    }
+    if (tris.empty() || !(total > 0.0)) return;
+
+    constexpr int kSamples = 65536;
+    std::vector<float> axis[3];
+    for (auto& a : axis) a.reserve(kSamples);
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() {  // 53-bit uniform in [0,1)
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(s >> 11) * (1.0 / 9007199254740992.0);
+    };
+    for (int k = 0; k < kSamples; ++k) {
+        const double r = rnd() * total;
+        const size_t ti = (size_t)(std::lower_bound(cum.begin(), cum.end(), r) - cum.begin());
+        const Tri& t = tris[std::min(ti, tris.size() - 1)];
+        float u = (float)rnd(), v = (float)rnd();
+        if (u + v > 1.0f) { u = 1.0f - u; v = 1.0f - v; }
+        const glm::vec3 p = t.a + u * (t.b - t.a) + v * (t.c - t.a);
+        axis[0].push_back(p.x); axis[1].push_back(p.y); axis[2].push_back(p.z);
+    }
+    for (int i = 0; i < 3; ++i) {
+        std::vector<float>& a = axis[i];
+        std::sort(a.begin(), a.end());
+        auto pct = [&](float q) { return a[std::min(a.size() - 1, (size_t)(q * (float)(a.size() - 1) + 0.5f))]; };
+        surfP01_[i]    = pct(0.01f);
+        surfMedian_[i] = pct(0.50f);
+        surfP75_[i]    = pct(0.75f);
+        surfP99_[i]    = pct(0.99f);
+    }
+    hasSurfStats_ = true;
+    MV_LOG("surface stats (%d area-weighted samples over %zu tris): median=(%.3f, %.3f, %.3f) "
+            "p75z=%.3f p01=(%.3f, %.3f, %.3f) p99=(%.3f, %.3f, %.3f)\n",
+            kSamples, tris.size(), surfMedian_[0], surfMedian_[1], surfMedian_[2], surfP75_[2],
+            surfP01_[0], surfP01_[1], surfP01_[2], surfP99_[0], surfP99_[1], surfP99_[2]);
+}
+
+bool ModelRenderer::getCenteringFrame(float outCenter[3], float outTrimmed[3],
+                                      float outSymFull[3]) const {
+    float mn[3], mx[3];
+    if (!hasSurfStats_ || !getSceneBBox(mn, mx)) return false;
+    outCenter[0] = surfMedian_[0];
+    outCenter[1] = 0.5f * (mn[1] + mx[1]);
+    outCenter[2] = surfP75_[2];
+    for (int i = 0; i < 3; ++i) {
+        outTrimmed[i] = std::max(surfP99_[i] - surfP01_[i], 1e-6f);
+        outSymFull[i] = 2.0f * std::max(std::fabs(mx[i] - outCenter[i]), std::fabs(outCenter[i] - mn[i]));
     }
     return true;
 }

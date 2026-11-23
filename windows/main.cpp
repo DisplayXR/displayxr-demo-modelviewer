@@ -638,6 +638,11 @@ static void ApplyLaunchPoseAndMargin(const dxr::LaunchArgs& a, const char* where
 // any heuristic (PCA, etc.) can pick the wrong side; the user can rotate
 // with mouse drag from a predictable starting pose.
 // Caller must hold g_sceneMutex (we read pickData_ from the renderer).
+// Robust-centring offset (robust centre - AABB centre), zero in box mode. The
+// per-frame skeleton anchor of a skinned model is the AABB-centre analogue, so the
+// anchor binding below adds this to keep the robust screen plane while it animates.
+static float g_robustDelta[3] = {0.0f, 0.0f, 0.0f};
+
 static void ApplyAutoFitForLoadedScene_locked() {
     // Gate the right-justified animation button on whether this model has clips.
     g_hasAnimations.store(g_modelRenderer.hasAnimations());
@@ -645,6 +650,34 @@ static void ApplyAutoFitForLoadedScene_locked() {
     // Full model AABB: center for the rig position, extent[0]/extent[1] (FULL
     // sizes, not half-extents) for the width-aware fit.
     bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
+    // Prototype (feat/robust-centering): DXR_MODELVIEWER_CENTER=box|robust, default robust.
+    // robust = area-weighted surface centring (ModelRenderer::getCenteringFrame): pivot x at
+    // the surface median, screen plane at the 75th-percentile depth (~25% of the surface in
+    // front), and fit extents trimmed to the 1st-99th percentile — but never so far that the
+    // FULL box (measured from the new centre) exceeds kRobustCapFill of the viewport.
+    if (ok) {
+        const char* cm = std::getenv("DXR_MODELVIEWER_CENTER");
+        const bool robust = !(cm && std::strcmp(cm, "box") == 0);
+        float rc[3], trimmed[3], symFull[3];
+        g_robustDelta[0] = g_robustDelta[1] = g_robustDelta[2] = 0.0f;
+        if (robust && g_modelRenderer.getCenteringFrame(rc, trimmed, symFull)) {
+            constexpr float kRobustCapFill = 0.9f;
+            const float fillNow = g_fitFill.load(std::memory_order_relaxed);
+            LOG_INFO("Centering: robust — box centre=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) -> "
+                     "centre=(%.3f, %.3f, %.3f) trimmed=(%.3f, %.3f, %.3f) symFull=(%.3f, %.3f, %.3f)",
+                     center[0], center[1], center[2], extent[0], extent[1], extent[2],
+                     rc[0], rc[1], rc[2], trimmed[0], trimmed[1], trimmed[2],
+                     symFull[0], symFull[1], symFull[2]);
+            for (int i = 0; i < 3; ++i) {
+                g_robustDelta[i] = rc[i] - center[i];
+                center[i] = rc[i];
+                extent[i] = (std::max)(trimmed[i], symFull[i] * fillNow / kRobustCapFill);
+            }
+        } else {
+            LOG_INFO("Centering: %s (AABB centre on the screen plane)",
+                     robust ? "box (no surface stats)" : "box (DXR_MODELVIEWER_CENTER=box)");
+        }
+    }
     if (ok) {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
@@ -2758,6 +2791,7 @@ static void RenderThreadFunc(
         {
             float anchor[3];
             if (g_fitValid.load() && g_modelRenderer.getAnimatedAnchor(anchor)) {
+                for (int i = 0; i < 3; ++i) anchor[i] += g_robustDelta[i];
                 const dxr::RecenterPins pins = g_recenter.pins();
                 const float offX = inputSnapshot.cameraPosX - g_fitCenter[0];
                 const float offY = inputSnapshot.cameraPosY - g_fitCenter[1];

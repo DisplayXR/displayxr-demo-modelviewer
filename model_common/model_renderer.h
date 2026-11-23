@@ -172,6 +172,18 @@ struct ModelRenderer {
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
+    //! Robust centring frame from AREA-WEIGHTED surface samples (bind pose,
+    //! world space), computed once at load. A thin outlier (a tail, an antenna)
+    //! carries little surface area, so it stops dragging the centre and the
+    //! screen plane the way the AABB does. Prototype (feat/robust-centering):
+    //!   centre.x  = area-weighted median x        (turn pivot)
+    //!   centre.y  = AABB centre y                  (unchanged)
+    //!   centre.z  = area-weighted 75th-percentile z, +z toward the viewer, so
+    //!               ~25% of the surface sits in front of the screen plane
+    //!   trimmed   = per-axis area-weighted 1st-99th percentile extent
+    //!   symFull   = 2 x the farthest AABB face from `centre`, per axis: the box
+    //!               a fit must still hold (at a looser fill) so nothing clips.
+    bool getCenteringFrame(float outCenter[3], float outTrimmed[3], float outSymFull[3]) const;
     // Smoothed world-space centroid of the active skeleton (mean joint
     // position), updated by updateAnimation. Lets the platform bind the
     // display rig to a moving/skinned subject so it stays centered + at the
@@ -950,6 +962,15 @@ private:
     float bboxMin_[3] = {0, 0, 0};
     float bboxMax_[3] = {0, 0, 0};
     bool  hasBBox_ = false;
+
+    // getCenteringFrame() inputs, from computeSurfaceStats at load.
+    float surfMedian_[3] = {0, 0, 0};
+    float surfP75_[3]    = {0, 0, 0};
+    float surfP01_[3]    = {0, 0, 0};
+    float surfP99_[3]    = {0, 0, 0};
+    bool  hasSurfStats_  = false;
+    void computeSurfaceStats(const std::vector<ModelVertex>& verts,
+                             const std::vector<uint32_t>& indices);
 
     // CPU ray cast (depth-aware cursor). Built in finalizeModel; its cluster
     // transforms follow primitives_[].modelMatrix and a CPU copy of the joint
