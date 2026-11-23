@@ -64,9 +64,11 @@ FetchContent_Declare(
     # v2.31.0: dxr::CursorDepth::useMeasuredDisparity() (displayxr-common#77).
     # v2.33.0: FormatEyeTrackingInfo can omit the [T] toggle hint; this demo has no
     #   T toggle and passes false (displayxr-common#90).
+    # v2.35.0: dxr::RobustFrameSampler (common/robust_frame.h, displayxr-common#92),
+    #   replacing the copy model_common/ carried until a tag shipped it.
     # v2.31.2: a right-button content drag runs on KWin (displayxr-common#78, only
     # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
-    GIT_TAG v2.33.0
+    GIT_TAG v2.35.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

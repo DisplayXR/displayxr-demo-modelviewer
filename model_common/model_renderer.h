@@ -27,7 +27,7 @@
 #include "model_vulkan_utils.h"
 #include "model_loader.h"
 #include "model_raycast.h"
-#include "robust_frame_vendored.h"  // dxr::RobustFrameSampler (displayxr-common#92)
+#include "robust_frame.h"  // displayxr-common v2.35.0+: dxr::RobustFrameSampler (#92)
 // MV_TEX_SLOTS / MV_MAT_VEC4S. A GLSL file, included here on purpose: it holds
 // nothing but #defines, and shaders/pbr.frag includes the same bytes. The
 // material SSBO's stride is a function of both numbers, so they cannot be
@@ -176,7 +176,7 @@ struct ModelRenderer {
     //! Robust framing (the default; displayxr-demo-modelviewer#192, mirrors the
     //! web SDK's addModel, displayxr-web#327). From AREA-WEIGHTED surface
     //! samples (bind pose, world space), computed once at load by
-    //! dxr::RobustFrameSampler (robust_frame_vendored.h): a thin outlier (a
+    //! dxr::RobustFrameSampler (robust_frame.h): a thin outlier (a
     //! tail, an antenna) carries little area, so it stops dragging the centre,
     //! the screen plane and the scale the way the AABB does.
     //!   outPivot     = (area-weighted median x, AABB centre y, area-weighted
