@@ -630,6 +630,22 @@ still the legacy positional model path, so every existing launcher keeps
 working. Exit codes: **2** = the launch was refused (bad or disallowed
 arguments), **3** = the link belongs to a sibling viewer that is not installed.
 
+**Framing: robust centring, the same rule as the page.** At load the viewer
+samples the model's surface uniformly by triangle area (65,536 fixed-seed
+samples, bind pose) and frames on that sample instead of the bounding box. The
+model turns about the area-weighted median (x and z; y stays the box centre),
+the 75th-percentile depth toward the viewer is slid onto the screen plane (so
+about a quarter of the surface comes out of the glass, and it stays there under
+zoom), and the fit uses the 1st–99th percentile extents, capped so the full box
+never fills more than 90% of the window. A thin tail, antenna or
+strap no longer shrinks the subject or pushes the body out of the glass. This
+is the web SDK's `addModel` rule
+([displayxr-web#327](https://github.com/DisplayXR/displayxr-web/issues/327)),
+shared through displayxr-common's `robust_frame.h`, so an undocked product
+keeps its size **and** its depth placement. `DXR_MODELVIEWER_CENTER=box`
+(Android: `setprop debug.dxr.mv.center box`) restores the bounding-box rule;
+`--vh` still pins the scale under either rule.
+
 **The opening pose is held, not spun — and that is a deliberate difference from
 the page.** The storefront's tile passes a non-zero `idleSpin` to the SDK, so a
 product starts turning a few seconds after it appears. The undocked view does

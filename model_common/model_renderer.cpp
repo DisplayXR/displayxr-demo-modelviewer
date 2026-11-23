@@ -2028,6 +2028,7 @@ bool ModelRenderer::finalizeModel(ModelData& md) {
     // bounds (correct height/center for the auto-fit). Needs primitives_/nodes_/
     // animations_/skins_ (set above) plus the still-intact CPU verts + indices.
     recomputeAnimatedBounds(md.vertices, md.indices);
+    computeSurfaceStats(md.vertices, md.indices);
 
     // CPU ray cast for the depth-aware cursor: per-cluster BVHs over the base
     // geometry (before md's CPU arrays go out of scope), bind-pose transforms.
@@ -2203,6 +2204,41 @@ bool ModelRenderer::getRobustSceneBounds(float, float,
         outCenter[i] = 0.5f * (mn[i] + mx[i]);
         outExtent[i] = mx[i] - mn[i];
     }
+    return true;
+}
+
+// Robust framing input (#192): every primitive's triangles, placed through its
+// baked modelMatrix (bind pose; skinned primitives use theirs, which is the bind
+// placement), sampled uniformly by area by the shared dxr::RobustFrameSampler —
+// the same sampling the web SDK's addModel runs, so the two frame alike.
+void ModelRenderer::computeSurfaceStats(const std::vector<ModelVertex>& verts,
+                                        const std::vector<uint32_t>& indices) {
+    robustFrame_ = dxr::RobustFrame{};
+    if (verts.empty() || indices.size() < 3 || primitives_.empty()) return;
+    dxr::RobustFrameSampler sampler;
+    for (const ModelPrimitive& p : primitives_) {
+        if (p.firstIndex >= indices.size()) continue;
+        const size_t count = std::min<size_t>(p.indexCount, indices.size() - p.firstIndex);
+        sampler.addTriangles(verts[0].pos, sizeof(ModelVertex), verts.size(),
+                             indices.data() + p.firstIndex, count, p.modelMatrix);
+    }
+    if (!sampler.compute(robustFrame_)) return;
+    const dxr::RobustFrame& f = robustFrame_;
+    MV_LOG("surface stats (%d area-weighted samples over %zu tris): median=(%.3f, %.3f, %.3f) "
+            "p75z=%.3f p01=(%.3f, %.3f, %.3f) p99=(%.3f, %.3f, %.3f)\n",
+            dxr::kRobustFrameSamples, sampler.triangleCount(), f.median[0], f.median[1], f.median[2],
+            f.zdpDepth, f.p01[0], f.p01[1], f.p01[2], f.p99[0], f.p99[1], f.p99[2]);
+}
+
+bool ModelRenderer::getCenteringFrame(float fill, float outPivot[3], float outFitExtent[3],
+                                      float* outScreenPlaneZ) const {
+    float mn[3], mx[3];
+    if (!robustFrame_.valid || !getSceneBBox(mn, mx)) return false;
+    // The pivot's y and the 90% full-box guard use the SCENE box (swept over the
+    // clips for an animated model, see recomputeAnimatedBounds); the guard is
+    // measured about the pivot, exactly as the web SDK does.
+    dxr::RobustFitExtent(robustFrame_, mn, mx, fill, outFitExtent, outPivot);
+    if (outScreenPlaneZ) *outScreenPlaneZ = robustFrame_.zdpDepth;
     return true;
 }
 

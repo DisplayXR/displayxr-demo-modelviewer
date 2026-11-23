@@ -366,6 +366,15 @@ static void MarkUserInput(InputState& input) {
     input.animationActive = false;
 }
 
+// Robust-centring offset (robust centre - AABB centre, #192), zero under box.
+// The animated centroid below is the AABB-centre analogue, so adding this keeps
+// the robust screen plane while a skinned model animates (Windows: same name).
+static float g_robustDelta[3] = {0.0f, 0.0f, 0.0f};
+// Screen-plane slide (#192, model units, pivot.z - p75; 0 under box): the
+// turntable turns about g_fitCenter (the pivot) and this puts the p75 depth on
+// the glass (common/model_orbit.h).
+static float g_screenPlaneShift = 0.0f;
+
 // Rig position for this frame: a pinned axis tracks the smoothed animated
 // centroid; an unpinned axis stays at the user-driven camera position.
 // No-op for static models (anchor invalid).
@@ -376,9 +385,9 @@ static void ComputeRigPosition(float out[3]) {
     float anchor[3];
     if (g_modelRenderer.getAnimatedAnchor(anchor)) {
         const dxr::RecenterPins pins = g_recenter.pins();
-        if (pins.x) out[0] = anchor[0];
-        if (pins.y) out[1] = anchor[1];
-        if (pins.z) out[2] = anchor[2];
+        if (pins.x) out[0] = anchor[0] + g_robustDelta[0];
+        if (pins.y) out[1] = anchor[1] + g_robustDelta[1];
+        if (pins.z) out[2] = anchor[2] + g_robustDelta[2];
     }
 }
 
@@ -1404,6 +1413,24 @@ static void ApplyLaunchPose() {
 static void ApplyAutoFitForLoadedScene() {
     float center[3], extent[3];
     const bool ok = g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent);
+    // Robust centring (#192, the default; common/model_fit.h): area-weighted
+    // median pivot, 75th-percentile screen plane, 1st-99th percentile extents
+    // capped by the full box at 90% — the web SDK's addModel rule
+    // (displayxr-web#327). DXR_MODELVIEWER_CENTER=box restores the AABB rule.
+    g_robustDelta[0] = g_robustDelta[1] = g_robustDelta[2] = 0.0f;
+    g_screenPlaneShift = 0.0f;
+    if (ok) {
+        const float boxCenter[3] = {center[0], center[1], center[2]};
+        const float boxExtent[3] = {extent[0], extent[1], extent[2]};
+        const char* how = modelviewer::ApplyCentering(
+            g_modelRenderer, modelviewer::CenteringFromString(std::getenv("DXR_MODELVIEWER_CENTER")),
+            g_fitFill, center, extent, g_robustDelta, &g_screenPlaneShift);
+        LOG_INFO("Centering: %s - box centre=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) -> "
+                 "pivot=(%.3f, %.3f, %.3f) screen-plane z=%.3f fit extent=(%.3f, %.3f, %.3f)",
+                 how, boxCenter[0], boxCenter[1], boxCenter[2], boxExtent[0], boxExtent[1], boxExtent[2],
+                 center[0], center[1], center[2], center[2] - g_screenPlaneShift,
+                 extent[0], extent[1], extent[2]);
+    }
     if (ok) {
         g_fitCenter[0] = center[0]; g_fitCenter[1] = center[1]; g_fitCenter[2] = center[2];
         g_fitExtentH = extent[1];
@@ -2660,7 +2687,8 @@ int main(int argc, char** argv) {
             orbitPose.position = {rigPos[0], rigPos[1], rigPos[2]};
             {
                 float sceneXf[16];
-                modelviewer::BuildSceneTransform(sceneXf, orbitPose, g_input.viewParams.scaleFactor);
+                modelviewer::BuildSceneTransform(sceneXf, orbitPose, g_input.viewParams.scaleFactor,
+                                                 g_screenPlaneShift);
                 g_modelRenderer.setSceneTransform(sceneXf);
             }
             const XrPosef cameraPose = modelviewer::OrbitRigPose();
