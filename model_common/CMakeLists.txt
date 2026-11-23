@@ -227,6 +227,7 @@ target_link_libraries(model_renderer PUBLIC
     glm::glm
 )
 target_link_libraries(model_renderer PRIVATE
+    displayxr::rules        # header-only displayxr-common headers: robust_frame.h (#192)
     tinygltf
     tinyusdz::tinyusdz_static
 )

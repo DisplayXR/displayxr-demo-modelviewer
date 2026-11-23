@@ -202,8 +202,8 @@ openxr_includes/                  — vendored OpenXR + DisplayXR ext headers
 - **...fed by ROBUST CENTRING, not the bounding box (#192, default on every
   leg).** The centre and extents that go into `FitVHeight` come from an
   area-weighted surface sample (`ModelRenderer::getCenteringFrame`, built on
-  displayxr-common's `dxr::RobustFrameSampler` / `robust_frame.h`; vendored as
-  `model_common/robust_frame_vendored.h` until a common tag ships it). The
+  displayxr-common's `dxr::RobustFrameSampler` / `robust_frame.h`, pinned at
+  displayxr-common v2.35.0 via `displayxr::rules`). The
   turn **pivot** = (area-weighted median x, box centre y, area-weighted median
   z); the **screen plane** = area-weighted 75th-percentile z (~25% of the
   surface in front of the glass) is a SEPARATE display-space slide

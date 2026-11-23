@@ -66,7 +66,8 @@ FetchContent_Declare(
     #   T toggle and passes false (displayxr-common#90).
     # v2.31.2: a right-button content drag runs on KWin (displayxr-common#78, only
     # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
-    GIT_TAG v2.33.0
+    # v2.35.0: dxr::RobustFrameSampler (common/robust_frame.h) — robust centring (#192, displayxr-common#92).
+    GIT_TAG v2.35.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
