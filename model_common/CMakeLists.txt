@@ -225,6 +225,7 @@ target_include_directories(model_renderer PRIVATE
 target_link_libraries(model_renderer PUBLIC
     Vulkan::Vulkan
     glm::glm
+    displayxr::rules   # robust_frame.h (displayxr-common v2.35.0+), included by model_renderer.h
 )
 target_link_libraries(model_renderer PRIVATE
     tinygltf
