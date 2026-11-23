@@ -725,6 +725,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data());
 
     bool hasVulkan = false;
+    bool hasWorkspaceInput = false;
     for (const auto& e : exts) {
         if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
@@ -740,6 +741,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(e.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) xr.hasWaylandBindingExt = true;
         if (strcmp(e.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
         if (strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeaveExt = true;
+        if (strcmp(e.extensionName, XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME) == 0) hasWorkspaceInput = true;
         if (strcmp(e.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
             xr.hasDepthBudgetExt = true;
             xr.depthBudgetExtVersion = e.extensionVersion;
@@ -785,6 +787,14 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     // depth budget on XrViewState at xrLocateViews. Backend-independent — the
     // budget rides the locate, not the window binding.
     if (xr.hasDepthBudgetExt) enabled.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
+    // XR_DXR_workspace_client_input: inside the DisplayXR workspace the window
+    // is hidden and the service owns the pointer and keyboard; this lets the
+    // window helper drain the app's routed share and deliver it as ordinary
+    // window events (displayxr-common's DxrLinuxWindow, armed by
+    // attach_session). A no-op outside a workspace, so enable it whenever the
+    // runtime advertises it.
+    if (hasWorkspaceInput) enabled.push_back(XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_workspace_client_input: %s", hasWorkspaceInput ? "ENABLED" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_xlib_window_binding: %s", xr.hasXlibBindingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_wayland_surface_binding: %s", xr.hasWaylandBindingExt ? "AVAILABLE" : "NOT FOUND");
