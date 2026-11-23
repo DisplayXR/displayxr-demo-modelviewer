@@ -68,7 +68,9 @@ FetchContent_Declare(
     #   replacing the copy model_common/ carried until a tag shipped it.
     # v2.31.2: a right-button content drag runs on KWin (displayxr-common#78, only
     # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
-    GIT_TAG v2.35.0
+    # v2.36.0: DxrLinuxWindow drains XR_DXR_workspace_client_input, so the app gets
+    #   mouse + keyboard under the Linux workspace (displayxr-common#93).
+    GIT_TAG v2.36.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
