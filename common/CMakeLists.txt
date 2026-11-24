@@ -70,8 +70,13 @@ FetchContent_Declare(
     # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
     # v2.36.0: DxrLinuxWindow drains XR_DXR_workspace_client_input, so the app gets
     #   mouse + keyboard under the Linux workspace (displayxr-common#93).
-    GIT_TAG v2.36.0
-    GIT_SHALLOW TRUE
+    # DRAFT (runtime #2795, display_info v27): displayxr-common
+    #   feat/mode-table-changed-event — the shared PollEvents and dxr::ModeTable
+    #   follow XrEventDataRenderingModeTableChangedDXR (the 3D mode remapped
+    #   live). Re-pin to the release tag before merging; a commit pin cannot be
+    #   fetched shallow.
+    GIT_TAG 3fd4eae38217dae8699105378b613fc7055ca755
+    GIT_SHALLOW FALSE
 )
 FetchContent_MakeAvailable(displayxr_common)
 

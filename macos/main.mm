@@ -60,6 +60,7 @@
 #include "view_params.h"
 #include "dxr_view_config.h" // displayxr-common: DxrSelectViewConfigType (#1486/#1500) + DxrAliasInactiveViews (ADR-041)
 #include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
+#include "mode_table.h"  // dxr::ModeTable + the v27 table-changed event (displayxr-common)
 #include "display3d_view.h"
 #include "camera3d_view.h"
 #include "projection_depth.h"
@@ -1473,6 +1474,8 @@ struct AppXrSession {
     //! Array index of the mode the runtime reports isActive at enumeration
     //! (-1 = none) — the app renders whatever mode the display is in.
     int32_t activeRenderingMode = -1;
+    //! The full table the arrays above are filled from (RefreshRenderingModes).
+    dxr::ModeTable modeTable;
 
     // Max views the runtime may return from xrLocateViews, taken from
     // xrEnumerateViewConfigurationViews at session init. Some runtimes (e.g.
@@ -1596,6 +1599,72 @@ static void CleanupOpenXR(AppXrSession& xr);
 // ============================================================================
 // OpenXR implementation (abbreviated — same logic as cube_handle_vk_macos)
 // ============================================================================
+
+/*!
+ * Read the session's rendering-mode table into the renderingMode* arrays (each
+ * mode in the slot its modeIndex names). Called once after xrCreateSession
+ * (`initial`) and again on XrEventDataRenderingModeTableChangedDXR
+ * (display_info v27, runtime ADR-066 C1): a live 3D-mode switch remaps slot 1
+ * to another entry — view count, tiles, view scale — while the active index
+ * stays put. The frame loop reads these arrays every frame, so refreshing them
+ * is all the tiling needs. The swapchain is NOT recreated (v27: still large
+ * enough); a table that no longer fits it is logged once.
+ */
+static bool RefreshRenderingModes(AppXrSession& xr, bool initial) {
+    if (xr.pfnEnumerateDisplayRenderingModesEXT == nullptr || xr.session == XR_NULL_HANDLE) return false;
+    const bool changed = xr.modeTable.refresh(xr.pfnEnumerateDisplayRenderingModesEXT, xr.session);
+    if (!xr.modeTable.lastRefreshOk()) {
+        LOG_WARN("xrEnumerateDisplayRenderingModesDXR failed; keeping the previous mode table");
+        return false;
+    }
+    if (xr.modeTable.empty()) return false;
+    for (uint32_t i = 0; i < 8; i++) {
+        xr.renderingModeNames[i][0] = '\0';
+        xr.renderingModeViewCounts[i] = 0;
+        xr.renderingModeScaleX[i] = xr.renderingModeScaleY[i] = 0.0f;
+        xr.renderingModeDisplay3D[i] = xr.renderingModeIsRequestable[i] = false;
+        xr.renderingModeTileColumns[i] = xr.renderingModeTileRows[i] = 0;
+    }
+    uint32_t count = 0;
+    LOG_INFO("Display rendering modes (%u):", (uint32_t)xr.modeTable.size());
+    for (const XrDisplayRenderingModeInfoDXR& m : xr.modeTable.modes()) {
+        LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)", m.modeIndex, m.modeName,
+                 m.viewCount, m.viewScaleX, m.viewScaleY, m.tileColumns ? m.tileColumns : 1u,
+                 m.tileRows ? m.tileRows : 1u, m.hardwareDisplay3D);
+        if (m.modeIndex >= 8) continue; // past the arrays; kept in modeTable only
+        const uint32_t s = m.modeIndex;
+        strncpy(xr.renderingModeNames[s], m.modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
+        xr.renderingModeNames[s][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
+        xr.renderingModeViewCounts[s] = m.viewCount;
+        xr.renderingModeScaleX[s] = m.viewScaleX;
+        xr.renderingModeScaleY[s] = m.viewScaleY;
+        xr.renderingModeDisplay3D[s] = (m.hardwareDisplay3D == XR_TRUE);
+        xr.renderingModeIsRequestable[s] = (m.isRequestable == XR_TRUE);
+        xr.renderingModeTileColumns[s] = m.tileColumns ? m.tileColumns : 1;
+        xr.renderingModeTileRows[s] = m.tileRows ? m.tileRows : 1;
+        // Only a 3D mode is a candidate for the app's default. The display
+        // commonly reports its 2D mode active at startup (it stays 2D until
+        // something asks for 3D), and adopting that would open this 3D demo
+        // in mono.
+        if (initial && m.isActive == XR_TRUE && m.hardwareDisplay3D == XR_TRUE)
+            xr.activeRenderingMode = (int32_t)s;
+        if (s + 1 > count) count = s + 1;
+    }
+    xr.renderingModeCount = count;
+    if (xr.swapchain.swapchain != XR_NULL_HANDLE &&
+        !xr.modeTable.fits(xr.displayPixelWidth, xr.displayPixelHeight, xr.swapchain.width, xr.swapchain.height)) {
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            uint32_t nw = 0, nh = 0;
+            xr.modeTable.worstCaseAtlas(xr.displayPixelWidth, xr.displayPixelHeight, false, &nw, &nh);
+            LOG_WARN("Rendering mode table needs %ux%u full-screen, larger than the %ux%u swapchain "
+                     "(no app-visible worst case in display_info v27)",
+                     nw, nh, xr.swapchain.width, xr.swapchain.height);
+        }
+    }
+    return changed;
+}
 
 static bool InitializeOpenXR(AppXrSession& xr) {
     uint32_t extCount = 0;
@@ -1940,44 +2009,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     }
 
     // Enumerate available rendering modes and store names
-    if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
-        uint32_t modeCount = 0;
-        XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
-        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
-            for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
-                modes[i].next = nullptr;
-            }
-            enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
-            if (XR_SUCCEEDED(enumRes)) {
-                xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
-                LOG_INFO("Display rendering modes (%u):", modeCount);
-                for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
-                    strncpy(xr.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
-                    xr.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
-                    xr.renderingModeViewCounts[i] = modes[i].viewCount;
-                    xr.renderingModeScaleX[i] = modes[i].viewScaleX;
-                    xr.renderingModeScaleY[i] = modes[i].viewScaleY;
-                    xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
-                    xr.renderingModeIsRequestable[i] = (modes[i].isRequestable == XR_TRUE);
-                    xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
-                    xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
-                    // Only a 3D mode is a candidate for the app's default. The
-                    // display commonly reports its 2D mode active at startup
-                    // (it stays 2D until something asks for 3D), and adopting
-                    // that would open this 3D demo in mono.
-                    if (modes[i].isActive == XR_TRUE && modes[i].hardwareDisplay3D == XR_TRUE)
-                        xr.activeRenderingMode = (int32_t)i;
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
-                        modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
-                        modes[i].viewScaleX, modes[i].viewScaleY,
-                        xr.renderingModeTileColumns[i], xr.renderingModeTileRows[i],
-                        modes[i].hardwareDisplay3D);
-                }
-            }
-        }
-    }
+    RefreshRenderingModes(xr, /*initial=*/true);
 
     return true;
 }
@@ -2375,6 +2407,30 @@ static void PollEvents(AppXrSession& xr) {
                 LOG_INFO("Rendering mode changed: %u -> %u (%s)",
                     rmc->previousModeIndex, rmc->currentModeIndex,
                     xr.renderingModeNames[rmc->currentModeIndex]);
+            }
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_TABLE_CHANGED_DXR) {
+            // display_info v27: the 3D mode was switched live — the table
+            // changed, the index did not. Re-read it; the per-frame view count,
+            // tile layout and per-view render size follow from the arrays.
+            dxr::RenderingModeTableChange change;
+            if (dxr::DecodeRenderingModeTableChanged((const XrEventDataBaseHeader*)&event, &change)) {
+                LOG_INFO("Rendering mode table changed (active mode %u): re-reading it",
+                         change.activeModeIndex);
+                RefreshRenderingModes(xr, /*initial=*/false);
+                g_input.renderingModeCount = xr.renderingModeCount;
+                if (change.activeModeIndex < xr.renderingModeCount) {
+                    g_input.currentRenderingMode = change.activeModeIndex;
+                    g_msLastMode = change.activeModeIndex;
+                }
+                UpdateTopBarButtonTitles(xr);
+                if (change.recreateSwapchains) {
+                    static bool s_recreateWarned = false;
+                    if (!s_recreateWarned) {
+                        s_recreateWarned = true;
+                        LOG_WARN("Rendering mode table change asks for swapchain recreation; not "
+                                 "implemented — keeping the swapchain (the runtime resamples)");
+                    }
+                }
             }
         } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR) {
             // An agent invoked one of our XR_DXR_mcp_tools tools (#22).
