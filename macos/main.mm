@@ -1410,6 +1410,10 @@ struct AppXrSession {
     float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0.5f;
     float recommendedViewScaleX = 0.5f, recommendedViewScaleY = 1.0f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
+    // display_info v28 (XrDisplayRenderingWorstCaseDXR on XrSystemProperties):
+    // the largest atlas / per-view rect any mode of any claimed screen can ask
+    // for, fixed for the instance. All zero on an older runtime.
+    XrDisplayRenderingWorstCaseDXR renderingWorstCase = {};
     // INV-1.3 (v16, runtime#715): 3D panel top-left in top-down virtual-desktop
     // pixels (XrDisplayDesktopPositionDXR). (0,0) = primary/unknown — the safe
     // default, which zero-init also yields on pre-v16 runtimes.
@@ -1658,9 +1662,11 @@ static bool RefreshRenderingModes(AppXrSession& xr, bool initial) {
             s_warned = true;
             uint32_t nw = 0, nh = 0;
             xr.modeTable.worstCaseAtlas(xr.displayPixelWidth, xr.displayPixelHeight, false, &nw, &nh);
-            LOG_WARN("Rendering mode table needs %ux%u full-screen, larger than the %ux%u swapchain "
-                     "(no app-visible worst case in display_info v27)",
-                     nw, nh, xr.swapchain.width, xr.swapchain.height);
+            LOG_WARN("Rendering mode table needs %ux%u full-screen, larger than the %ux%u swapchain (%s)",
+                     nw, nh, xr.swapchain.width, xr.swapchain.height,
+                     xr.renderingWorstCase.maxAtlasWidthPixels == 0
+                         ? "the runtime states no display_info v28 worst case"
+                         : "beyond the runtime's display_info v28 worst case");
         }
     }
     return changed;
@@ -1750,8 +1756,19 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         desktopPos.next = &ec;
+        // display_info v28: the instance's worst case, which the atlas
+        // swapchain is sized from. An older runtime leaves it zero.
+        XrDisplayRenderingWorstCaseDXR worstCase = {};
+        worstCase.type = XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR;
+        ec.next = &worstCase;
         di.next = &desktopPos; sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
+            xr.renderingWorstCase = worstCase;
+            xr.renderingWorstCase.next = nullptr;
+            LOG_INFO("Rendering worst case (display_info v28): atlas %ux%u, view %ux%u, %u views%s",
+                     worstCase.maxAtlasWidthPixels, worstCase.maxAtlasHeightPixels,
+                     worstCase.maxViewWidthPixels, worstCase.maxViewHeightPixels, worstCase.maxViewCount,
+                     worstCase.maxAtlasWidthPixels == 0 ? " (none stated: older runtime)" : "");
             xr.recommendedViewScaleX = di.recommendedViewScaleX;
             xr.recommendedViewScaleY = di.recommendedViewScaleY;
             xr.displayWidthM = di.displaySizeMeters.width;
@@ -2071,6 +2088,15 @@ static bool CreateSwapchains(AppXrSession& xr) {
             if (maxAtlasW > w) w = maxAtlasW;
             if (maxAtlasH > h) h = maxAtlasH;
         }
+    }
+    // display_info v28: never smaller than the runtime's stated worst case, so a
+    // live 3D-mode switch (or a move to another screen) always fits without
+    // recreating the swapchain. All zero on an older runtime: the size above stands.
+    {
+        const uint32_t cw = w, ch = h;
+        dxr::SizeFromWorstCase(xr.renderingWorstCase, false, cw, ch, &w, &h);
+        LOG_INFO("Swapchain sizing: computed %ux%u, runtime worst case %ux%u -> %ux%u", cw, ch,
+                 xr.renderingWorstCase.maxAtlasWidthPixels, xr.renderingWorstCase.maxAtlasHeightPixels, w, h);
     }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};

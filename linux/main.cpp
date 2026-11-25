@@ -717,6 +717,10 @@ struct AppXrSession {
     int32_t activeRenderingMode = -1;
     //! The full table the arrays above are filled from (RefreshRenderingModes).
     dxr::ModeTable modeTable;
+    //! display_info v28 (XrDisplayRenderingWorstCaseDXR on XrSystemProperties):
+    //! the largest atlas / per-view rect any mode of any claimed screen can ask
+    //! for, fixed for the instance. All zero on an older runtime.
+    XrDisplayRenderingWorstCaseDXR renderingWorstCase = {};
 
     uint32_t maxViewCount = 2;
 };
@@ -729,7 +733,8 @@ struct AppXrSession {
  * count, tiles, view scale — while the active index stays put. The frame loop
  * reads these arrays every frame, so refreshing them is all it takes for the
  * tiling to follow. The swapchain is NOT recreated (v27: it is still large
- * enough); a table that no longer fits it is logged once.
+ * enough: v28 sizes it from XrDisplayRenderingWorstCaseDXR); a table that
+ * no longer fits it is logged once.
  * @return true when the table's layout changed (dxr::ModeTable::refresh).
  */
 static bool RefreshRenderingModes(AppXrSession& xr) {
@@ -773,8 +778,11 @@ static bool RefreshRenderingModes(AppXrSession& xr) {
             uint32_t nw = 0, nh = 0;
             xr.modeTable.worstCaseAtlas(xr.displayPixelWidth, xr.displayPixelHeight, false, &nw, &nh);
             LOG_WARN("Rendering mode table needs %ux%u full-screen, larger than the %ux%u swapchain; "
-                     "tiles are clamped to the swapchain (no app-visible worst case in display_info v27)",
-                     nw, nh, xr.swapchain.width, xr.swapchain.height);
+                     "tiles are clamped to the swapchain (%s)",
+                     nw, nh, xr.swapchain.width, xr.swapchain.height,
+                     xr.renderingWorstCase.maxAtlasWidthPixels == 0
+                         ? "the runtime states no display_info v28 worst case"
+                         : "beyond the runtime's display_info v28 worst case");
         }
     }
     return changed;
@@ -902,10 +910,22 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         // and separately chained — an older runtime just leaves it zero.
         XrDisplayDesktopInfoDXR desktopInfo = {};
         desktopInfo.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+        // display_info v28: the instance's worst case, which the atlas
+        // swapchain is sized from (CreateSwapchains). An older runtime ignores
+        // the struct and leaves it zero.
+        XrDisplayRenderingWorstCaseDXR worstCase = {};
+        worstCase.type = XR_TYPE_DISPLAY_RENDERING_WORST_CASE_DXR;
+        desktopInfo.next = &worstCase;
         desktopPos.next = &desktopInfo;
         di.next = &desktopPos;
         sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
+            xr.renderingWorstCase = worstCase;
+            xr.renderingWorstCase.next = nullptr;
+            LOG_INFO("Rendering worst case (display_info v28): atlas %ux%u, view %ux%u, %u views%s",
+                     worstCase.maxAtlasWidthPixels, worstCase.maxAtlasHeightPixels,
+                     worstCase.maxViewWidthPixels, worstCase.maxViewHeightPixels, worstCase.maxViewCount,
+                     worstCase.maxAtlasWidthPixels == 0 ? " (none stated: older runtime)" : "");
             xr.displayDesktopRect = desktopInfo.desktopRect;
             xr.displayPanelConfirmed = desktopInfo.isPanelConfirmed == XR_TRUE;
             LOG_INFO("Display desktop rect: (%d, %d) %dx%d panelConfirmed=%s device='%s'",
@@ -1126,6 +1146,15 @@ static bool CreateSwapchains(AppXrSession& xr) {
             if (aw > w) w = aw;
             if (ah > h) h = ah;
         }
+    }
+    // display_info v28: never smaller than the runtime's stated worst case, so a
+    // live 3D-mode switch (or a move to another screen) always fits without
+    // recreating the swapchain. All zero on an older runtime: the size above stands.
+    {
+        const uint32_t cw = w, ch = h;
+        dxr::SizeFromWorstCase(xr.renderingWorstCase, false, cw, ch, &w, &h);
+        LOG_INFO("Swapchain sizing: computed %ux%u, runtime worst case %ux%u -> %ux%u", cw, ch,
+                 xr.renderingWorstCase.maxAtlasWidthPixels, xr.renderingWorstCase.maxAtlasHeightPixels, w, h);
     }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -2885,10 +2914,11 @@ int main(int argc, char** argv) {
                 float scaleY = (xr.renderingModeCount > 0 && m < xr.renderingModeCount) ? xr.renderingModeScaleY[m] : 1.0f;
                 uint32_t renderW = (uint32_t)((double)g_windowW * scaleX); if (renderW == 0) renderW = 1;
                 uint32_t renderH = (uint32_t)((double)g_windowH * scaleY); if (renderH == 0) renderH = 1;
-                // Keep the atlas inside the swapchain. It is worst-case-sized at
-                // start, but a live 3D-mode switch (display_info v27) can select
-                // an entry the start-up table did not show; v27 states no
-                // app-visible worst case, so clamp rather than overrun.
+                // Keep the atlas inside the swapchain. It is sized from the
+                // runtime's v28 worst case, so this never fires on a v28
+                // runtime; an older (v27) runtime states none and a live
+                // 3D-mode switch can select an entry the start-up table did not
+                // show, so clamp rather than overrun.
                 {
                     const uint32_t cols = tileColumns > 0 ? tileColumns : 1u;
                     const uint32_t rows = ((uint32_t)eyeCount + cols - 1) / cols;
