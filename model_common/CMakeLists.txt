@@ -288,9 +288,26 @@ if(MODELVIEWER_BUILD_TESTS)
         gltf_accessor_check.cpp
     )
     target_include_directories(gltf_anim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(gltf_anim_tests PRIVATE tinygltf)
+    # displayxr::rules: gltf_accessor.h, which gltf_accessor_check.cpp includes.
+    target_link_libraries(gltf_anim_tests PRIVATE tinygltf displayxr::rules)
     if(MSVC)
         target_compile_options(gltf_anim_tests PRIVATE /utf-8)
     endif()
     add_test(NAME gltf_anim_tests COMMAND gltf_anim_tests)
+
+    # Integer-stored and sparse vertex attributes (#184): the check the glTF
+    # backend runs before reading a float attribute, and the values
+    # dxr::gltf::ReadFloats then returns — u16 normalized UVs, BYTE/SHORT
+    # normals and positions through a byteStride and byteOffset, a sparse morph
+    # delta. Hand-built tinygltf documents, no file, no GPU.
+    add_executable(gltf_attr_tests
+        tests/gltf_attr_tests.cpp
+        gltf_accessor_check.cpp
+    )
+    target_include_directories(gltf_attr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(gltf_attr_tests PRIVATE tinygltf displayxr::rules)
+    if(MSVC)
+        target_compile_options(gltf_attr_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME gltf_attr_tests COMMAND gltf_attr_tests)
 endif()

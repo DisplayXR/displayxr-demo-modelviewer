@@ -68,6 +68,7 @@ difference.
 | `KHR_materials_fuzz` *(draft)* | ⚠️ factors **+ textures** (`fuzzTexture` R, `fuzzColorTexture` RGB, `fuzzRoughnessTexture` A) — replaces sheen, layered above the coat, weight separate from colour. Limited by the sheen LUT, see below |
 | `KHR_materials_scatter` *(draft)* | ⚠️ factors **+ `scatterStrengthTexture`** (A) **+ `multiscatterColorTexture`** (RGB) — subsurface/multiple scattering. Volumetric mode is approximated with the spec-sanctioned thin-walled model; see the limits below |
 | `KHR_texture_transform` | ✅ offset / rotation / scale, per texture slot (all 15). `texCoord` overrides ignored — single UV set |
+| `KHR_mesh_quantization` | ✅ integer `POSITION` / `NORMAL` / `TANGENT` / `TEXCOORD_0` and morph-target deltas are decoded to float on load (normalized scaling where the accessor says so); sparse vertex-attribute accessors too. Integer-stored animation outputs are still dropped
 | Draco, KTX2/Basis | ❌ |
 
 **Scatter is an approximation, and here is exactly where it stops.** The spec

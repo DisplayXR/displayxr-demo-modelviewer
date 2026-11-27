@@ -4,13 +4,16 @@
  * @file
  * @brief  Range checks on a parsed glTF document, run before anything reads it.
  *
- * The glTF backend (model_loader_gltf.cpp) reads accessors by raw pointer
- * arithmetic over the buffers the file declares. These checks decide, before
+ * The glTF backend (model_loader_gltf.cpp) reads index, joint, weight and
+ * animation accessors by raw pointer arithmetic over the buffers the file
+ * declares, and float vertex attributes through displayxr-common's validated
+ * reader (dxr::gltf::ReadFloats, gltf_accessor.h). These checks decide, before
  * that read, whether an accessor or an animation channel can be read without
- * leaving its bufferView/buffer. They check ranges and types only; they decode
- * nothing. Kept out of model_loader_gltf.cpp (which defines the tinygltf
+ * leaving its bufferView/buffer and decoded as the file describes. They check
+ * ranges and types only; they decode nothing. Kept out of model_loader_gltf.cpp (which defines the tinygltf
  * implementation and needs stb) so tests/gltf_anim_tests.cpp can exercise them
- * on hand-built documents with no file, no image decoder and no GPU.
+ * (and tests/gltf_attr_tests.cpp) on hand-built documents with no file, no
+ * image decoder and no GPU.
  */
 
 #pragma once
@@ -36,6 +39,17 @@ namespace gltf_check {
 // else tightly packed) ends inside both; nullptr otherwise.
 const tinygltf::Accessor* checkedAccessor(const tinygltf::Model& m, int idx, int type,
                                           std::initializer_list<int> compTypes);
+
+// `idx` as a float vertex attribute (or morph-target delta) that
+// dxr::gltf::ReadFloats decodes exactly: an accessor of `type` with one of
+// `compTypes` that dxr::gltf::ResolveAccessor accepts (every index and byte
+// range in bounds, byteStride >= one element, sparse indices and values in
+// range; no bufferView = zeros plus sparse overrides). `intNormalized` = an
+// integer componentType must also be `normalized` (NORMAL, TANGENT and morph
+// NORMAL hold unit vectors). nullptr otherwise.
+const tinygltf::Accessor* decodableAttribute(const tinygltf::Model& m, int idx, int type,
+                                             std::initializer_list<int> compTypes,
+                                             bool intNormalized);
 
 // Why channel `c` of animation `a` cannot be played, or nullptr when it can.
 // `nodeMorphWeights[n]` = how many morph weights node n carries (its mesh's
