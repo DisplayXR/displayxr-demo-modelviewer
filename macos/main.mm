@@ -1721,7 +1721,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
              xr.depthBudgetExtVersion);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
+    strncpy(ci.applicationInfo.applicationName, "DisplayXR 3D Model Viewer", sizeof(ci.applicationInfo.applicationName));
     ci.applicationInfo.applicationVersion = 1;
     strncpy(ci.applicationInfo.engineName, "None", sizeof(ci.applicationInfo.engineName));
     ci.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
@@ -1847,7 +1847,7 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
 
     VkApplicationInfo ai = {};
     ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    ai.pApplicationName = "DisplayXRModelViewerMacOS";
+    ai.pApplicationName = "DisplayXR 3D Model Viewer";
     ai.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ci = {};
     ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
