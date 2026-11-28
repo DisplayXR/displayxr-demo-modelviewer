@@ -12,6 +12,7 @@
 #define TINYGLTF_NO_STB_IMAGE
 #define TINYGLTF_NO_STB_IMAGE_WRITE
 #include <tiny_gltf.h>
+#include "gltf_accessor.h"  // dxr::gltf (displayxr-common >= v2.33.0); after tiny_gltf.h
 
 #include <algorithm>
 
@@ -38,6 +39,23 @@ const tinygltf::Accessor* checkedAccessor(const tinygltf::Model& m, int idx, int
     if (acc.byteOffset > bv.byteLength) return nullptr;
     const size_t avail = bv.byteLength - acc.byteOffset;
     if (elem > avail || (acc.count - 1) > (avail - elem) / stride) return nullptr;
+    return &acc;
+}
+
+const tinygltf::Accessor* decodableAttribute(const tinygltf::Model& m, int idx, int type,
+                                             std::initializer_list<int> compTypes,
+                                             bool intNormalized) {
+    if (idx < 0 || idx >= (int)m.accessors.size()) return nullptr;
+    const tinygltf::Accessor& acc = m.accessors[(size_t)idx];
+    if (acc.type != type) return nullptr;
+    if (std::find(compTypes.begin(), compTypes.end(), acc.componentType) == compTypes.end())
+        return nullptr;
+    if (intNormalized && acc.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT && !acc.normalized)
+        return nullptr;
+    dxr::gltf::AccessorLayout layout;
+    if (!dxr::gltf::ResolveAccessor(m, idx, tinygltf::GetNumComponentsInType((uint32_t)type),
+                                    layout))
+        return nullptr;
     return &acc;
 }
 
