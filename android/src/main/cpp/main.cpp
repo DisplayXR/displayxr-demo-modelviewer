@@ -578,7 +578,7 @@ create_instance(struct android_app *app)
 	create_info.type = XR_TYPE_INSTANCE_CREATE_INFO;
 	create_info.next = &android_info;
 	std::strncpy(create_info.applicationInfo.applicationName,
-	             "model_viewer_vk_android", XR_MAX_APPLICATION_NAME_SIZE - 1);
+	             "DisplayXR 3D Model Viewer", XR_MAX_APPLICATION_NAME_SIZE - 1);
 	create_info.applicationInfo.applicationVersion = 1;
 	std::strncpy(create_info.applicationInfo.engineName, "displayxr",
 	             XR_MAX_ENGINE_NAME_SIZE - 1);
@@ -664,7 +664,7 @@ create_vulkan_instance()
 	}
 	VkApplicationInfo app_info = {};
 	app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-	app_info.pApplicationName = "model_viewer_vk_android";
+	app_info.pApplicationName = "DisplayXR 3D Model Viewer";
 	app_info.applicationVersion = 1;
 	app_info.pEngineName = "displayxr";
 	app_info.engineVersion = 1;
